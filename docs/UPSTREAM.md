@@ -124,6 +124,7 @@ whether upstream has the problem. See
 | [#430](https://github.com/crtahlin/wasp/issues/430) | swap: MigratePeer is not atomic, so a failed delete leaves two peers sharing one beneficiary | not planned | `fix/430-migratepeer` | [`b0fb7d82`](https://github.com/crtahlin/wasp/commit/b0fb7d82) |
 | [#511](https://github.com/crtahlin/wasp/issues/511) | A peer behind NAT waits 10 s for its addresses before the handshake | done, validated | `fix/511-identify-wait` | [`a20f4812`](https://github.com/crtahlin/wasp/commit/a20f4812) |
 | [#522](https://github.com/crtahlin/wasp/issues/522) | api: POST /connect to an already connected peer answers 500, and on the reverse direction disconnects the peer | done, validated | `spec/522-connect-already-connected`, `fix/522-connect-already-connected` | [`1063b2bf`](https://github.com/crtahlin/wasp/commit/1063b2bf) |
+| [#541](https://github.com/crtahlin/wasp/issues/541) | swap: fixed gas limits fail under Glamsterdam's state-gas costs; chequebook deploy breaks on Sepolia on 2026-10-06 | open | - | - |
 
 #301 and #302 are done, and they settle only half of what #300 says. Its per
 peer half stands: the three chain calls were confirmed directly, and the rate at
