@@ -41,6 +41,12 @@ chain head that postage events must be before they are applied.
 - Values below 1 are refused at start, with an error naming the setting. A
   depth of 0 would apply events from the head itself, which is never safe. This
   follows #492: stop on a bad value instead of looping on it.
+- **Values above 64 are refused too** (added in review of #553). While the
+  listener waits for the chain to move the depth past what it has synced, it
+  makes no progress, and after the 10-minute postage stall limit the node stops
+  and is restarted, over and over. 64 blocks is 320 s at 5 s blocks and 128 s
+  at 2 s blocks, so even a raise from 4 to 64 on a synced node stays under the
+  limit.
 - It applies to the live listener and to the listener behind the snapshot
   loader.
 

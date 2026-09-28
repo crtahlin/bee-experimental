@@ -306,11 +306,14 @@ var ErrConfig = errors.New("node: invalid configuration")
 
 // validatePostageConfirmationDepth refuses a depth of 0, which would apply
 // postage events from the chain head itself, where they can still be rolled
-// back (#545). It is a configuration error, so the node stops instead of
-// restarting on it.
+// back, and a depth above listener.MaxConfirmationDepth, which would stall
+// postage syncing past its timeout and restart the node over and over (#545).
+// Either is a configuration error, so the node stops instead of restarting on
+// it. A value that is not a number reads as 0 and is refused the same way.
 func validatePostageConfirmationDepth(depth uint64) error {
-	if depth < 1 {
-		return fmt.Errorf("%w: postage-confirmation-depth %d: must be at least 1", ErrConfig, depth)
+	if depth < 1 || depth > listener.MaxConfirmationDepth {
+		return fmt.Errorf("%w: postage-confirmation-depth %d: must be a number from 1 to %d",
+			ErrConfig, depth, listener.MaxConfirmationDepth)
 	}
 	return nil
 }

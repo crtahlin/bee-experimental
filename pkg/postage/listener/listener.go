@@ -39,6 +39,14 @@ const (
 // value (#545). It was the fixed tailSize before.
 const DefaultConfirmationDepth = 4
 
+// MaxConfirmationDepth is the largest postage-confirmation-depth a node accepts.
+// While the listener waits for the chain to move that far past what it has
+// synced, it makes no progress, and after the postage stall timeout (10
+// minutes) the node stops. 64 blocks is 320 s at 5 s blocks and 128 s at 2 s
+// blocks, so even raising the depth from 4 to 64 on a synced node stays under
+// it. An Ethereum reorg rolls Gnosis Chain back about 6 to 12 blocks (#545).
+const MaxConfirmationDepth = 64
+
 // for testing, set externally
 var batchFactorOverridePublic = "5"
 
