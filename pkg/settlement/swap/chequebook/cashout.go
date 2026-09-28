@@ -138,13 +138,17 @@ func (s *cashoutService) CashCheque(ctx context.Context, chequebook, recipient c
 	if err != nil {
 		return common.Hash{}, err
 	}
+	// A Gas-Limit header on the request is used as a fixed limit, as before.
+	// Without one the gas is estimated, with the former default as the floor
+	// (#541).
 	request := &transaction.TxRequest{
-		To:          &chequebook,
-		Data:        callData,
-		GasPrice:    sctx.GetGasPrice(ctx),
-		GasLimit:    sctx.GetGasLimitWithDefault(ctx, 300_000),
-		Value:       big.NewInt(0),
-		Description: "cheque cashout",
+		To:                   &chequebook,
+		Data:                 callData,
+		GasPrice:             sctx.GetGasPrice(ctx),
+		GasLimit:             sctx.GetGasLimit(ctx),
+		MinEstimatedGasLimit: CashoutGasLimitFloor,
+		Value:                big.NewInt(0),
+		Description:          "cheque cashout",
 	}
 
 	txHash, err := s.transactionService.Send(ctx, request, transaction.DefaultTipBoostPercent)

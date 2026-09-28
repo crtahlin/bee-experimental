@@ -17,6 +17,11 @@ import (
 	"github.com/ethersphere/go-sw3-abi/sw3abi"
 )
 
+// TransferGasLimitFloor is the lowest gas limit a token transfer is sent with.
+// The gas is estimated and raised to this floor, which is the fixed limit
+// transfers used before (#541).
+const TransferGasLimitFloor = 90_000
+
 var (
 	erc20ABI     = abiutil.MustParseABI(sw3abi.ERC20ABIv0_6_9)
 	errDecodeABI = errors.New("could not decode abi data")
@@ -75,13 +80,16 @@ func (c *erc20Service) Transfer(ctx context.Context, address common.Address, val
 		return common.Hash{}, err
 	}
 
+	// Estimated, with the former fixed limit as the floor (#541). A transfer
+	// to an address holding no tokens creates a balance slot, which under
+	// Glamsterdam's state-gas costs (EIP-8037) alone exceeds the old limit.
 	request := &transaction.TxRequest{
-		To:          &c.address,
-		Data:        callData,
-		GasPrice:    sctx.GetGasPrice(ctx),
-		GasLimit:    90000,
-		Value:       big.NewInt(0),
-		Description: "token transfer",
+		To:                   &c.address,
+		Data:                 callData,
+		GasPrice:             sctx.GetGasPrice(ctx),
+		MinEstimatedGasLimit: TransferGasLimitFloor,
+		Value:                big.NewInt(0),
+		Description:          "token transfer",
 	}
 
 	txHash, err := c.transactionService.Send(ctx, request, transaction.DefaultTipBoostPercent)

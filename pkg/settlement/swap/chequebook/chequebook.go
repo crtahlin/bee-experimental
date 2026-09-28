@@ -32,6 +32,16 @@ const (
 	totalIssuedKey            = "swap_chequebook_total_issued_"
 )
 
+// Gas limit floors for the chequebook's own transactions. Each is the fixed
+// limit these transactions used before they were estimated (#541): the gas is
+// estimated, and the limit is never set below the floor, so on the gas
+// schedule the floors were tuned for nothing gets a lower limit than before.
+const (
+	DeployGasLimitFloor   = 175_000
+	WithdrawGasLimitFloor = 95_000
+	CashoutGasLimitFloor  = 300_000
+)
+
 var (
 	// ErrOutOfFunds is the error when the chequebook has not enough free funds for a cheque
 	ErrOutOfFunds = errors.New("chequebook out of funds")
@@ -377,13 +387,16 @@ func (s *service) Withdraw(ctx context.Context, amount *big.Int) (hash common.Ha
 		return common.Hash{}, err
 	}
 
+	// Estimated, with the former fixed limit as the floor (#541): the
+	// token transfer inside creates a balance slot when the owner holds no
+	// BZZ, which costs more than the fixed limit under EIP-8037.
 	request := &transaction.TxRequest{
-		To:          &s.address,
-		Data:        callData,
-		GasPrice:    sctx.GetGasPrice(ctx),
-		GasLimit:    95000,
-		Value:       big.NewInt(0),
-		Description: fmt.Sprintf("chequebook withdrawal of %d BZZ", amount),
+		To:                   &s.address,
+		Data:                 callData,
+		GasPrice:             sctx.GetGasPrice(ctx),
+		MinEstimatedGasLimit: WithdrawGasLimitFloor,
+		Value:                big.NewInt(0),
+		Description:          fmt.Sprintf("chequebook withdrawal of %d BZZ", amount),
 	}
 
 	txHash, err := s.transactionService.Send(ctx, request, transaction.DefaultTipBoostPercent)
