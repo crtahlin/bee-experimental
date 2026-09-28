@@ -119,6 +119,7 @@ type testServerOptions struct {
 	PSSPublicKey    ecdsa.PublicKey
 	EthereumAddress common.Address
 	BlockTime       time.Duration
+	BlockTimeFunc   func() time.Duration
 	P2P             *p2pmock.Service
 	Pingpong        pingpong.Interface
 	TopologyOpts    []topologymock.Option
@@ -202,6 +203,7 @@ func newTestServer(t *testing.T, o testServerOptions) (*http.Client, *websocket.
 		Chequebook:         chequebook,
 		Pingpong:           o.Pingpong,
 		BlockTime:          o.BlockTime,
+		BlockTimeFunc:      o.BlockTimeFunc,
 		Storer:             o.Storer,
 		Resolver:           o.Resolver,
 		Pss:                o.Pss,
@@ -713,7 +715,7 @@ func createRedistributionAgentService(
 		stakingContract,
 		mockstorer.NewReserve(),
 		func() bool { return true },
-		time.Millisecond*10,
+		func() time.Duration { return time.Millisecond * 10 },
 		blocksPerRound,
 		blocksPerPhase,
 		storer,
@@ -764,6 +766,10 @@ func (m *mockContract) ReserveSalt(context.Context) ([]byte, error) {
 
 func (m *mockContract) IsPlaying(context.Context, uint8) (bool, error) {
 	return true, nil
+}
+
+func (m *mockContract) CurrentRound(context.Context) (uint64, error) {
+	return 0, errors.New("mock: currentRound not set")
 }
 
 func (m *mockContract) IsWinner(context.Context) (bool, error) {

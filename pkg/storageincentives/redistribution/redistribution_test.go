@@ -132,6 +132,33 @@ func TestRedistribution(t *testing.T) {
 		}
 	})
 
+	t.Run("CurrentRound", func(t *testing.T) {
+		t.Parallel()
+
+		currentRoundSelector := redistributionContractABI.Methods["currentRound"].ID
+		contract := redistribution.New(overlay, owner, log.Noop,
+			transactionMock.New(
+				transactionMock.WithCallFunc(func(ctx context.Context, request *transaction.TxRequest) (result []byte, err error) {
+					if *request.To != redistributionContractAddress || !bytes.Equal(request.Data[:4], currentRoundSelector) {
+						return nil, errors.New("unexpected call")
+					}
+					return big.NewInt(318749).FillBytes(make([]byte, 32)), nil
+				}),
+			),
+			redistributionContractAddress,
+			redistributionContractABI,
+			0,
+		)
+
+		round, err := contract.CurrentRound(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if round != 318749 {
+			t.Fatalf("got round %d, want 318749", round)
+		}
+	})
+
 	t.Run("IsWinner - false", func(t *testing.T) {
 		t.Parallel()
 

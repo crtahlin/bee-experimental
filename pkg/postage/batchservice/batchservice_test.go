@@ -925,7 +925,7 @@ func TestSnapshotHandoffNoGap(t *testing.T) {
 		{BlockNumber: maxBlock, Address: common.HexToAddress("0x1"), Topics: []common.Hash{}},
 	}
 	snap, err := snapshot.New(context.Background(), testLog, rawSnapshotGetter(gzipSnapshot(t, logs)), nil,
-		common.Address{}, abi.ABI{}, time.Second, time.Minute, time.Second, 0)
+		common.Address{}, abi.ABI{}, func() time.Duration { return time.Second }, time.Minute, time.Second, 0)
 	if err != nil {
 		t.Fatalf("snapshot.New: %v", err)
 	}

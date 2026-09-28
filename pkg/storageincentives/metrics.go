@@ -31,6 +31,9 @@ type metrics struct {
 	ErrClaim          prometheus.Counter
 	ErrWinner         prometheus.Counter
 	ErrCheckIsPlaying prometheus.Counter
+	// RoundMismatch counts commits skipped because the round the node computed
+	// disagreed with the contract's (#540).
+	RoundMismatch prometheus.Counter
 }
 
 func newMetrics() metrics {
@@ -112,6 +115,12 @@ func newMetrics() metrics {
 			Subsystem: subsystem,
 			Name:      "reveal_phase_errors",
 			Help:      "total reveal phase errors while processing",
+		}),
+		RoundMismatch: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "round_mismatch_total",
+			Help:      "Number of commits skipped because the node's round disagreed with the contract's.",
 		}),
 		ErrCommit: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: m.Namespace,

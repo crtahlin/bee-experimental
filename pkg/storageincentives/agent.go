@@ -84,7 +84,7 @@ func New(overlay swarm.Address,
 	redistributionStatuser staking.RedistributionStatuser,
 	store storer.Reserve,
 	fullSyncedFunc func() bool,
-	blockTime time.Duration,
+	blockTime func() time.Duration,
 	blocksPerRound,
 	blocksPerPhase uint64,
 	stateStore storage.StateStorer,
@@ -131,7 +131,9 @@ func New(overlay swarm.Address,
 // If our neighborhood is selected to participate, a sample is created during the sample phase. In the commit phase,
 // the sample is submitted, and in the reveal phase, the obfuscation key from the commit phase is submitted.
 // Next, in the claim phase, we check if we've won, and the cycle repeats. The cycle must occur in the length of one round.
-func (a *Agent) start(blockTime time.Duration, blocksPerRound, blocksPerPhase uint64) {
+// blockTime is read each time it is needed, so a change in the chain's block
+// time is followed without a restart (#540).
+func (a *Agent) start(blockTime func() time.Duration, blocksPerRound, blocksPerPhase uint64) {
 	defer a.wg.Done()
 
 	phaseEvents := newEvents()
@@ -187,7 +189,7 @@ func (a *Agent) start(blockTime time.Duration, blocksPerRound, blocksPerPhase ui
 	)
 
 	phaseCheck := func(ctx context.Context) {
-		ctx, cancel := context.WithTimeout(ctx, blockTime*time.Duration(blocksPerRound))
+		ctx, cancel := context.WithTimeout(ctx, blockTime()*time.Duration(blocksPerRound))
 		defer cancel()
 
 		a.metrics.BackendCalls.Inc()
@@ -250,13 +252,13 @@ func (a *Agent) start(blockTime time.Duration, blocksPerRound, blocksPerPhase ui
 	// manually invoke phaseCheck initially in order to set initial data asap
 	phaseCheck(ctx)
 
-	phaseCheckInterval := blockTime
-	// optimization, we do not need to check the phase change at every new block
-	if blocksPerPhase > 10 {
-		phaseCheckInterval = blockTime * 5
-	}
-
 	for {
+		phaseCheckInterval := blockTime()
+		// optimization, we do not need to check the phase change at every new block
+		if blocksPerPhase > 10 {
+			phaseCheckInterval *= 5
+		}
+
 		select {
 		case <-ctx.Done():
 			return
@@ -284,7 +286,22 @@ func (a *Agent) handleCommit(ctx context.Context, round uint64) error {
 		return nil
 	}
 
-	err := a.commit(ctx, sample, round)
+	// The node computes the round from its compiled-in round length. If the
+	// contract disagrees, the round length has changed under it (a redeployed
+	// contract, #540) and a commit would land in the wrong phase and waste
+	// gas; not committing costs nothing. A failed call is not a disagreement:
+	// the node plays as it always has.
+	contractRound, err := a.contract.CurrentRound(ctx)
+	switch {
+	case err != nil:
+		a.logger.Debug("could not read the contract's round, committing on the node's own", "round", round, "error", err)
+	case contractRound != round:
+		a.metrics.RoundMismatch.Inc()
+		a.logger.Error(nil, "the node's round disagrees with the redistribution contract's; not committing in this round", "node_round", round, "contract_round", contractRound)
+		return nil
+	}
+
+	err = a.commit(ctx, sample, round)
 	if err != nil {
 		return err
 	}

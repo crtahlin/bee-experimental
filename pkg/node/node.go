@@ -134,20 +134,24 @@ type Bee struct {
 }
 
 type Options struct {
-	Addr                            string
-	AllowPrivateCIDRs               bool
-	APIAddr                         string
-	EnableWSS                       bool
-	WSSAddr                         string
-	AutoTLSStorageDir               string
-	BlockchainRpcEndpoints          []string
-	BlockchainRpcDialTimeout        time.Duration
-	BlockchainRpcTLSTimeout         time.Duration
-	BlockchainRpcIdleTimeout        time.Duration
-	BlockchainRpcKeepalive          time.Duration
-	BzzTokenAddress                 common.Address
-	BlockProfile                    bool
-	BlockTime                       time.Duration
+	Addr                     string
+	AllowPrivateCIDRs        bool
+	APIAddr                  string
+	EnableWSS                bool
+	WSSAddr                  string
+	AutoTLSStorageDir        string
+	BlockchainRpcEndpoints   []string
+	BlockchainRpcDialTimeout time.Duration
+	BlockchainRpcTLSTimeout  time.Duration
+	BlockchainRpcIdleTimeout time.Duration
+	BlockchainRpcKeepalive   time.Duration
+	BzzTokenAddress          common.Address
+	BlockProfile             bool
+	BlockTime                time.Duration
+	// BlockTimeSet reports that the operator set block-time explicitly. Then
+	// BlockTime is used as is; otherwise it is only the starting value until
+	// the chain's block time has been observed (#540).
+	BlockTimeSet                    bool
 	BlockSyncInterval               uint64
 	BootnodeMode                    bool
 	Bootnodes                       []string
@@ -688,6 +692,9 @@ func NewBee(
 	logger.Info("using chain with network", "chain_id", chainID, "network_id", networkID)
 
 	b.ethClientCloser = chainBackend.Close
+
+	blockTime := blockTimeFunc(chainBackend, o.BlockTime, o.BlockTimeSet)
+	go watchBlockTime(ctx, logger, chainBackend, o.BlockTime, o.BlockTimeSet)
 	b.transactionCloser = tracerCloser
 	b.transactionMonitorCloser = transactionMonitor
 
@@ -1018,7 +1025,7 @@ func NewBee(
 		contractGasLimit,
 	)
 
-	eventListener = listener.New(b.syncingStopped, logger, chainBackend, postageStampContractAddress, postageStampContractABI, o.BlockTime, postageSyncingStallingTimeout, postageSyncingBackoffTimeout)
+	eventListener = listener.New(b.syncingStopped, logger, chainBackend, postageStampContractAddress, postageStampContractABI, blockTime, postageSyncingStallingTimeout, postageSyncingBackoffTimeout)
 	b.listenerCloser = eventListener
 
 	// Construct protocols.
@@ -1150,7 +1157,7 @@ func NewBee(
 
 	var batchSnapshot *batchservice.Snapshot
 	if useEmbeddedSnapshot(o.SkipPostageSnapshot, batchStoreExists, o.Resync, networkID, beeNodeMode) {
-		batchSnapshot, err = snapshot.New(ctx, logger, archive.Getter{}, b.syncingStopped, postageStampContractAddress, postageStampContractABI, o.BlockTime, postageSyncingStallingTimeout, postageSyncingBackoffTimeout, postageSyncStart)
+		batchSnapshot, err = snapshot.New(ctx, logger, archive.Getter{}, b.syncingStopped, postageStampContractAddress, postageStampContractABI, blockTime, postageSyncingStallingTimeout, postageSyncingBackoffTimeout, postageSyncStart)
 		if err != nil {
 			// A corrupt snapshot is not fatal: rebuild from the chain instead.
 			logger.Error(err, "postage snapshot unavailable, syncing from chain instead")
@@ -1620,7 +1627,7 @@ func NewBee(
 				stakingContract,
 				localStore,
 				isFullySynced,
-				o.BlockTime,
+				blockTime,
 				storageincentives.DefaultBlocksPerRound,
 				storageincentives.DefaultBlocksPerPhase,
 				stateStore,
@@ -1676,6 +1683,7 @@ func NewBee(
 		Swap:            swapService,
 		Chequebook:      chequebookService,
 		BlockTime:       o.BlockTime,
+		BlockTimeFunc:   blockTime,
 		Storer:          localStore,
 		Resolver:        multiResolver,
 		Pss:             pssService,

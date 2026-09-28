@@ -104,7 +104,11 @@
 ## block number cache sync interval in blocks
 # block-sync-interval: 10
 
-## chain block time
+## chain block time, in whole seconds. Set explicitly, it is used as is. Left
+## unset, the network's default (5 on mainnet, 12 on testnet) is only the
+## starting value: the node measures the chain's block time and uses that for
+## the stamp TTL, the storage-incentives phase checks and the postage listener,
+## and warns when the two differ for 10 minutes (#540).
 # block-time: 5
 
 ## blockchain rpc TCP dial timeout

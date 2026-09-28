@@ -69,6 +69,11 @@ Not the sample. The sample fits the commit-phase window (152-block round, three
 38-block phases, about 190 s at 5 s blocks) even at bench-1's untuned setting, and
 tuned to trigger 4 it is about 44 s with wide headroom.
 
+(Correction, 2026-09-28, #540: the round has phases of 38, 38 and 76 blocks, and
+the sampling window runs from the start of the claim phase to the start of the
+next reveal, about 114 blocks: 570 s at 5 s blocks, about 228 s at the 2 s blocks
+Gnosis Chain is moving to. The conclusion stands.)
+
 The limits are elsewhere and scale with the total reserve, not the per-neighborhood
 sample:
 

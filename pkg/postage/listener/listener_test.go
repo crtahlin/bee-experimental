@@ -76,7 +76,7 @@ func TestListener(t *testing.T) {
 			mf,
 			postageStampContractAddress,
 			postageStampContractABI,
-			1,
+			func() time.Duration { return 1 },
 			stallingTimeout,
 			backoffTime,
 		)
@@ -117,7 +117,7 @@ func TestListener(t *testing.T) {
 			mf,
 			postageStampContractAddress,
 			postageStampContractABI,
-			1,
+			func() time.Duration { return 1 },
 			stallingTimeout,
 			backoffTime,
 		)
@@ -158,7 +158,7 @@ func TestListener(t *testing.T) {
 			mf,
 			postageStampContractAddress,
 			postageStampContractABI,
-			1,
+			func() time.Duration { return 1 },
 			stallingTimeout,
 			backoffTime,
 		)
@@ -198,7 +198,7 @@ func TestListener(t *testing.T) {
 			mf,
 			postageStampContractAddress,
 			postageStampContractABI,
-			1,
+			func() time.Duration { return 1 },
 			stallingTimeout,
 			backoffTime,
 		)
@@ -261,7 +261,7 @@ func TestListener(t *testing.T) {
 			mf,
 			postageStampContractAddress,
 			postageStampContractABI,
-			1,
+			func() time.Duration { return 1 },
 			stallingTimeout,
 			backoffTime,
 		)
@@ -341,7 +341,7 @@ func TestListener(t *testing.T) {
 			mf,
 			postageStampContractAddress,
 			postageStampContractABI,
-			1,
+			func() time.Duration { return 1 },
 			stallingTimeout,
 			0,
 		)
@@ -369,7 +369,7 @@ func TestListener(t *testing.T) {
 			mf,
 			postageStampContractAddress,
 			postageStampContractABI,
-			1,
+			func() time.Duration { return 1 },
 			50*time.Millisecond,
 			0,
 		)
@@ -396,7 +396,7 @@ func TestListener(t *testing.T) {
 			mf,
 			postageStampContractAddress,
 			postageStampContractABI,
-			1,
+			func() time.Duration { return 1 },
 			stallingTimeout,
 			backoffTime,
 		)
@@ -444,7 +444,7 @@ func TestListenerPageSize(t *testing.T) {
 			mkFilterer(base),
 			postageStampContractAddress,
 			postageStampContractABI,
-			1,
+			func() time.Duration { return 1 },
 			stallingTimeout,
 			backoffTime,
 		)

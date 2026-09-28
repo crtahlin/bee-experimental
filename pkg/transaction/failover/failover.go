@@ -299,6 +299,16 @@ func (b *Backend) Close() {
 }
 
 // Active reports which endpoint is currently serving, for tests and logging.
+// AverageBlockTime returns the block time observed by the endpoint in use, or 0
+// when it observes none. See transaction.BlockTimer.
+func (b *Backend) AverageBlockTime() time.Duration {
+	_, _, be := b.current()
+	if timer, ok := be.(transaction.BlockTimer); ok {
+		return timer.AverageBlockTime()
+	}
+	return 0
+}
+
 func (b *Backend) Active() string {
 	_, ep, _ := b.current()
 	return ep.name

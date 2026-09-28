@@ -108,3 +108,28 @@ func WaitBlockAfterTransaction(ctx context.Context, backend Backend, pollingInte
 		}
 	}
 }
+
+// BlockTimer is implemented by a backend that observes how long the chain's
+// blocks take.
+type BlockTimer interface {
+	// AverageBlockTime returns the observed average block time, or 0 when
+	// nothing has been observed yet.
+	AverageBlockTime() time.Duration
+}
+
+// ObservedBlockTime returns a function that reports the chain's block time as
+// the backend observes it, and fallback while the backend has observed nothing
+// or does not observe block times at all. It is read each time it is called,
+// so a change in the chain's block time is followed without a restart (#540).
+func ObservedBlockTime(backend Backend, fallback time.Duration) func() time.Duration {
+	timer, ok := backend.(BlockTimer)
+	if !ok {
+		return func() time.Duration { return fallback }
+	}
+	return func() time.Duration {
+		if observed := timer.AverageBlockTime(); observed > 0 {
+			return observed
+		}
+		return fallback
+	}
+}

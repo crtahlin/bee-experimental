@@ -163,7 +163,7 @@ func TestNew(t *testing.T) {
 	getter := newMockSnapshotGetter(makeSnapshotData(logs))
 
 	snap, err := snapshot.New(context.Background(), log.Noop, getter, nil,
-		common.Address{}, abi.ABI{}, time.Second, time.Second, time.Second, 100)
+		common.Address{}, abi.ABI{}, func() time.Duration { return time.Second }, time.Second, time.Second, 100)
 	require.NoError(t, err)
 	require.NotNil(t, snap)
 	assert.Equal(t, uint64(100), snap.StartBlock)
@@ -172,7 +172,7 @@ func TestNew(t *testing.T) {
 	t.Run("corrupt snapshot returns an error", func(t *testing.T) {
 		t.Parallel()
 		_, err := snapshot.New(context.Background(), log.Noop, newMockSnapshotGetter([]byte("not-gzip")), nil,
-			common.Address{}, abi.ABI{}, time.Second, time.Second, time.Second, 100)
+			common.Address{}, abi.ABI{}, func() time.Duration { return time.Second }, time.Second, time.Second, 100)
 		assert.Error(t, err)
 	})
 }
@@ -200,7 +200,7 @@ func TestReplayStopsBelowMaxBlock(t *testing.T) {
 	}
 	filterer := snapshot.NewSnapshotLogFilterer(log.Noop, newMockSnapshotGetter(makeSnapshotData(logs)))
 
-	l := listener.New(nil, log.Noop, filterer, common.Address{}, abi.ABI{}, time.Second, time.Minute, time.Second)
+	l := listener.New(nil, log.Noop, filterer, common.Address{}, abi.ABI{}, func() time.Duration { return time.Second }, time.Minute, time.Second)
 	t.Cleanup(func() { _ = l.Close() })
 
 	rec := &blockRecorder{blocks: make(chan uint64, 8)}

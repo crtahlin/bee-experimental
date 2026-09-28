@@ -506,9 +506,12 @@ func (s *Service) estimateBatchTTL(batch *postage.Batch) (int64, error) {
 		cumulativePayout  = state.TotalAmount
 		pricePerBlock     = state.CurrentPrice
 	)
+	// remaining blocks × block time, in nanoseconds so a block time that is not
+	// a whole number of seconds is not truncated, then converted to seconds.
 	ttl := new(big.Int).Sub(normalizedBalance, cumulativePayout)
-	ttl = ttl.Mul(ttl, big.NewInt(int64(s.blockTime/time.Second)))
+	ttl = ttl.Mul(ttl, big.NewInt(int64(s.blockTime())))
 	ttl = ttl.Div(ttl, pricePerBlock)
+	ttl = ttl.Div(ttl, big.NewInt(int64(time.Second)))
 
 	return ttl.Int64(), nil
 }
