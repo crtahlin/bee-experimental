@@ -382,6 +382,12 @@
 ## from your peer
 # payment-tolerance-percent: 25
 
+## blocks behind the chain head that postage events must be before they are
+## applied, from 1 to 64; raising it delays seeing stamp events and pauses
+## postage syncing once by the difference, lowering it risks applying events
+## from blocks that are rolled back
+# postage-confirmation-depth: 4
+
 ## postage stamp contract start block number
 # postage-stamp-start-block: 0
 

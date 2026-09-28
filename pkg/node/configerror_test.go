@@ -12,6 +12,7 @@ import (
 
 	"github.com/ethersphere/bee/v2/pkg/log"
 	"github.com/ethersphere/bee/v2/pkg/node"
+	"github.com/ethersphere/bee/v2/pkg/postage/listener"
 )
 
 // TestStakeRecoveryModeAcceptsYAMLFalse is wasp #489.
@@ -105,6 +106,25 @@ func TestRecoverableErrorIsNotAConfigError(t *testing.T) {
 		if errors.Is(err, node.ErrConfig) {
 			t.Fatalf("a transient error is reported as a configuration error: %v. "+
 				"The node would stop instead of retrying.", err)
+		}
+	}
+}
+
+// TestPostageConfirmationDepthOutOfRangeIsAConfigError: a depth of 0 would apply
+// postage events from the chain head itself, and one above the maximum would
+// stall postage syncing until the node stops, so both are refused at start as
+// a configuration error a restart cannot fix (#545).
+func TestPostageConfirmationDepthOutOfRangeIsAConfigError(t *testing.T) {
+	t.Parallel()
+
+	for _, depth := range []uint64{0, listener.MaxConfirmationDepth + 1, 1_000_000_000} {
+		if err := node.ValidatePostageConfirmationDepth(depth); !errors.Is(err, node.ErrConfig) {
+			t.Fatalf("depth %d: got %v, want node.ErrConfig", depth, err)
+		}
+	}
+	for _, depth := range []uint64{1, 4, 12, listener.MaxConfirmationDepth} {
+		if err := node.ValidatePostageConfirmationDepth(depth); err != nil {
+			t.Fatalf("depth %d: got %v, want accepted", depth, err)
 		}
 	}
 }

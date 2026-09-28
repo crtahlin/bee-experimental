@@ -31,9 +31,21 @@ const loggerName = "listener"
 const (
 	blockPage          = 5000      // how many blocks to sync every time we page
 	blockPageSnapshot  = 50000     // how many blocks to sync every time from snapshot
-	tailSize           = 4         // how many blocks to tail from the tip of the chain
 	defaultBatchFactor = uint64(5) // minimal number of blocks to sync at once
 )
+
+// DefaultConfirmationDepth is how many blocks behind the chain head events must
+// be before they are applied, unless postage-confirmation-depth sets another
+// value (#545). It was the fixed tailSize before.
+const DefaultConfirmationDepth = 4
+
+// MaxConfirmationDepth is the largest postage-confirmation-depth a node accepts.
+// While the listener waits for the chain to move that far past what it has
+// synced, it makes no progress, and after the postage stall timeout (10
+// minutes) the node stops. 64 blocks is 320 s at 5 s blocks and 128 s at 2 s
+// blocks, so even raising the depth from 4 to 64 on a synced node stays under
+// it. An Ethereum reorg rolls Gnosis Chain back about 6 to 12 blocks (#545).
+const MaxConfirmationDepth = 64
 
 // for testing, set externally
 var batchFactorOverridePublic = "5"
@@ -53,6 +65,9 @@ type listener struct {
 	logger    log.Logger
 	ev        BlockHeightContractFilterer
 	blockTime func() time.Duration // read each time, so a block time change is followed (#540)
+	// confirmationDepth is how many blocks behind the head events must be
+	// before they are applied (#545).
+	confirmationDepth uint64
 
 	postageStampContractAddress common.Address
 	postageStampContractABI     abi.ABI
@@ -78,6 +93,7 @@ func New(
 	postageStampContractAddress common.Address,
 	postageStampContractABI abi.ABI,
 	blockTime func() time.Duration,
+	confirmationDepth uint64,
 	stallingTimeout time.Duration,
 	backoffTime time.Duration,
 ) postage.Listener {
@@ -86,6 +102,7 @@ func New(
 		logger:                      logger.WithName(loggerName).Register(),
 		ev:                          ev,
 		blockTime:                   blockTime,
+		confirmationDepth:           confirmationDepth,
 		postageStampContractAddress: postageStampContractAddress,
 		postageStampContractABI:     postageStampContractABI,
 		quit:                        make(chan struct{}),
@@ -305,13 +322,13 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 				continue
 			}
 
-			if to < tailSize {
+			if to < l.confirmationDepth {
 				// in a test blockchain there might be not be enough blocks yet
 				continue
 			}
 
-			// consider to-tailSize as the "latest" block we need to sync to
-			to = to - tailSize
+			// consider to-confirmationDepth as the "latest" block we need to sync to
+			to = to - l.confirmationDepth
 			lastConfirmedBlock = to
 
 			// round down to the largest multiple of batchFactor

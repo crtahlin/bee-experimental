@@ -22,6 +22,7 @@ import (
 	"github.com/ethersphere/bee/v2/pkg/postage"
 	"github.com/ethersphere/bee/v2/pkg/postage/batchservice"
 	"github.com/ethersphere/bee/v2/pkg/postage/batchstore/mock"
+	"github.com/ethersphere/bee/v2/pkg/postage/listener"
 	"github.com/ethersphere/bee/v2/pkg/postage/snapshot"
 	postagetesting "github.com/ethersphere/bee/v2/pkg/postage/testing"
 	mocks "github.com/ethersphere/bee/v2/pkg/statestore/mock"
@@ -925,7 +926,7 @@ func TestSnapshotHandoffNoGap(t *testing.T) {
 		{BlockNumber: maxBlock, Address: common.HexToAddress("0x1"), Topics: []common.Hash{}},
 	}
 	snap, err := snapshot.New(context.Background(), testLog, rawSnapshotGetter(gzipSnapshot(t, logs)), nil,
-		common.Address{}, abi.ABI{}, func() time.Duration { return time.Second }, time.Minute, time.Second, 0)
+		common.Address{}, abi.ABI{}, func() time.Duration { return time.Second }, listener.DefaultConfirmationDepth, time.Minute, time.Second, 0)
 	if err != nil {
 		t.Fatalf("snapshot.New: %v", err)
 	}

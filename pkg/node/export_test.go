@@ -7,14 +7,15 @@ package node
 import "io"
 
 var (
-	ValidatePublicAddress      = validatePublicAddress
-	UseEmbeddedSnapshot        = useEmbeddedSnapshot
-	ShallowReceiptToleranceFor = shallowReceiptToleranceFor
-	EffectiveMaxDoubling       = effectiveMaxDoubling
-	SyncedWithinThreshold      = syncedWithinThreshold
-	RadiusWithoutWaiting       = radiusWithoutWaiting
-	ErrNetworkRadiusUnknown    = errNetworkRadiusUnknown
-	RunStakeRecoveryOnStartup  = runStakeRecoveryOnStartup
+	ValidatePublicAddress            = validatePublicAddress
+	UseEmbeddedSnapshot              = useEmbeddedSnapshot
+	ShallowReceiptToleranceFor       = shallowReceiptToleranceFor
+	EffectiveMaxDoubling             = effectiveMaxDoubling
+	SyncedWithinThreshold            = syncedWithinThreshold
+	RadiusWithoutWaiting             = radiusWithoutWaiting
+	ErrNetworkRadiusUnknown          = errNetworkRadiusUnknown
+	RunStakeRecoveryOnStartup        = runStakeRecoveryOnStartup
+	ValidatePostageConfirmationDepth = validatePostageConfirmationDepth
 )
 
 // NewTestBeeWithClosers builds a Bee with only the push-sync and retrieval

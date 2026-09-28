@@ -16,6 +16,7 @@ import (
 	chaincfg "github.com/ethersphere/bee/v2/pkg/config"
 	"github.com/ethersphere/bee/v2/pkg/log"
 	"github.com/ethersphere/bee/v2/pkg/node"
+	"github.com/ethersphere/bee/v2/pkg/postage/listener"
 	"github.com/ethersphere/bee/v2/pkg/swarm"
 	p2pforge "github.com/ipshipyard/p2p-forge/client"
 	"github.com/spf13/cobra"
@@ -87,6 +88,7 @@ const (
 	optionNameStakeRecoveryOnStartup       = "stake-recovery-on-startup"
 	optionNameBlockTime                    = "block-time"
 	optionNameBlockSyncInterval            = "block-sync-interval"
+	optionNamePostageConfirmationDepth     = "postage-confirmation-depth"
 	optionWarmUpTime                       = "warmup-time"
 	optionNameMainNet                      = "mainnet"
 	optionNameRetrievalCaching             = "cache-retrieval"
@@ -415,6 +417,7 @@ func (c *command) setAllFlags(cmd *cobra.Command) {
 	cmd.Flags().String(optionNameStakeRecoveryOnStartup, "off", "recover stake left in retired staking contracts when the node starts: \"off\" (default, do nothing), \"withdraw\" (recover it to the node's wallet), or \"migrate\" (recover it into the current staking contract). It moves staked funds, so it is off by default and runs only on explicit opt-in. If the node has no gas or the chain is unreachable it is skipped and retried on the next start, never blocking startup. In a YAML config file QUOTE the value: a bare off, on, yes or no is read as a boolean, so stake-recovery-on-startup: off arrives as \"false\". That is accepted as off, but quoting is what makes the file say what it means.")
 	cmd.Flags().Uint64(optionNameBlockTime, 5, "chain block time in seconds; if set, used as is; if unset, the network default is used until the node has measured the chain's block time")
 	cmd.Flags().Uint64(optionNameBlockSyncInterval, 10, "block number cache sync interval in blocks")
+	cmd.Flags().Uint64(optionNamePostageConfirmationDepth, listener.DefaultConfirmationDepth, "blocks behind the chain head that postage events must be before they are applied, from 1 to 64; raising it delays seeing stamp events and pauses postage syncing once by the difference, lowering it risks applying events from blocks that are rolled back")
 	cmd.Flags().Duration(optionWarmUpTime, time.Minute*5, "maximum node warmup duration; proceeds when stable or after this time")
 	cmd.Flags().Bool(optionNameMainNet, true, "triggers connect to main net bootnodes.")
 	cmd.Flags().Bool(optionNameRetrievalCaching, true, "enable forwarded content caching")
