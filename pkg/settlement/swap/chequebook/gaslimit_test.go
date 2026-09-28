@@ -226,7 +226,10 @@ func TestInitClearsRevertedDeployment(t *testing.T) {
 	}
 }
 
-func TestInitKeepsSlowDeployment(t *testing.T) {
+// TestInitKeepsDeploymentOnOtherErrors: a wait that fails for any reason other
+// than a revert (here an RPC error) keeps the saved deployment, so a deployment
+// that is only slow or unreachable for now is never sent twice.
+func TestInitKeepsDeploymentOnOtherErrors(t *testing.T) {
 	t.Parallel()
 
 	savedTx := common.HexToHash("0xdead")
