@@ -28,7 +28,7 @@ func New(
 	syncingStopped *syncutil.Signaler,
 	contractAddress common.Address,
 	contractABI abi.ABI,
-	blockTime time.Duration,
+	blockTime func() time.Duration,
 	stallingTimeout time.Duration,
 	backoffTimeout time.Duration,
 	startBlock uint64,

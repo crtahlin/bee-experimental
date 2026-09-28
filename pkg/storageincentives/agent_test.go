@@ -173,6 +173,24 @@ func createService(
 	reserveOpts ...resMock.Option,
 ) (*storageincentives.Agent, error) {
 	t.Helper()
+	return createServiceWithBlockTime(t, addr, backend, contract, func() time.Duration { return time.Millisecond * 100 },
+		blocksPerRound, blocksPerPhase, radius, doubling, reserveProofMode, reserveOpts...)
+}
+
+func createServiceWithBlockTime(
+	t *testing.T,
+	addr swarm.Address,
+	backend storageincentives.ChainBackend,
+	contract redistribution.Contract,
+	blockTime func() time.Duration,
+	blocksPerRound uint64,
+	blocksPerPhase uint64,
+	radius uint8,
+	doubling uint8,
+	reserveProofMode string,
+	reserveOpts ...resMock.Option,
+) (*storageincentives.Agent, error) {
+	t.Helper()
 
 	postageContract := contractMock.New(contractMock.WithExpiresBatchesFunc(func(context.Context) error {
 		return nil
@@ -197,7 +215,7 @@ func createService(
 		stakingContract,
 		reserve,
 		func() bool { return true },
-		time.Millisecond*100,
+		blockTime,
 		blocksPerRound,
 		blocksPerPhase,
 		statestore.NewStateStore(),
@@ -279,6 +297,16 @@ type mockContract struct {
 	mtx            sync.Mutex
 	expectedRadius uint8
 	t              *testing.T
+	// currentRound answers CurrentRound. When nil the call fails, and the
+	// agent commits on its own round, as it did before the round check.
+	currentRound func(ctx context.Context) (uint64, error)
+}
+
+func (m *mockContract) CurrentRound(ctx context.Context) (uint64, error) {
+	if m.currentRound == nil {
+		return 0, errors.New("mock: currentRound not set")
+	}
+	return m.currentRound(ctx)
 }
 
 // getCalls returns a snapshot of the calls list

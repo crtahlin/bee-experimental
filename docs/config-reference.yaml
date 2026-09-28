@@ -104,7 +104,7 @@
 ## block number cache sync interval in blocks
 # block-sync-interval: 10
 
-## chain block time
+## chain block time in seconds; if set, used as is; if unset, the network default is used until the node has measured the chain's block time
 # block-time: 5
 
 ## blockchain rpc TCP dial timeout

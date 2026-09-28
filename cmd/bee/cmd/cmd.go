@@ -413,7 +413,7 @@ func (c *command) setAllFlags(cmd *cobra.Command) {
 	cmd.Flags().String(optionNameRedistributionAddress, "", "redistribution contract address")
 	cmd.Flags().String(optionNameStakingAddress, "", "staking contract address")
 	cmd.Flags().String(optionNameStakeRecoveryOnStartup, "off", "recover stake left in retired staking contracts when the node starts: \"off\" (default, do nothing), \"withdraw\" (recover it to the node's wallet), or \"migrate\" (recover it into the current staking contract). It moves staked funds, so it is off by default and runs only on explicit opt-in. If the node has no gas or the chain is unreachable it is skipped and retried on the next start, never blocking startup. In a YAML config file QUOTE the value: a bare off, on, yes or no is read as a boolean, so stake-recovery-on-startup: off arrives as \"false\". That is accepted as off, but quoting is what makes the file say what it means.")
-	cmd.Flags().Uint64(optionNameBlockTime, 5, "chain block time")
+	cmd.Flags().Uint64(optionNameBlockTime, 5, "chain block time in seconds; if set, used as is; if unset, the network default is used until the node has measured the chain's block time")
 	cmd.Flags().Uint64(optionNameBlockSyncInterval, 10, "block number cache sync interval in blocks")
 	cmd.Flags().Duration(optionWarmUpTime, time.Minute*5, "maximum node warmup duration; proceeds when stable or after this time")
 	cmd.Flags().Bool(optionNameMainNet, true, "triggers connect to main net bootnodes.")

@@ -225,7 +225,7 @@ type Service struct {
 	swap        swap.Interface
 	transaction transaction.Service
 	lightNodes  *lightnode.Container
-	blockTime   time.Duration
+	blockTime   func() time.Duration
 
 	statusSem        *semaphore.Weighted
 	postageSem       *semaphore.Weighted
@@ -273,14 +273,18 @@ type Options struct {
 }
 
 type ExtraOptions struct {
-	Pingpong        pingpong.Interface
-	TopologyDriver  topology.Driver
-	LightNodes      *lightnode.Container
-	Accounting      accounting.Interface
-	Pseudosettle    settlement.Interface
-	Swap            swap.Interface
-	Chequebook      chequebook.Service
-	BlockTime       time.Duration
+	Pingpong       pingpong.Interface
+	TopologyDriver topology.Driver
+	LightNodes     *lightnode.Container
+	Accounting     accounting.Interface
+	Pseudosettle   settlement.Interface
+	Swap           swap.Interface
+	Chequebook     chequebook.Service
+	BlockTime      time.Duration
+	// BlockTimeFunc, when set, is used instead of BlockTime and is read each
+	// time a TTL is estimated, so it can follow the chain's observed block
+	// time (#540).
+	BlockTimeFunc   func() time.Duration
 	Storer          Storer
 	Resolver        resolver.Interface
 	Pss             pss.Interface
@@ -387,7 +391,11 @@ func (s *Service) Configure(signer crypto.Signer, tracer *tracing.Tracer, o Opti
 	s.swap = e.Swap
 	s.lightNodes = e.LightNodes
 	s.pseudosettle = e.Pseudosettle
-	s.blockTime = e.BlockTime
+	s.blockTime = e.BlockTimeFunc
+	if s.blockTime == nil {
+		blockTime := e.BlockTime
+		s.blockTime = func() time.Duration { return blockTime }
+	}
 
 	s.statusSem = semaphore.NewWeighted(1)
 	s.postageSem = semaphore.NewWeighted(1)

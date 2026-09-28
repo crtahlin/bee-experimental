@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"math/big"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
@@ -35,6 +36,9 @@ type wrappedBackend struct {
 	blockTime         time.Duration
 	blockSyncInterval uint64
 	blockNumberCache  *cache.SingleFlightCache[blockNumberAnchor]
+	// observed is the last average block time measured from two headers, in
+	// nanoseconds, or 0 before the first measurement.
+	observed atomic.Int64
 }
 
 func NewBackend(
@@ -105,8 +109,11 @@ func (b *wrappedBackend) BlockNumber(ctx context.Context) (uint64, error) {
 
 		newNumber := header.Number.Uint64()
 		newTime := time.Unix(int64(header.Time), 0).UTC()
-		averageBlockTime := b.computeAverageBlockTime(prev, newNumber, newTime)
+		averageBlockTime, measured := b.computeAverageBlockTime(prev, newNumber, newTime)
 		b.metrics.AverageBlockTimeSeconds.Set(averageBlockTime.Seconds())
+		if measured {
+			b.observed.Store(int64(averageBlockTime))
+		}
 
 		return blockNumberAnchor{
 			number:           newNumber,
@@ -146,12 +153,13 @@ func (b *wrappedBackend) estimatedBlockNumberWithElapsed(anchor blockNumberAncho
 }
 
 // computeAverageBlockTime returns the observed block time between prev and the
-// freshly loaded header. Falls back to the configured block time when prev is
-// unset, the block number did not increase, or the header timestamp did not
-// strictly increase.
-func (b *wrappedBackend) computeAverageBlockTime(prev blockNumberAnchor, newNumber uint64, newTime time.Time) time.Duration {
+// freshly loaded header, and whether it was measured. Falls back to the
+// configured block time, reported as not measured, when prev is unset, the
+// block number did not increase, or the header timestamp did not strictly
+// increase.
+func (b *wrappedBackend) computeAverageBlockTime(prev blockNumberAnchor, newNumber uint64, newTime time.Time) (time.Duration, bool) {
 	if prev.number == 0 || newNumber <= prev.number || !newTime.After(prev.timestamp) {
-		return b.blockTime
+		return b.blockTime, false
 	}
 
 	elapsed := newTime.Sub(prev.timestamp)
@@ -159,10 +167,19 @@ func (b *wrappedBackend) computeAverageBlockTime(prev blockNumberAnchor, newNumb
 
 	averageBlockTime := elapsed / time.Duration(blocks)
 	if averageBlockTime > maxAverageBlockTime {
-		return maxAverageBlockTime
+		// A capped value comes from a stall, not from the chain's block
+		// time, so it is not reported as a measurement: the last real one
+		// stays in use (#540).
+		return maxAverageBlockTime, false
 	}
 
-	return averageBlockTime
+	return averageBlockTime, true
+}
+
+// AverageBlockTime returns the last block time measured from two headers, or 0
+// before the first measurement. See transaction.BlockTimer.
+func (b *wrappedBackend) AverageBlockTime() time.Duration {
+	return time.Duration(b.observed.Load())
 }
 
 func (b *wrappedBackend) HeaderByNumber(ctx context.Context, number *big.Int) (*types.Header, error) {

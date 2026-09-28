@@ -60,7 +60,8 @@ parity on both engines across real rounds over days:
 | Pebble (bench-2) | 40 to 48 s (latest 43.8 s) |
 
 So Pebble and goleveldb sample in the same time in real operation, both far inside
-the roughly 190 s commit window ([#17](https://github.com/crtahlin/wasp/issues/17)).
+the sampling window (stated here first as a 190 s commit window; the code allows
+about 114 blocks, 570 s at 5 s blocks and about 228 s at 2 s blocks, see [#540](https://github.com/crtahlin/wasp/issues/540)) ([#17](https://github.com/crtahlin/wasp/issues/17)).
 The read-axis verdict in [#185](https://github.com/crtahlin/wasp/issues/185), and
 Pebble as the default engine, stand.
 

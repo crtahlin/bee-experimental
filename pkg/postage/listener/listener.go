@@ -52,7 +52,7 @@ type BlockHeightContractFilterer interface {
 type listener struct {
 	logger    log.Logger
 	ev        BlockHeightContractFilterer
-	blockTime time.Duration
+	blockTime func() time.Duration // read each time, so a block time change is followed (#540)
 
 	postageStampContractAddress common.Address
 	postageStampContractABI     abi.ABI
@@ -77,7 +77,7 @@ func New(
 	ev BlockHeightContractFilterer,
 	postageStampContractAddress common.Address,
 	postageStampContractABI abi.ABI,
-	blockTime time.Duration,
+	blockTime func() time.Duration,
 	stallingTimeout time.Duration,
 	backoffTime time.Duration,
 ) postage.Listener {
@@ -273,7 +273,7 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 			if lastConfirmedBlock != 0 {
 				nextExpectedBatchBlock := (lastConfirmedBlock/batchFactor + 1) * batchFactor
 				remainingBlocks := nextExpectedBatchBlock - lastConfirmedBlock
-				expectedWaitTime = l.blockTime * time.Duration(remainingBlocks)
+				expectedWaitTime = l.blockTime() * time.Duration(remainingBlocks)
 			} else {
 				expectedWaitTime = l.backoffTime
 			}

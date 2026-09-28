@@ -51,9 +51,16 @@ A redistribution round is `DefaultBlocksPerRound = 152` blocks and divides into
 phases of `152 / 4 = 38` blocks (`pkg/storageincentives/agent.go:37-38`). At the
 5 second default `block-time` (`cmd/bee/cmd/cmd.go:416`) that is **760 s per
 round and 190 s per phase**, which matches the observed round cadence on the
-bench of roughly 13 minutes. The reserve sample is computed in its own phase and
-must be ready before the commit phase, so **190 s is a hard ceiling**, not a
-target.
+bench of roughly 13 minutes.
+
+**Correction (2026-09-28, #540):** this spec first said the sample must fit in
+one 190 s phase. The code allows more. Sampling starts when the claim phase
+starts (block 76 of the round) and is cancelled when the next round's reveal
+phase starts (block 190). So the budget is about **114 blocks, less the time to
+send the commit**: 570 s at 5 s blocks. Gnosis Chain is moving to 2 s blocks
+(GIP-153, targeted for December 2026 or January 2027), which makes it about
+228 s. The pass line below is kept at 120 s, and at 2 s blocks it leaves far
+less headroom than the 190 s figure suggested.
 
 Measured on bench hardware, the sample takes 69.0 s with SIMD hashing and 92.0 s
 without, over 243 runs. So the bench has roughly 2.7x headroom. A slow hosted
@@ -62,7 +69,7 @@ disk can plausibly consume that.
 **Pass:** three runs at the intended reserve size, every one at or under
 **120 s**, with the spread reported per rule 7.
 
-120 s rather than 190 s deliberately. The remaining 70 s absorbs reserve growth,
+120 s rather than the phase length deliberately. The remaining time absorbs reserve growth,
 accumulated Pebble compaction debt, and a noisy neighbour on shared hosting. A
 node that passes at 185 s passes today and fails silently in a month, and the
 failure mode is missed rounds with a node that otherwise looks healthy.

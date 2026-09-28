@@ -29,6 +29,10 @@ type Contract interface {
 	Claim(context.Context, ChunkInclusionProofs) (common.Hash, error)
 	Commit(context.Context, []byte, uint64) (common.Hash, error)
 	Reveal(context.Context, uint8, []byte, []byte) (common.Hash, error)
+	// CurrentRound returns the round the contract is in. The node computes
+	// the round itself from its compiled-in round length; this lets it check
+	// that the two agree before committing (#540).
+	CurrentRound(context.Context) (uint64, error)
 }
 
 type contract struct {
@@ -98,6 +102,29 @@ func (c *contract) IsWinner(ctx context.Context) (isWinner bool, err error) {
 		return false, fmt.Errorf("IsWinner: results %v : %w", results, err)
 	}
 	return results[0].(bool), nil
+}
+
+// CurrentRound returns the contract's current round.
+func (c *contract) CurrentRound(ctx context.Context) (uint64, error) {
+	callData, err := c.incentivesContractABI.Pack("currentRound")
+	if err != nil {
+		return 0, err
+	}
+
+	result, err := c.callTx(ctx, callData)
+	if err != nil {
+		return 0, fmt.Errorf("CurrentRound: %w", err)
+	}
+
+	results, err := c.incentivesContractABI.Unpack("currentRound", result)
+	if err != nil {
+		return 0, fmt.Errorf("CurrentRound: results %v : %w", results, err)
+	}
+	round, ok := results[0].(uint64)
+	if !ok {
+		return 0, fmt.Errorf("CurrentRound: unexpected result type %T", results[0])
+	}
+	return round, nil
 }
 
 // Claim sends a transaction to blockchain if a win is claimed.
