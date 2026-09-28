@@ -105,6 +105,20 @@ func TestAgentRoundCheck(t *testing.T) {
 			wantCommit: true,
 		},
 		{
+			// At the first block of a round the node's estimated block can
+			// run one ahead of the chain, so the contract still reports the
+			// previous round. The commit is sent: it lands in the new round.
+			name: "contract one round behind",
+			round: func(b *mockchainBackend) func(context.Context) (uint64, error) {
+				return func(context.Context) (uint64, error) {
+					b.mu.Lock()
+					defer b.mu.Unlock()
+					return (b.block-1)/blocksPerRound - 1, nil
+				}
+			},
+			wantCommit: true,
+		},
+		{
 			name: "contract disagrees",
 			round: func(*mockchainBackend) func(context.Context) (uint64, error) {
 				return func(context.Context) (uint64, error) { return 1 << 40, nil }

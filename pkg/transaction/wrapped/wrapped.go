@@ -167,7 +167,10 @@ func (b *wrappedBackend) computeAverageBlockTime(prev blockNumberAnchor, newNumb
 
 	averageBlockTime := elapsed / time.Duration(blocks)
 	if averageBlockTime > maxAverageBlockTime {
-		return maxAverageBlockTime, true
+		// A capped value comes from a stall, not from the chain's block
+		// time, so it is not reported as a measurement: the last real one
+		// stays in use (#540).
+		return maxAverageBlockTime, false
 	}
 
 	return averageBlockTime, true

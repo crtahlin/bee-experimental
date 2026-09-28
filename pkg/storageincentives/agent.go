@@ -291,11 +291,17 @@ func (a *Agent) handleCommit(ctx context.Context, round uint64) error {
 	// contract, #540) and a commit would land in the wrong phase and waste
 	// gas; not committing costs nothing. A failed call is not a disagreement:
 	// the node plays as it always has.
+	//
+	// A difference of one round is tolerated. The node's block number is an
+	// estimate that can run a block ahead of the chain, so at the first block
+	// of a round the contract, asked at the latest block, still reports the
+	// previous round, and the commit would succeed once mined. A changed
+	// round length makes the two differ by far more than one.
 	contractRound, err := a.contract.CurrentRound(ctx)
 	switch {
 	case err != nil:
 		a.logger.Debug("could not read the contract's round, committing on the node's own", "round", round, "error", err)
-	case contractRound != round:
+	case roundsDiffer(contractRound, round):
 		a.metrics.RoundMismatch.Inc()
 		a.logger.Error(nil, "the node's round disagrees with the redistribution contract's; not committing in this round", "node_round", round, "contract_round", contractRound)
 		return nil
@@ -309,6 +315,15 @@ func (a *Agent) handleCommit(ctx context.Context, round uint64) error {
 	a.state.SetLastPlayedRound(round)
 
 	return nil
+}
+
+// roundsDiffer reports whether the contract's round and the node's differ by
+// more than the one round an estimated block number can account for.
+func roundsDiffer(contractRound, nodeRound uint64) bool {
+	if contractRound > nodeRound {
+		return contractRound-nodeRound > 1
+	}
+	return nodeRound-contractRound > 1
 }
 
 func (a *Agent) handleReveal(ctx context.Context, round uint64) error {
