@@ -65,13 +65,17 @@ func (c *factory) Deploy(ctx context.Context, issuer common.Address, defaultHard
 		return common.Hash{}, err
 	}
 
+	// The gas is estimated, with the limit used before as the floor. A fixed
+	// limit cannot follow a change in the gas schedule: Glamsterdam's
+	// state-gas costs (EIP-8037) take this deployment from about 142k to about
+	// 616k gas (#541).
 	request := &transaction.TxRequest{
-		To:          &c.address,
-		Data:        callData,
-		GasPrice:    sctx.GetGasPrice(ctx),
-		GasLimit:    175000,
-		Value:       big.NewInt(0),
-		Description: "chequebook deployment",
+		To:                   &c.address,
+		Data:                 callData,
+		GasPrice:             sctx.GetGasPrice(ctx),
+		MinEstimatedGasLimit: DeployGasLimitFloor,
+		Value:                big.NewInt(0),
+		Description:          "chequebook deployment",
 	}
 
 	txHash, err := c.transactionService.Send(ctx, request, transaction.DefaultTipBoostPercent)

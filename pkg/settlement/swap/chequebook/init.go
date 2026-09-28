@@ -183,6 +183,19 @@ func Init(
 
 		chequebookAddress, err = chequebookFactory.WaitDeployed(ctx, txHash)
 		if err != nil {
+			// A reverted deployment will never produce a chequebook. Its hash
+			// is cleared so the next start deploys again; otherwise every start
+			// waits for the same reverted transaction and fails (#541). It is
+			// not redeployed here: a revert means something about the build or
+			// the chain is wrong, and deploying again at once would spend gas
+			// on the same mistake. Any other error keeps the hash, so a
+			// deployment that is only slow is never sent twice.
+			if errors.Is(err, transaction.ErrTransactionReverted) {
+				if delErr := stateStore.Delete(ChequebookDeploymentKey); delErr != nil {
+					return nil, errors.Join(err, fmt.Errorf("clear reverted chequebook deployment: %w", delErr))
+				}
+				logger.Error(err, "chequebook deployment reverted; the saved transaction was cleared and the next start deploys a new chequebook", "tx", txHash)
+			}
 			return nil, err
 		}
 
