@@ -151,7 +151,10 @@ type Options struct {
 	// BlockTimeSet reports that the operator set block-time explicitly. Then
 	// BlockTime is used as is; otherwise it is only the starting value until
 	// the chain's block time has been observed (#540).
-	BlockTimeSet                    bool
+	BlockTimeSet bool
+	// PostageConfirmationDepth is how many blocks behind the chain head postage
+	// events must be before they are applied (#545). At least 1.
+	PostageConfirmationDepth        uint64
 	BlockSyncInterval               uint64
 	BootnodeMode                    bool
 	Bootnodes                       []string
@@ -300,6 +303,17 @@ func effectiveMaxDoubling(requested, configuredMax int) (int, error) {
 // is briefly down has to come back on its own. Widening this turns a passing
 // outage into one that needs a human, which is worse than the loop it replaces.
 var ErrConfig = errors.New("node: invalid configuration")
+
+// validatePostageConfirmationDepth refuses a depth of 0, which would apply
+// postage events from the chain head itself, where they can still be rolled
+// back (#545). It is a configuration error, so the node stops instead of
+// restarting on it.
+func validatePostageConfirmationDepth(depth uint64) error {
+	if depth < 1 {
+		return fmt.Errorf("%w: postage-confirmation-depth %d: must be at least 1", ErrConfig, depth)
+	}
+	return nil
+}
 
 // runStakeRecoveryOnStartup optionally recovers stake left in retired staking
 // contracts when the node starts (issue #256). The mode is off (the default,
@@ -450,6 +464,10 @@ func NewBee(
 
 	if err := validatePublicAddress(o.NATAddr); err != nil {
 		return nil, fmt.Errorf("invalid NAT address %s: %w", o.NATAddr, err)
+	}
+
+	if err := validatePostageConfirmationDepth(o.PostageConfirmationDepth); err != nil {
+		return nil, err
 	}
 
 	if err := validatePublicAddress(o.NATWSSAddr); err != nil {
@@ -1025,7 +1043,7 @@ func NewBee(
 		contractGasLimit,
 	)
 
-	eventListener = listener.New(b.syncingStopped, logger, chainBackend, postageStampContractAddress, postageStampContractABI, blockTime, postageSyncingStallingTimeout, postageSyncingBackoffTimeout)
+	eventListener = listener.New(b.syncingStopped, logger, chainBackend, postageStampContractAddress, postageStampContractABI, blockTime, o.PostageConfirmationDepth, postageSyncingStallingTimeout, postageSyncingBackoffTimeout)
 	b.listenerCloser = eventListener
 
 	// Construct protocols.
@@ -1157,7 +1175,7 @@ func NewBee(
 
 	var batchSnapshot *batchservice.Snapshot
 	if useEmbeddedSnapshot(o.SkipPostageSnapshot, batchStoreExists, o.Resync, networkID, beeNodeMode) {
-		batchSnapshot, err = snapshot.New(ctx, logger, archive.Getter{}, b.syncingStopped, postageStampContractAddress, postageStampContractABI, blockTime, postageSyncingStallingTimeout, postageSyncingBackoffTimeout, postageSyncStart)
+		batchSnapshot, err = snapshot.New(ctx, logger, archive.Getter{}, b.syncingStopped, postageStampContractAddress, postageStampContractABI, blockTime, o.PostageConfirmationDepth, postageSyncingStallingTimeout, postageSyncingBackoffTimeout, postageSyncStart)
 		if err != nil {
 			// A corrupt snapshot is not fatal: rebuild from the chain instead.
 			logger.Error(err, "postage snapshot unavailable, syncing from chain instead")

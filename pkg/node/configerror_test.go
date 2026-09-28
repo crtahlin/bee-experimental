@@ -108,3 +108,19 @@ func TestRecoverableErrorIsNotAConfigError(t *testing.T) {
 		}
 	}
 }
+
+// TestPostageConfirmationDepthZeroIsAConfigError: a depth of 0 would apply
+// postage events from the chain head itself, so it is refused at start, as a
+// configuration error a restart cannot fix (#545).
+func TestPostageConfirmationDepthZeroIsAConfigError(t *testing.T) {
+	t.Parallel()
+
+	if err := node.ValidatePostageConfirmationDepth(0); !errors.Is(err, node.ErrConfig) {
+		t.Fatalf("depth 0: got %v, want node.ErrConfig", err)
+	}
+	for _, depth := range []uint64{1, 4, 12} {
+		if err := node.ValidatePostageConfirmationDepth(depth); err != nil {
+			t.Fatalf("depth %d: got %v, want accepted", depth, err)
+		}
+	}
+}

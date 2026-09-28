@@ -385,6 +385,7 @@ func buildBeeNode(ctx context.Context, c *command, cmd *cobra.Command, logger lo
 		BlockProfile:                    c.config.GetBool(optionNamePProfBlock),
 		BlockTime:                       networkConfig.blockTime,
 		BlockTimeSet:                    c.config.IsSet(optionNameBlockTime) && blockTime != 0,
+		PostageConfirmationDepth:        c.config.GetUint64(optionNamePostageConfirmationDepth),
 		BlockSyncInterval:               c.config.GetUint64(optionNameBlockSyncInterval),
 		BootnodeMode:                    bootNode,
 		Bootnodes:                       networkConfig.bootNodes,
