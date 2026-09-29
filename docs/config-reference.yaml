@@ -187,12 +187,21 @@
 # ========================================================================
 
 ## size of block cache of the database in bytes. This caches the index store's
-## blocks, not chunk data, which the operating system page cache serves. Raising
-## it uses more heap memory and, on a node whose reserve is larger than RAM,
-## leaves less page cache for the much larger chunk store, which can slow reads;
-## a node measurement found no reserve-sample speedup from raising it (issue #12).
-## Lowering it caches less of the index. The default serves a normal node; raise
-## it only on a large-reserve goleveldb node that has measured a need.
+## blocks, not chunk data, which the operating system page cache serves.
+##
+## With the pebble engine the default 33554432 becomes 268435456 (256 MiB). A
+## node holding a full neighbourhood has 63 to 68 MiB of bloom filters and index
+## blocks; below about 128 MiB of cache a reserve sample re-reads them on most
+## lookups and runs several times slower (issue #555). Any value other than
+## 33554432 is used as given, so set 33554431 for a deliberately small cache.
+## Raise it with reserve-capacity-doubling, which doubles the index.
+##
+## Raising it costs memory: this build keeps the cache on the Go heap, so up to
+## about twice its size in resident memory, taken from the page cache that
+## serves chunk reads. Lowering it below about twice the index's filters and
+## index blocks brings the slow samples back. With goleveldb the default stays
+## 33554432; a node measurement found no reserve-sample speedup from raising it
+## there, because the page cache already holds the index (issue #12).
 # db-block-cache-capacity: 33554432
 
 ## level-0 SST files at which the index store starts compacting; lower

@@ -119,6 +119,30 @@ func TestPebbleIndexStoreOptions(t *testing.T) {
 	}
 }
 
+// TestPebbleBlockCacheDefault checks that a Pebble index store gets its own,
+// larger block cache when db-block-cache-capacity is left at the shared
+// default, that any other value is used as given, and that goleveldb keeps the
+// shared default (#555).
+func TestPebbleBlockCacheDefault(t *testing.T) {
+	t.Parallel()
+
+	opts := defaultOptions()
+	if got, want := pebbleIndexStoreOptions(opts).Cache.MaxSize(), int64(defaultPebbleBlockCacheCapacity); got != want {
+		t.Errorf("pebble block cache at the shared default = %d, want %d", got, want)
+	}
+	if got, want := indexStoreOptions(opts).BlockCacheCapacity, int(defaultBlockCacheCapacity); got != want {
+		t.Errorf("goleveldb block cache at the shared default = %d, want %d", got, want)
+	}
+
+	// A value other than the shared default, larger or smaller, is used as given.
+	for _, v := range []uint64{64 << 20, 1 << 30, defaultBlockCacheCapacity - 1} {
+		opts.LdbBlockCacheCapacity = v
+		if got := pebbleIndexStoreOptions(opts).Cache.MaxSize(); got != int64(v) {
+			t.Errorf("explicit block cache %d not honoured: got %d", v, got)
+		}
+	}
+}
+
 // TestInitStoreOpensBothEngines is the integration check that the selector
 // actually constructs a working store for each engine, and errors on an unknown
 // one. Each engine opens its own fresh directory.

@@ -263,10 +263,16 @@ const (
 	// three without saying so.
 	drainTimeout = 5 * time.Second
 
-	defaultOpenFilesLimit         = uint64(256)
-	defaultBlockCacheCapacity     = uint64(32 * 1024 * 1024)
-	defaultWriteBufferSize        = uint64(32 * 1024 * 1024)
-	defaultDisableSeeksCompaction = false
+	defaultOpenFilesLimit     = uint64(256)
+	defaultBlockCacheCapacity = uint64(32 * 1024 * 1024)
+	// defaultPebbleBlockCacheCapacity replaces defaultBlockCacheCapacity for a
+	// Pebble index store. A full neighbourhood's bloom filters and index blocks
+	// come to 63-68 MiB, and at 32 MiB a reserve sample re-reads them on most
+	// lookups; 128 MiB was the smallest size that avoided it on three nodes.
+	// See docs/experiments/pebble-block-cache/spec.md (#555).
+	defaultPebbleBlockCacheCapacity = uint64(256 * 1024 * 1024)
+	defaultWriteBufferSize          = uint64(32 * 1024 * 1024)
+	defaultDisableSeeksCompaction   = false
 
 	// The three goleveldb level-0 triggers for the index store, made explicit
 	// so they can be configured. These are the values the store has always run
@@ -440,8 +446,8 @@ func indexStoreOptions(opts *Options) *opt.Options {
 // per node lifetime is not worth threading a closer through for.
 func pebbleIndexStoreOptions(opts *Options) *pebble.Options {
 	o := pebblestore.DefaultOptions()
-	if opts.LdbBlockCacheCapacity > 0 {
-		o.Cache = pebble.NewCache(int64(opts.LdbBlockCacheCapacity))
+	if c := pebbleBlockCacheCapacity(opts.LdbBlockCacheCapacity); c > 0 {
+		o.Cache = pebble.NewCache(int64(c))
 	}
 	if opts.LdbWriteBufferSize > 0 {
 		o.MemTableSize = opts.LdbWriteBufferSize
@@ -460,6 +466,18 @@ func pebbleIndexStoreOptions(opts *Options) *pebble.Options {
 		o.MaxOpenFiles = int(opts.LdbOpenFilesLimit)
 	}
 	return o
+}
+
+// pebbleBlockCacheCapacity returns the Pebble block cache size for a configured
+// db-block-cache-capacity. The shared default is sized for goleveldb and is too
+// small for a Pebble index holding a full neighbourhood (#555), so it is
+// replaced by defaultPebbleBlockCacheCapacity, the same way the L0 trigger's
+// shared default is. Any other operator value is used as given.
+func pebbleBlockCacheCapacity(configured uint64) uint64 {
+	if configured == defaultBlockCacheCapacity {
+		return defaultPebbleBlockCacheCapacity
+	}
+	return configured
 }
 
 func initDiskRepository(

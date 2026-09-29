@@ -348,7 +348,7 @@ func (c *command) setAllFlags(cmd *cobra.Command) {
 	cmd.Flags().String(optionNameReserveProofMode, "classic", "redistribution reserve-size proof: \"classic\" (default, the whole-reserve scan the live contract accepts) or \"windowed\" (experimental sublinear proof; NOT accepted by the live contract, wins nothing, testnet and research only). See issue #273.")
 	cmd.Flags().Uint64(optionNameReserveCapacity, 0, "reserve size in chunks; 0 uses the default of 4194304 (1<<22). Sets the base that reserve-capacity-doubling multiplies. For sizing the reserve to a disk or driving radius behaviour in testing. See issue #283.")
 	cmd.Flags().Uint64(optionNameDBOpenFilesLimit, 200, "number of open files allowed by database")
-	cmd.Flags().Uint64(optionNameDBBlockCacheCapacity, 32*1024*1024, "size of block cache of the database in bytes")
+	cmd.Flags().Uint64(optionNameDBBlockCacheCapacity, 32*1024*1024, "size of block cache of the database in bytes; with the pebble engine the default 33554432 becomes 268435456, and any other value is used as given")
 	cmd.Flags().Uint64(optionNameDBWriteBufferSize, 32*1024*1024, "size of the database write buffer in bytes")
 	cmd.Flags().Bool(optionNameDBDisableSeeksCompaction, true, "disables db compactions triggered by seeks")
 	cmd.Flags().Int(optionNameDBCompactionL0Trigger, 8, "level-0 SST files at which the index store starts compacting; lower compacts sooner and more often (more write amplification), higher lets level 0 grow (more read amplification on the sampling path); 0 means the goleveldb default of 4")
