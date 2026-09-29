@@ -119,27 +119,48 @@ func TestPebbleIndexStoreOptions(t *testing.T) {
 	}
 }
 
-// TestPebbleBlockCacheDefault checks that a Pebble index store gets its own,
-// larger block cache when db-block-cache-capacity is left at the shared
-// default, that any other value is used as given, and that goleveldb keeps the
-// shared default (#555).
+// TestPebbleBlockCacheDefault checks that a Pebble index store's block cache is
+// the usable size plus what its memtables can reserve (#555): 64 MiB usable when
+// db-block-cache-capacity is left at the shared default, any other value used as
+// the usable size, 0 leaving Pebble's own cache, and goleveldb unchanged.
 func TestPebbleBlockCacheDefault(t *testing.T) {
 	t.Parallel()
 
+	reserve := func(o *Options) int64 {
+		p := pebbleIndexStoreOptions(o)
+		return int64(p.MemTableStopWritesThreshold+1) * int64(p.MemTableSize)
+	}
+
 	opts := defaultOptions()
-	if got, want := pebbleIndexStoreOptions(opts).Cache.MaxSize(), int64(defaultPebbleBlockCacheCapacity); got != want {
-		t.Errorf("pebble block cache at the shared default = %d, want %d", got, want)
+	want := int64(defaultPebbleUsableBlockCache) + reserve(opts)
+	if got := pebbleIndexStoreOptions(opts).Cache.MaxSize(); got != want {
+		t.Errorf("pebble block cache at the shared default = %d, want %d (64 MiB usable plus the memtable reservation)", got, want)
+	}
+	if want != 160<<20 {
+		t.Errorf("default pebble block cache = %d, want 160 MiB (64 MiB + 3 x 32 MiB)", want)
 	}
 	if got, want := indexStoreOptions(opts).BlockCacheCapacity, int(defaultBlockCacheCapacity); got != want {
 		t.Errorf("goleveldb block cache at the shared default = %d, want %d", got, want)
 	}
 
-	// A value other than the shared default, larger or smaller, is used as given.
-	for _, v := range []uint64{64 << 20, 1 << 30, defaultBlockCacheCapacity - 1} {
+	// A larger write buffer raises the reservation, and the cache with it.
+	opts.LdbWriteBufferSize = 64 << 20
+	if got, want := pebbleIndexStoreOptions(opts).Cache.MaxSize(), int64(defaultPebbleUsableBlockCache)+3*(64<<20); got != want {
+		t.Errorf("pebble block cache with a 64 MiB write buffer = %d, want %d", got, want)
+	}
+
+	// A value other than the shared default, larger or smaller, is the usable size.
+	for _, v := range []uint64{8 << 20, 1 << 30, defaultBlockCacheCapacity - 1} {
 		opts.LdbBlockCacheCapacity = v
-		if got := pebbleIndexStoreOptions(opts).Cache.MaxSize(); got != int64(v) {
-			t.Errorf("explicit block cache %d not honoured: got %d", v, got)
+		if got, want := pebbleIndexStoreOptions(opts).Cache.MaxSize(), int64(v)+reserve(opts); got != want {
+			t.Errorf("explicit block cache %d: got %d, want %d", v, got, want)
 		}
+	}
+
+	// 0 leaves Pebble's own cache in place rather than a reservation-only one.
+	opts.LdbBlockCacheCapacity = 0
+	if got := pebbleBlockCacheCapacity(0, 64<<20, 2); got != 0 {
+		t.Errorf("block cache capacity 0 gave %d, want 0 (Pebble's own cache)", got)
 	}
 }
 
