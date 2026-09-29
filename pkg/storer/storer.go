@@ -263,8 +263,14 @@ const (
 	// three without saying so.
 	drainTimeout = 5 * time.Second
 
-	defaultOpenFilesLimit         = uint64(256)
-	defaultBlockCacheCapacity     = uint64(32 * 1024 * 1024)
+	defaultOpenFilesLimit     = uint64(256)
+	defaultBlockCacheCapacity = uint64(32 * 1024 * 1024)
+	// defaultPebbleUsableBlockCache replaces defaultBlockCacheCapacity as the
+	// usable Pebble block cache when the option is left at the shared default.
+	// Pebble charges memtables against its block cache, so
+	// pebbleBlockCacheCapacity adds their reservation on top. See
+	// docs/experiments/pebble-block-cache/spec.md (#555).
+	defaultPebbleUsableBlockCache = uint64(64 * 1024 * 1024)
 	defaultWriteBufferSize        = uint64(32 * 1024 * 1024)
 	defaultDisableSeeksCompaction = false
 
@@ -440,11 +446,13 @@ func indexStoreOptions(opts *Options) *opt.Options {
 // per node lifetime is not worth threading a closer through for.
 func pebbleIndexStoreOptions(opts *Options) *pebble.Options {
 	o := pebblestore.DefaultOptions()
-	if opts.LdbBlockCacheCapacity > 0 {
-		o.Cache = pebble.NewCache(int64(opts.LdbBlockCacheCapacity))
-	}
 	if opts.LdbWriteBufferSize > 0 {
 		o.MemTableSize = opts.LdbWriteBufferSize
+	}
+	// Sized after MemTableSize is known: the memtables reserve their size from
+	// this cache.
+	if c := pebbleBlockCacheCapacity(opts.LdbBlockCacheCapacity, o.MemTableSize, o.MemTableStopWritesThreshold); c > 0 {
+		o.Cache = pebble.NewCache(int64(c))
 	}
 	// Honour an explicit db-compaction-l0-trigger, but do not let its goleveldb
 	// oriented default clobber pebble's own shallow-L0 default, which is what makes
@@ -460,6 +468,30 @@ func pebbleIndexStoreOptions(opts *Options) *pebble.Options {
 		o.MaxOpenFiles = int(opts.LdbOpenFilesLimit)
 	}
 	return o
+}
+
+// pebbleBlockCacheCapacity returns the Pebble block cache size for a configured
+// db-block-cache-capacity, which is the usable cache the operator asks for.
+//
+// Pebble reserves each memtable's size from the block cache (Cache.Reserve),
+// including a memtable being flushed and one kept for recycling, so up to
+// (stopWritesThreshold+1) memtables. Without room for that, a grown memtable
+// leaves the cache unable to hold the filter blocks a reserve sample needs, and
+// the sample slows down several times (#555). The reservation is therefore
+// added on top of the usable size.
+//
+// The shared default is sized for goleveldb, so it is replaced by
+// defaultPebbleUsableBlockCache, the same way the L0 trigger's shared default
+// is. Any other operator value is used as given; 0 leaves Pebble's own cache.
+func pebbleBlockCacheCapacity(configured, memTableSize uint64, stopWritesThreshold int) uint64 {
+	if configured == 0 {
+		return 0
+	}
+	usable := configured
+	if configured == defaultBlockCacheCapacity {
+		usable = defaultPebbleUsableBlockCache
+	}
+	return usable + uint64(stopWritesThreshold+1)*memTableSize
 }
 
 func initDiskRepository(
