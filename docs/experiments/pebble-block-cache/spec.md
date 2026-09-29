@@ -12,8 +12,8 @@ new data directory, the same 32 MiB becomes Pebble's block cache
 
 With that cache, a reserve sample on a node holding a full neighbourhood spends
 about half of its CPU re-reading bloom filter blocks. Each lookup of a chunk's
-retrieval index entry needs the table's filter block (one per table, about
-120 to 400 KiB) and one 4 KiB partition of its two-level index. The filters and
+retrieval index entry needs the table's filter block (one per table, up to
+about 400 KiB and about 115 KiB on average) and one 4 KiB partition of its two-level index. The filters and
 index partitions do not stay in the cache, so they are read again, allocated on
 the Go heap (this build has no cgo), checksummed and collected, for most of the
 3.8 million lookups in a sample.
@@ -79,7 +79,7 @@ shared default (33554432), use **268435456 (256 MiB)** instead. An operator
 value that differs from the shared default is used as given.
 
 This is the pattern `pebbleIndexStoreOptions` already uses for
-`db-compaction-l0-trigger` (`pkg/storer/storer.go:449`): the goleveldb-oriented
+`db-compaction-l0-trigger` (`pkg/storer/storer.go:453`): the goleveldb-oriented
 default is not allowed to override what Pebble needs, and an explicit operator
 value still wins.
 
@@ -101,10 +101,11 @@ copies for Homebrew and Scoop), `docs/config-reference.yaml` and
 
 ### What raising and lowering it cost
 
-- **Raising it** costs Go heap, about one to one: the cache is allocated in Go
-  memory on this build. 256 MiB added about 0.6 GB to the resident size on
-  stake-1 (0.89 GB with 256 MiB against about 0.32 GB before, including the
-  heap's own overhead). A node with little RAM loses that much page cache.
+- **Raising it** costs Go heap: the cache is allocated in Go memory on this
+  build, and the collector lets the heap grow to about twice its live size, so
+  the resident cost is up to about twice the cache. 256 MiB added about 0.6 GB
+  to the resident size on stake-1 (0.89 GB against about 0.32 GB before). A
+  node with little RAM loses that much page cache.
 - **Lowering it** below about twice the index metadata brings back the filter
   re-reads, and with them a reserve sample several times slower. On a node with
   a full neighbourhood that means below about 128 MiB.
