@@ -43,7 +43,20 @@ MANIFEST before each sample.
   from 64 MiB to 4 MiB kept bench-2 fast for 1.7 h. The same node had been slow
   at 64 MiB.
 
-## The implementation
+## The implementation (spec, Measurement item 2)
 
-The measurement of the implementation itself (spec, Measurement item 2) is
-recorded on #555 when it has run.
+On bench-2 with a build of this change (`0.1.5-18e5e5dc`), using test 4's
+protocol (800 MB of local ingest before each sample), 6 runs alternating the two
+configurations, 2026-09-29.
+
+**Table: reserve sample after the write load, bench-2, with the change**
+
+| Configuration | Pebble cache | Sample durations | `readFilter` | Memtables before the sample | Cached blocks before the sample |
+|---|---|---|---|---|---|
+| defaults | 160 MiB | 45.8, 44.0, 45.1 s | 0.57 to 0.61% | 64 MB | 87 to 97 MB |
+| `db-write-buffer-size: 67108864` | 256 MiB | 45.7, 41.0, 46.3 s | 0.35 to 0.53% | 97 to 127 MB | 156 to 227 MB |
+
+**All 6 runs were under 150 s, with `readFilter` under 5%. The success criterion
+is met.** With the memtables at full size, the cache still held 87 to 227 MB of
+blocks. Under the same load the previous 32 MiB default was slow in 6 of 6 runs
+(test 4).
