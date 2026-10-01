@@ -234,7 +234,29 @@ func (db *DB) reserveSample(
 			addStats(stats)
 		}()
 
-		err := db.reserve.IterateChunksItems(db.StorageRadius(), func(ch *reserve.ChunkBinItem) (bool, error) {
+		// Walk only the bins that can hold the anchor's neighbourhood. On a
+		// node with reserve-capacity-doubling d the reserve holds 2^d
+		// neighbourhoods, and walking all of them to sample one cost 8x the
+		// index reads at d=3. When the anchor is far from the overlay the
+		// range is still one bin holding several neighbourhoods, up to 2^(d-1)
+		// of them in bin d below the committed depth. See issue #568.
+		lo, hi, ok := sampleBins(db.baseAddr.Bytes(), anchor, committedDepth, db.StorageRadius())
+		if !ok {
+			return nil
+		}
+
+		err := db.reserve.IterateChunksItems(lo, func(ch *reserve.ChunkBinItem) (bool, error) {
+			// Keys are ordered by bin first, so nothing after this is in range.
+			if ch.Bin > hi {
+				return true, nil
+			}
+			stats.ChunkBinScanned++
+
+			// Required when p < committedDepth: the range is then bin p, which
+			// also holds the other neighbourhoods that share p bits with the
+			// overlay, and this drops them. When p >= committedDepth every
+			// entry in range passes. It cannot recover chunks a range that is
+			// too narrow would miss; the tests guard that side.
 			if swarm.Proximity(ch.Address.Bytes(), anchor) < committedDepth {
 				return false, nil
 			}
@@ -612,6 +634,28 @@ type SampleStats struct {
 	// still passed to the readers, so they are not lost — they are counted here
 	// and will usually be counted again in ChunkLoadFailed.
 	LocateFailed int64
+	// ChunkBinScanned is how many chunkBin entries the iteration walked, counted
+	// before any filter. TotalIterated counts only the entries in the anchor's
+	// neighbourhood, so this is what shows the cost of the index scan itself.
+	// See issue #568.
+	ChunkBinScanned int64
+}
+
+// sampleBins returns the range of reserve bins that can hold chunks within
+// committedDepth of the anchor, and false when the range lies entirely below
+// the storage radius. A chunk's bin is its proximity to the overlay. With p the
+// proximity of the overlay to the anchor: if p < committedDepth, every such
+// chunk shares exactly p bits with the overlay, so only bin p can hold them;
+// otherwise they are exactly bins committedDepth to MaxPO. The derivation is in
+// docs/experiments/sampler-bin-range/spec.md.
+func sampleBins(overlay, anchor []byte, committedDepth, storageRadius uint8) (lo, hi uint8, ok bool) {
+	p := swarm.Proximity(overlay, anchor)
+	lo, hi = committedDepth, swarm.MaxPO
+	if p < committedDepth {
+		lo, hi = p, p
+	}
+	lo = max(lo, storageRadius)
+	return lo, hi, lo <= hi
 }
 
 func (s *SampleStats) add(other SampleStats) {
@@ -629,6 +673,7 @@ func (s *SampleStats) add(other SampleStats) {
 	s.ChunkLoadFailed += other.ChunkLoadFailed
 	s.StampLoadFailed += other.StampLoadFailed
 	s.TotalIterated += other.TotalIterated
+	s.ChunkBinScanned += other.ChunkBinScanned
 	// Assigned, not summed: exactly one ordering stage runs, and a sum would
 	// still read correctly today while quietly becoming a multiple if that ever
 	// stopped being true.
@@ -708,6 +753,7 @@ func (db *DB) recordReserveSampleMetrics(duration time.Duration, stats *SampleSt
 	summaryMetrics := map[string]float64{
 		"duration_seconds":                     duration.Seconds(),
 		"chunks_iterated":                      float64(stats.TotalIterated),
+		"chunk_bin_scanned":                    float64(stats.ChunkBinScanned),
 		"chunks_load_failed":                   float64(stats.ChunkLoadFailed),
 		"stamp_validations":                    float64(stats.SampleInserts),
 		"invalid_stamps":                       float64(stats.InvalidStamp),
