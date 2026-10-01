@@ -81,11 +81,13 @@ In `reserveSample` (`pkg/storer/sample.go`):
 2. Iterate with `IterateChunksItems(lo, ...)` and stop (return `true`) at the
    first item with `Bin > hi`. Keys are ordered by bin first, so everything after
    that item is outside the range.
-3. Keep the anchor filter unchanged inside the loop. Inside the range it always
-   passes, at the cost of one proximity computation per entry. It can only reject
-   chunks, so it protects against a range that is too wide, not one that is too
-   narrow: chunks outside a too-narrow range would be lost without any error.
-   The equivalence test below is what guards against that.
+3. Keep the anchor filter unchanged inside the loop. When `p >= D` every entry
+   in the range passes it. When `p < D` it is required: the range is then bin
+   `p`, which also holds the other neighbourhoods that share `p` bits with the
+   overlay, and the filter drops them. It can only reject chunks, so it protects
+   against a range that is too wide, not one that is too narrow: chunks outside
+   a too-narrow range would be lost without any error. The equivalence test
+   below is what guards against that.
 4. Add `ChunkBinScanned int64` to `SampleStats`: entries walked, counted before
    any filter. It is added in `SampleStats.add` and logged with the other fields,
    so measurements can show the scan directly.
@@ -110,7 +112,11 @@ on the wire or on disk changes, and `.github/protocol-freeze.lock` is untouched.
    those of the unchanged loop, kept in the test as a reference implementation.
    Also check that `ChunkBinScanned` equals the number of stored entries in bins
    `lo` to `hi`, because equal samples alone cannot detect a range that is too
-   wide. Required cases:
+   wide. As implemented, the test compares `TotalIterated` with the reference
+   loop's count rather than the sample items and hash: the bounded scan walks a
+   subset of the reference loop's entries with the same filters, so an equal
+   count means an equal set of chunks, and every later stage is unchanged.
+   Required cases:
    - `p < D` with the storage radius at or below `p` (a doubled node), so the
      correct sample is non-empty and comes from bin `p` only;
    - `p < D` with the storage radius above `p` (nothing to walk);

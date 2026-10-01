@@ -237,7 +237,9 @@ func (db *DB) reserveSample(
 		// Walk only the bins that can hold the anchor's neighbourhood. On a
 		// node with reserve-capacity-doubling d the reserve holds 2^d
 		// neighbourhoods, and walking all of them to sample one cost 8x the
-		// index reads at d=3. See issue #568.
+		// index reads at d=3. When the anchor is far from the overlay the
+		// range is still one bin holding several neighbourhoods, up to 2^(d-1)
+		// of them in bin d below the committed depth. See issue #568.
 		lo, hi, ok := sampleBins(db.baseAddr.Bytes(), anchor, committedDepth, db.StorageRadius())
 		if !ok {
 			return nil
@@ -250,9 +252,10 @@ func (db *DB) reserveSample(
 			}
 			stats.ChunkBinScanned++
 
-			// Inside the range this always passes. It is kept because it costs
-			// one proximity per entry and rejects anything a range that is too
-			// wide would let through. It cannot recover chunks a range that is
+			// Required when p < committedDepth: the range is then bin p, which
+			// also holds the other neighbourhoods that share p bits with the
+			// overlay, and this drops them. When p >= committedDepth every
+			// entry in range passes. It cannot recover chunks a range that is
 			// too narrow would miss; the tests guard that side.
 			if swarm.Proximity(ch.Address.Bytes(), anchor) < committedDepth {
 				return false, nil
@@ -639,8 +642,8 @@ type SampleStats struct {
 }
 
 // sampleBins returns the range of reserve bins that can hold chunks within
-// committedDepth of the anchor, and false when no bin at or above the storage
-// radius can. A chunk's bin is its proximity to the overlay. With p the
+// committedDepth of the anchor, and false when the range lies entirely below
+// the storage radius. A chunk's bin is its proximity to the overlay. With p the
 // proximity of the overlay to the anchor: if p < committedDepth, every such
 // chunk shares exactly p bits with the overlay, so only bin p can hold them;
 // otherwise they are exactly bins committedDepth to MaxPO. The derivation is in
@@ -750,6 +753,7 @@ func (db *DB) recordReserveSampleMetrics(duration time.Duration, stats *SampleSt
 	summaryMetrics := map[string]float64{
 		"duration_seconds":                     duration.Seconds(),
 		"chunks_iterated":                      float64(stats.TotalIterated),
+		"chunk_bin_scanned":                    float64(stats.ChunkBinScanned),
 		"chunks_load_failed":                   float64(stats.ChunkLoadFailed),
 		"stamp_validations":                    float64(stats.SampleInserts),
 		"invalid_stamps":                       float64(stats.InvalidStamp),

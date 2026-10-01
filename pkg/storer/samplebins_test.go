@@ -25,7 +25,9 @@ import (
 // bounded scan walks a subset of those entries and applies the same filter, so
 // equal TotalIterated means equal sets of chunks, and so an equal sample.
 // ChunkBinScanned is checked as well, because equal samples alone cannot show a
-// range that is too wide.
+// range that is too wide. The spec also asks to compare sample items and hash
+// with a reference; that follows from the equal set of chunks, since every
+// stage after the iteration is unchanged.
 func TestReserveSampleScansOnlyAnchorBins(t *testing.T) {
 	t.Parallel()
 
@@ -52,7 +54,8 @@ func TestReserveSampleScansOnlyAnchorBins(t *testing.T) {
 		return ch.WithBatch(3, 2, false).WithStamp(postagetesting.MustNewStampWithTimestamp(timeVar - 1))
 	}
 	chs := make([]swarm.Chunk, 0, chunksPerBin*(maxGeneratedPO+1+anchorCount))
-	// Chunks in every low bin of the overlay.
+	// Chunks across the low bins of the overlay. GenerateValidRandomChunkAt
+	// returns a chunk with proximity above po, so these land in bins 1 and up.
 	for po := range maxGeneratedPO {
 		for range chunksPerBin {
 			chs = append(chs, stamped(chunk.GenerateValidRandomChunkAt(t, baseAddr, po)))
@@ -67,7 +70,8 @@ func TestReserveSampleScansOnlyAnchorBins(t *testing.T) {
 	}
 
 	// Anchors at a chosen proximity p to the overlay, each with chunks of its own
-	// neighbourhood, so that a sample with p < committedDepth is not empty.
+	// neighbourhood (proximity above committedDepth to the anchor), so that a
+	// sample with p < committedDepth is not empty.
 	anchors := map[uint8]swarm.Address{}
 	for _, p := range []uint8{3, 5, 7} {
 		a := swarm.RandAddressAt(t, baseAddr, int(p))
