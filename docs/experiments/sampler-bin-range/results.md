@@ -12,7 +12,7 @@ about 30.7 million chunks in the reserve), 2026-10-01, 14:15 to 15:33 UTC.
   - **worst case:** p = 6, equal to the storage radius, so the range is bin 6, holding 4 neighbourhoods;
   - **own neighbourhood:** p = 12, which is at least D, so the range is bins 9 to 31.
 - **Runs:** 3 per build and anchor, interleaved. Each run began with a binary swap and a restart, then 3 minutes of settling, then an emptied page cache, then one sample.
-- **Other conditions:** `read_ahead_kb` 8192 (#567 found no setting better). bench-2 was idle.
+- **Other conditions:** `read_ahead_kb` 8192, the benches' default. bench-2 was idle.
 - `main` has no `ChunkBinScanned`. Its scan is the reserve size at or above the storage radius, about 30.7 million entries.
 
 **Table: reserve sample on bench-1 at doubling 3, `main` against the bounded scan**
@@ -54,12 +54,13 @@ A separate trace (`bpftrace` on `vfs_read` and on page-cache insertions, one col
 - **The disk reads 2 to 2.7 times what bee requests.** Part of this is certain: a sharky slot is 4,201 bytes, larger than a 4 KB page and not aligned to pages, so every chunk read brings in two pages. That alone is about 31 GB for 3.86 million chunks.
 - **Correction (2026-10-01):** this page first said "Readahead is not the cause.
   #567 found no readahead setting that changes sample time." That was wrong.
-  The #567 comparisons changed `read_ahead_kb` without restarting bee, and Linux
-  copies that setting into a file's state only when the file is opened. So
-  readahead never reached the shard files, and nothing was measured. In a single
-  worst-case sample with readahead actually at 16 KB, applied with a restart,
-  bee read 29.5 GB instead of about 65 GB, but issued about 20 times as many
-  requests. A proper comparison is registered on #567.
+  Readahead was never tested in #567. Its first attempt did not write the
+  value. Its later parts changed `read_ahead_kb` without restarting bee, and
+  Linux copies that setting into a file's state only when the file is opened,
+  so the shard files kept 8192. In a single worst-case sample with readahead
+  actually at 16 KB, applied with a restart, bee read 29.5 GB instead of about
+  65 GB, but issued about 20 times as many requests as at 8192 KB. That run
+  took 95 s and was not faster. A proper comparison is registered on #567.
 
 ## Conclusion
 
