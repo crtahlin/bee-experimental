@@ -52,7 +52,14 @@ A separate trace (`bpftrace` on `vfs_read` and on page-cache insertions, one col
 - **Sharky's share is the same at every doubling:** one read per sampled chunk.
 - **Pebble's share grows about 4.5 times at doubling 3.** The full index walk is part of it, and this change removes it. Point lookups in an index 8 times larger are the likely rest.
 - **The disk reads 2 to 2.7 times what bee requests.** Part of this is certain: a sharky slot is 4,201 bytes, larger than a 4 KB page and not aligned to pages, so every chunk read brings in two pages. That alone is about 31 GB for 3.86 million chunks.
-- **Readahead is not the cause.** #567 found no readahead setting that changes sample time.
+- **Correction (2026-10-01):** this page first said "Readahead is not the cause.
+  #567 found no readahead setting that changes sample time." That was wrong.
+  The #567 comparisons changed `read_ahead_kb` without restarting bee, and Linux
+  copies that setting into a file's state only when the file is opened. So
+  readahead never reached the shard files, and nothing was measured. In a single
+  worst-case sample with readahead actually at 16 KB, applied with a restart,
+  bee read 29.5 GB instead of about 65 GB, but issued about 20 times as many
+  requests. A proper comparison is registered on #567.
 
 ## Conclusion
 
