@@ -36,6 +36,10 @@ Upstream v2.8.1 has the same loop (`pkg/storer/sample.go:105`).
 
 ## Hypothesis
 
+Terms: the proximity of two addresses is the number of leading bits they share
+(`swarm.Proximity`). A chunk is "within `D` of the anchor" when its proximity to
+the anchor is at least `D`; those are the chunks the sampler keeps.
+
 A chunk's bin is its proximity to the node's overlay address
 (`reserve.go:123`, `swarm.Proximity(r.baseAddr, chunkAddr)`). Let `p` be the
 proximity of the overlay to the anchor, and `D` the committed depth. `Proximity`
@@ -54,7 +58,17 @@ cap applies equally to both.
 Walking only those bins visits every chunk the current loop keeps, and skips only
 chunks the current filter rejects. At doubling 3 that is 3.85 to 15 million
 entries instead of about 30 million: bin 6 holds four neighbourhoods, bin 7 two,
-bin 8 and above one.
+bin 8 one, and bins 9 to 31 together one.
+
+**Assumption.** This relies on each stored bin being the proximity of the chunk to
+the current overlay, `db.baseAddr`. That holds while the overlay is unchanged.
+It does not hold if the overlay changes without the reserve being reset: the node
+resets the reserve on an overlay change only when a nonce was already stored
+(`pkg/node/node.go:580-608`), so losing the state store's nonce keeps the old
+reserve under a new overlay. In that state the current loop and the bounded loop
+would sample different sets. Both are already wrong there, because the stored bins
+no longer describe the neighbourhood, so this change does not make that case
+worse, but it does make it different.
 
 ## Design
 
@@ -67,15 +81,18 @@ In `reserveSample` (`pkg/storer/sample.go`):
 2. Iterate with `IterateChunksItems(lo, ...)` and stop (return `true`) at the
    first item with `Bin > hi`. Keys are ordered by bin first, so everything after
    that item is outside the range.
-3. Keep the anchor filter unchanged inside the loop. It becomes a check that
-   always passes inside the range. It costs one proximity computation per entry,
-   and it keeps the sample correct if the reasoning above is ever wrong.
+3. Keep the anchor filter unchanged inside the loop. Inside the range it always
+   passes, at the cost of one proximity computation per entry. It can only reject
+   chunks, so it protects against a range that is too wide, not one that is too
+   narrow: chunks outside a too-narrow range would be lost without any error.
+   The equivalence test below is what guards against that.
 4. Add `ChunkBinScanned int64` to `SampleStats`: entries walked, counted before
    any filter. It is added in `SampleStats.add` and logged with the other fields,
    so measurements can show the scan directly.
 
 `db.baseAddr` is the address the reserve uses for its bins: both come from
-`opts.Address` (`pkg/storer/storer.go:917,960`).
+`opts.Address` (`pkg/storer/storer.go:917` and `961`). `db.StorageRadius()` is
+read once and the same value is used for the clamp and for nothing else.
 
 No new configuration. There is nothing to tune: the range is fully determined by
 the overlay, the anchor and the committed depth.
@@ -88,20 +105,42 @@ on the wire or on disk changes, and `.github/protocol-freeze.lock` is untouched.
 
 ## Measurement
 
-1. **Equivalence (unit test, `pkg/storer`).** Build a reserve at several storage
-   radii, and for anchors giving `p < D`, `p = D` and `p > D`, check that the
-   sample items, `TotalIterated` and the sample hash equal those of the unchanged
-   loop. The old loop is kept in the test as a reference implementation.
-2. **Mutation checks** on the bounds: `lo` from `p` to `p+1`, the stop condition
-   from `> hi` to `>= hi`, and the `p < D` comparison to `<=`. Each must make the
-   equivalence test fail.
+1. **Equivalence (unit test, `pkg/storer`).** Build a reserve and, for each case
+   below, check that the sample items, `TotalIterated` and the sample hash equal
+   those of the unchanged loop, kept in the test as a reference implementation.
+   Also check that `ChunkBinScanned` equals the number of stored entries in bins
+   `lo` to `hi`, because equal samples alone cannot detect a range that is too
+   wide. Required cases:
+   - `p < D` with the storage radius at or below `p` (a doubled node), so the
+     correct sample is non-empty and comes from bin `p` only;
+   - `p < D` with the storage radius above `p` (nothing to walk);
+   - `p = D` and `p > D`;
+   - chunks placed on purpose in bin 31 (`chunk.GenerateTestRandomChunkAt`), so
+     the upper bound is exercised, since random chunks almost never land there;
+   - windowed mode (`inWindow` set), which filters after the anchor.
+2. **Mutation checks.** Each must make the test fail:
+   - `lo` from `p` to `p+1`;
+   - the stop condition from `> hi` to `>= hi`;
+   - the `p < D` comparison to `<=`;
+   - the early stop removed (walk to the end, as today);
+   - the start moved back to the storage radius;
+   - the storage-radius clamp dropped.
 3. **bench-1 at doubling 3**, after #567 restores its readahead to the setting
    #567 finds best, or 8192 if none wins. A build of this change against `main`
    (1f956b40), 3 runs each, interleaved, each from an emptied page cache:
    sampler duration, `ChunkBinScanned`, and bytes and requests read (iostat).
-   **Success:** `ChunkBinScanned` drops from about 30 million to the size of the
-   anchor's bins, and the sample reads fewer bytes. Duration is reported either
-   way.
+   - The scan size depends on `p`: at doubling 3 it is about 3.85 million when
+     `p >= D` and about 15 million when `p` equals the storage radius (bin 6).
+     Both builds therefore use the same fixed anchors, passed to the `/rchash`
+     endpoint, and two anchors are measured: one with `p` equal to the storage
+     radius (the worst case) and one with `p >= D`. The value of `p` is reported
+     for each.
+   - `main` has no `ChunkBinScanned`. Its scan size is taken as the reserve size
+     at or above the storage radius (`/status` `reserveSize`, about 30.7 million
+     on bench-1), which is what the current loop walks.
+   - **Success:** `ChunkBinScanned` equals the size of the anchor's bins, and the
+     sample reads fewer bytes than `main` in all 3 runs for the same anchor.
+     Duration is reported either way, together with the readahead setting used.
 4. **A negative result** is no change in duration or bytes read. That would mean
    the index scan is cheap next to the shard reads, and the gap #566 found comes
    from readahead (#567).
@@ -115,7 +154,9 @@ without it. Nothing is stored, so there is nothing to migrate.
 
 The change is local to `reserveSample` and uses only `swarm.Proximity`, the
 reserve's existing `IterateChunksItems`, and the bin stored in each
-`ChunkBinItem`. It applies to upstream v2.8.1 as is. It only matters there for
+`ChunkBinItem`. Upstream v2.8.1 has the same loop, bin computation and key layout.
+The patch needs small changes there, because upstream counts `TotalIterated` in a
+different place and has no windowed mode. It only matters there for
 nodes using `reserve-capacity-doubling`, which upstream caps at 1. At doubling 1
 the scan halves.
 
