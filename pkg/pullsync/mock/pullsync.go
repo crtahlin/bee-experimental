@@ -46,6 +46,9 @@ type SyncReply struct {
 	Start   uint64
 	Topmost uint64
 	Count   int
+	// Err, when set, is returned with this reply instead of the mock-wide
+	// error from WithSyncError, so a test can mix failures and successes.
+	Err error
 }
 
 type PullSyncMock struct {
@@ -82,6 +85,9 @@ func (p *PullSyncMock) Sync(ctx context.Context, peer swarm.Address, bin uint8, 
 		p.replies[id] = p.replies[id][1:]
 		p.syncCalls = append(p.syncCalls, reply)
 		p.mtx.Unlock()
+		if reply.Err != nil {
+			return reply.Topmost, reply.Count, reply.Err
+		}
 		return reply.Topmost, reply.Count, p.syncErr
 	}
 	p.mtx.Unlock()
