@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -127,6 +128,12 @@ type Puller struct {
 	start sync.Once
 
 	limiter *ratelimit.Limiter
+
+	// retryBackoffBase and retryBackoffMax bound the wait after a pull-sync
+	// call that made no progress. Fields rather than package variables so a
+	// test can change them before Start without racing other tests. See #573.
+	retryBackoffBase time.Duration
+	retryBackoffMax  time.Duration
 }
 
 func New(
@@ -170,9 +177,45 @@ func New(
 		cancel:         func() { /* Noop, since the context is initialized in the Start(). */ },
 		limiter:        ratelimit.NewLimiter(ratelimit.Every(time.Second/time.Duration(rateLimit)), rateLimit),
 		recalcPeersDur: recalcDur,
+
+		retryBackoffBase: defaultRetryBackoffBase,
+		retryBackoffMax:  defaultRetryBackoffMax,
 	}
 
 	return p
+}
+
+const (
+	defaultRetryBackoffBase = time.Second
+	defaultRetryBackoffMax  = time.Minute
+)
+
+// retryBackoff is the wait after the n-th consecutive pull-sync call that made
+// no progress: the base doubled n-1 times, capped at the maximum, plus a random
+// 0 to 20 percent so that a peer's workers do not retry in step.
+func (p *Puller) retryBackoff(n int) time.Duration {
+	d := p.retryBackoffMax
+	if n < 1 {
+		n = 1
+	}
+	if n <= 30 && p.retryBackoffBase<<(n-1) < p.retryBackoffMax {
+		d = p.retryBackoffBase << (n - 1)
+	}
+	return d + time.Duration(rand.Int64N(int64(d)/5+1)) //nolint:gosec // timing jitter, not security
+}
+
+// waitRetry waits before retrying a peer that keeps failing. It returns false
+// if ctx ended first. It must end with ctx: removing a peer waits for that
+// peer's workers while holding locks the manage loop needs. See #573.
+func (p *Puller) waitRetry(ctx context.Context, failures int) bool {
+	t := time.NewTimer(p.retryBackoff(failures))
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }
 
 func (p *Puller) Start(ctx context.Context) {
@@ -394,6 +437,9 @@ func (p *Puller) syncPeerBin(parentCtx context.Context, peer *syncPeer, bin uint
 		defer p.metrics.SyncWorkerCounter.Dec()
 
 		var err error
+		// failures counts consecutive calls that made no progress; any call
+		// that advances the interval resets it. See #573.
+		failures := 0
 
 		for {
 			if isHistorical { // override start with the next interval if historical syncing
@@ -443,6 +489,18 @@ func (p *Puller) syncPeerBin(parentCtx context.Context, peer *syncPeer, bin uint
 				}
 				errCount := countErrors(err)
 				p.logger.Debug("syncWorker interval failed", "error_count", errCount, "example_error", errors.Unwrap(err), "peer_address", address, "bin", bin, "cursor", cursor, "start", start, "topmost", top)
+				// A call that failed without advancing the interval is retried
+				// only after a pause; one that advanced (some chunks failed, the
+				// interval moved on) continues at once, as before. Without the
+				// pause, a peer that keeps failing is retried as fast as the
+				// network allows. See #573.
+				if top < start {
+					failures++
+					if !p.waitRetry(ctx, failures) {
+						p.logger.Debug("syncWorker context cancelled", "peer_address", address, "bin", bin)
+						return
+					}
+				}
 			}
 
 			_ = p.limiter.WaitN(ctx, count)
@@ -456,6 +514,7 @@ func (p *Puller) syncPeerBin(parentCtx context.Context, peer *syncPeer, bin uint
 
 			// pulled at least one chunk
 			if top >= start {
+				failures = 0
 				if err := p.addPeerInterval(address, bin, start, top); err != nil {
 					p.metrics.SyncWorkerErrCounter.Inc()
 					p.logger.Error(err, "syncWorker could not persist interval for peer, quitting", "peer_address", address)

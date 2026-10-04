@@ -4,7 +4,29 @@
 
 package puller
 
-import "github.com/ethersphere/bee/v2/pkg/swarm"
+import (
+	"time"
+
+	"github.com/ethersphere/bee/v2/pkg/swarm"
+	dto "github.com/prometheus/client_model/go"
+)
+
+// SyncWorkers returns the number of running sync workers, from the
+// SyncWorkerCounter gauge.
+func (p *Puller) SyncWorkers() float64 {
+	var m dto.Metric
+	if err := p.metrics.SyncWorkerCounter.Write(&m); err != nil {
+		return -1
+	}
+	return m.GetGauge().GetValue()
+}
+
+// SetRetryBackoff sets the wait bounds after a failed pull-sync call. Call it
+// before Start.
+func (p *Puller) SetRetryBackoff(base, maxWait time.Duration) {
+	p.retryBackoffBase = base
+	p.retryBackoffMax = maxWait
+}
 
 var PeerIntervalKey = peerIntervalKey
 
