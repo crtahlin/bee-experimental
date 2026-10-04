@@ -126,6 +126,7 @@ whether upstream has the problem. See
 | [#522](https://github.com/crtahlin/wasp/issues/522) | api: POST /connect to an already connected peer answers 500, and on the reverse direction disconnects the peer | done, validated | `spec/522-connect-already-connected`, `fix/522-connect-already-connected` | [`1063b2bf`](https://github.com/crtahlin/wasp/commit/1063b2bf) |
 | [#541](https://github.com/crtahlin/wasp/issues/541) | swap: fixed gas limits fail under Glamsterdam's state-gas costs; chequebook deploy breaks on Sepolia on 2026-10-06 | fixed, validation pending | `spec/541-swap-gas-estimation`, `fix/541-swap-gas-estimation` | [`97442a76`](https://github.com/crtahlin/wasp/commit/97442a76) |
 | [#548](https://github.com/crtahlin/wasp/issues/548) | swap: a reverted initial deposit into a new chequebook is never retried | open | - | - |
+| [#573](https://github.com/crtahlin/wasp/issues/573) | Puller: a peer that keeps failing pull-sync is retried with no pause (2,000 attempts/s, 1.4 cores) | open | - | - |
 
 #301 and #302 are done, and they settle only half of what #300 says. Its per
 peer half stands: the three chain calls were confirmed directly, and the rate at
