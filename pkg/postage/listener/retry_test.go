@@ -85,7 +85,9 @@ func startRetryListener(t *testing.T, f *failingLogsFilterer, backoff time.Durat
 		f,
 		postageStampContractAddress,
 		postageStampContractABI,
-		func() time.Duration { return 1 },
+		// A block time of backoff makes the wait after a successful page as
+		// long as after a failure, so the page test can tell them apart.
+		func() time.Duration { return backoff },
 		listener.DefaultConfirmationDepth,
 		stallingTimeout,
 		backoff,
