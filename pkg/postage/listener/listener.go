@@ -356,6 +356,10 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 				l.metrics.BackendErrors.Inc()
 				l.logger.Warning("could not get blockchain log", "error", err)
 				lastConfirmedBlock = 0
+				// Wait backoffTime before retrying, as after a failed block
+				// number query; a paged pass would otherwise retry at once.
+				// See #578.
+				paged = false
 				continue
 			}
 
