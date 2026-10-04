@@ -169,3 +169,21 @@ func TestPullerRetryWaitEndsWithContext(t *testing.T) {
 		t.Fatalf("%v sync workers still running 1 s after the peer was removed: the retry wait must end when the worker's context ends", p.SyncWorkers())
 	}
 }
+
+// TestPullerRetryBackoffBounds: the wait stays between base and max plus 20
+// percent for any failure count, including bases large enough that shifting
+// them would overflow.
+func TestPullerRetryBackoffBounds(t *testing.T) {
+	t.Parallel()
+
+	for _, base := range []time.Duration{time.Millisecond, time.Second, 20 * time.Second, time.Minute} {
+		p := puller.New(swarm.RandAddress(t), nil, nil, nil, nil, nil, log.Noop, puller.Options{Bins: 1})
+		p.SetRetryBackoff(base, 10*time.Minute)
+		for n := -1; n <= 70; n++ {
+			got := p.RetryBackoff(n)
+			if got < base || got > 12*time.Minute {
+				t.Fatalf("base %v, %d failures: wait %v, want between %v and 12m", base, n, got, base)
+			}
+		}
+	}
+}

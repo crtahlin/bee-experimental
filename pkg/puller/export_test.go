@@ -28,6 +28,9 @@ func (p *Puller) SetRetryBackoff(base, maxWait time.Duration) {
 	p.retryBackoffMax = maxWait
 }
 
+// RetryBackoff returns the wait after n consecutive failed calls.
+func (p *Puller) RetryBackoff(n int) time.Duration { return p.retryBackoff(n) }
+
 var PeerIntervalKey = peerIntervalKey
 
 func (p *Puller) IsSyncing(addr swarm.Address) bool {

@@ -198,7 +198,7 @@ func (p *Puller) retryBackoff(n int) time.Duration {
 	if n < 1 {
 		n = 1
 	}
-	if n <= 30 && p.retryBackoffBase<<(n-1) < p.retryBackoffMax {
+	if n <= 30 && p.retryBackoffBase < p.retryBackoffMax>>(n-1) {
 		d = p.retryBackoffBase << (n - 1)
 	}
 	return d + time.Duration(rand.Int64N(int64(d)/5+1)) //nolint:gosec // timing jitter, not security
