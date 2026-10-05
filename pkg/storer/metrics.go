@@ -38,6 +38,7 @@ type metrics struct {
 	RecoveryPrunedChunkCount      prometheus.Counter
 	ReserveHasWaitDuration        prometheus.Histogram
 	ReserveScanDuration           *prometheus.HistogramVec
+	RadiusCheck                   *prometheus.CounterVec
 	LocalIngestChunks             prometheus.Gauge
 }
 
@@ -213,6 +214,15 @@ func newMetrics() metrics {
 				Name:      "recovery_pruned_chunk_count",
 				Help:      "Number of corrupted chunks pruned from the index during sharky recovery.",
 			},
+		),
+		RadiusCheck: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: m.Namespace,
+				Subsystem: subsystem,
+				Name:      "radius_check_total",
+				Help:      "Checks whether to lower the storage radius, by what started the check and its result.",
+			},
+			[]string{"trigger", "result"},
 		),
 		ReserveScanDuration: prometheus.NewHistogramVec(
 			prometheus.HistogramOpts{

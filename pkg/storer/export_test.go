@@ -16,6 +16,7 @@ import (
 	"github.com/ethersphere/bee/v2/pkg/storer/internal/events"
 	"github.com/ethersphere/bee/v2/pkg/storer/internal/reserve"
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 )
 
 func (db *DB) Reserve() *reserve.Reserve {
@@ -196,3 +197,41 @@ func CacheLimiterCancelled(db *DB) bool {
 		return false
 	}
 }
+
+// Radius decision hooks (#588).
+
+// SetRadiusTimings replaces the hold times and intervals of the radius
+// decision. Call it before StartReserveWorker.
+func (db *DB) SetRadiusTimings(holdAfterDecrease, holdAfterRaise, scanInterval, samplingPoll time.Duration) {
+	db.radiusTimings = radiusTimings{
+		holdAfterDecrease: holdAfterDecrease,
+		holdAfterRaise:    holdAfterRaise,
+		scanInterval:      scanInterval,
+		samplingPoll:      samplingPoll,
+	}
+}
+
+// RadiusChecks reads the radius_check_total counter.
+func (db *DB) RadiusChecks(trigger, result string) float64 {
+	var m dto.Metric
+	if err := db.metrics.RadiusCheck.WithLabelValues(trigger, result).Write(&m); err != nil {
+		return -1
+	}
+	return m.GetCounter().GetValue()
+}
+
+// ReserveScans returns how many reserve passes of a kind ("count" or
+// "combined") have run.
+func (db *DB) ReserveScans(kind string) uint64 {
+	var m dto.Metric
+	h, ok := db.metrics.ReserveScanDuration.WithLabelValues(kind).(prometheus.Histogram)
+	if !ok || h.Write(&m) != nil {
+		return 0
+	}
+	return m.GetHistogram().GetSampleCount()
+}
+
+// SetSampling sets the sampling-in-progress flag as a running sample does.
+func (db *DB) SetSampling(v bool) { db.samplingInProgress.Store(v) }
+
+const FallbackChecks = fallbackChecks

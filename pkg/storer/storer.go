@@ -769,6 +769,12 @@ type DB struct {
 	// pause pulling and leave the store quiet for the sample. See issue #23.
 	samplingInProgress atomic.Bool
 
+	// withinRadius is the last count of reserve chunks within the storage
+	// radius and the radius it was counted at. radiusTimings are the hold
+	// times and intervals of the radius decision. See issue #588.
+	withinRadius  withinRadiusCount
+	radiusTimings radiusTimings
+
 	pinIntegrity *PinIntegrity
 }
 
@@ -950,6 +956,7 @@ func New(ctx context.Context, dirPath string, opts *Options) (*DB, error) {
 		directUploadLimiter: make(chan struct{}, pusher.ConcurrentPushes),
 		reserveHasLimiter:   reserveHasSlots(opts.ReserveHasConcurrency),
 		pinIntegrity:        pinIntegrity,
+		radiusTimings:       defaultRadiusTimings(),
 	}
 
 	if db.validStamp == nil {
