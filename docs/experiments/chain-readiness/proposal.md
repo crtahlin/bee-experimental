@@ -6,6 +6,11 @@ Status: proposal, 2026-10-05. Nothing here is implemented yet except where it sa
 
 Changes to the chain a node runs on can reach every node, on dates wasp does not control. The client should not assume one chain's parameters.
 
+Terms used below:
+- A **rollup** is a chain that records its blocks on another chain, its parent chain, usually Ethereum.
+- **State gas** is the extra gas EIP-8037 charges for creating new contract storage.
+- A node **plays** a round of the storage-incentives game when it sends commit, reveal and, if it wins, claim transactions.
+
 **Table: chain changes that affect a Swarm node, with what is known about their dates on 2026-10-05**
 
 | Change | What it means for a node | Date |
@@ -36,7 +41,7 @@ The client computes the round and phase itself, from compiled-in constants (`pkg
 - `DefaultBlocksPerPhase = 152 / 4 = 38`;
 - commit for blocks 0 to 37 of a round, reveal for 38 to 75, claim for 76 to 151.
 
-In the Swarm contracts (`go-storage-incentives-abi` v0.9.4), the round length is a constant **with no getter**, and the contracts cannot be upgraded. A different round length therefore means new contracts, and every client must then match them exactly. A setting on its own would mostly be a new way to configure a node wrongly.
+In the Swarm contracts, the round length is a constant, `ROUND_LENGTH` in the redistribution contract's source, and the ABI the client uses (`go-storage-incentives-abi` v0.9.4) has **no getter** for it and no upgrade function. The contracts therefore cannot be upgraded in place. A different round length therefore means new contracts, and every client must then match them exactly. A setting on its own would mostly be a new way to configure a node wrongly.
 
 The contract does expose what is needed to check the client:
 - `currentRound()`;
@@ -53,7 +58,7 @@ Block time is different: it already adjusts itself through the observed value. O
 
 ### W1. Glamsterdam: measure and finish (urgent)
 
-- **Measure #541 on Sepolia after the fork.** Use fresh accounts and the harness from the baseline run on 2026-09-28. Run five cases, each with v0.1.5 and with `main`, three times:
+- **Measure #541 on Sepolia after the fork.** Use fresh accounts and the same script as the [baseline run on 2026-09-28](https://github.com/crtahlin/wasp/issues/541#issuecomment-5874659373). Run five cases, each with v0.1.5 and with `main`, three times:
   - chequebook deployment;
   - first deposit;
   - withdrawal to an owner who holds no tokens;
@@ -63,7 +68,7 @@ Block time is different: it already adjusts itself through the observed value. O
   The results PR closes #541.
 - **[#547](https://github.com/crtahlin/wasp/issues/547):** the balance check before a chequebook deployment asks for a fixed 250,000 gas (`pkg/settlement/swap/chequebook/init.go`). Base it on the gas estimate, with 250,000 as the minimum.
 - **[#548](https://github.com/crtahlin/wasp/issues/548):** an initial chequebook deposit that reverts is never retried. Warn, and retry when a deposit is configured and the chequebook balance is 0.
-- **New:** with `transaction-debug-mode`, every contract call gets a fixed limit of 1,000,000 gas (`pkg/node/node.go`). Use the estimate, with 1,000,000 as the minimum.
+- **New:** with `transaction-debug-mode`, transactions to the postage, staking and redistribution contracts skip gas estimation and get a fixed limit of 1,000,000 gas (`pkg/node/node.go`). Skipping the estimate is the point of the mode: a transaction that would revert is still sent, so it can be inspected on the chain. Keep that, and make the fixed limit a setting, so it can be raised when state gas makes 1,000,000 too low.
 - **New:** the storage-incentives funds check assumes 15 transactions of 250,000 gas each (`minTxCountToCover`, `avgTxGas` in `pkg/storageincentives/agent.go`). Base it on the gas the node's own last commit, reveal and claim used, with today's value as the minimum.
 
 None of this depends on upstream Bee.
@@ -71,25 +76,33 @@ None of this depends on upstream Bee.
 ### W2. Gnosis EEZ at 2 s blocks: close the remaining gaps
 
 - **[#556](https://github.com/crtahlin/wasp/issues/556):** the observed block time jumps by about 11 per cent when one slot is missed, and the stamp TTL jumps with it. Smooth the value used for the TTL; keep the raw value for estimating block numbers.
-- **New:** two places still use the fixed block time instead of the observed one (`pkg/node/chain.go`, `InitChain`):
-  - the transaction monitor's polling interval;
-  - the wrapped backend's starting estimate.
-- **New:** the phase check runs every 5 blocks when a phase is longer than 10 blocks (`agent.go`, the `blocksPerPhase > 10` branch). A new phase can therefore be noticed up to 5 blocks late. At 2 s blocks the sampling window is about 228 s, and 10 s of it is lost this way. Check every block. The block number used there is an estimate from the wrapped backend, so this should not add RPC calls; the spec must confirm that.
+- **New:** the configured block time, 5 s on mainnet unless set, is still used in two places (`pkg/node/chain.go`, `InitChain`):
+  - the transaction monitor's polling interval, which is fixed at start;
+  - the wrapped backend's fallback, used before the first measurement and after any refresh that fails to measure.
+
+  At 2 s blocks the effect is small: receipts are noticed a few seconds later. Poll the monitor at the observed block time, and keep the fallback as it is but log when it is in use.
+- **New:** the phase check runs every 5 blocks when a phase is longer than 10 blocks (`agent.go`, the `blocksPerPhase > 10` branch). A new phase can therefore be noticed up to 5 blocks late. At 2 s blocks the sampling window is about 228 s, and 10 s of it is lost this way. Check every block. The block number used there is an estimate from the wrapped backend, which fetches a new header only every `block-sync-interval` blocks (default 10), so with the default this adds no RPC calls. With a `block-sync-interval` below 5 it would; the spec must handle that. Checking more often removes only the delay between checks, not the error of the estimate itself.
 - **[#545](https://github.com/crtahlin/wasp/issues/545):** decide the confirmation depth from a reorg measurement on the EEZ testnet, and check whether the chain serves the `safe` and `finalized` block tags (see W5).
 - **[#552](https://github.com/crtahlin/wasp/issues/552), [#554](https://github.com/crtahlin/wasp/issues/554):** missing tests for the block-time watcher and the confirmation-depth wiring.
 
 ### W3. Learn the round structure from the contract
 
-- At startup, read `currentRound()` together with the block number, and infer the number of blocks per round. Check the phase boundaries with `currentPhaseCommit/Reveal/Claim()` close to the predicted boundary.
+- **Infer the round length from where the round number changes, not by division.** One pair of block number and round number fits many lengths when the round number is small. That does not matter on Gnosis today, where the round number is about 270,000, but it does on a new or local chain. The spec should therefore find the block at which `currentRound()` changes, twice, and take the distance.
+- **Read the contract at an explicit block, taken from a real block header.** The client's block number is an estimate that is refreshed only every few blocks, and a call without a block number runs at whichever block the endpoint has. Close to a boundary, that difference is exactly what the check would trip on. Calls at an explicit block need a new call path, and only recent blocks can be queried on providers that keep limited history (often about 128 blocks); the spec states which blocks it reads.
+- **State the assumption that rounds start at block 0**, which the client assumes today and nothing checks, and check it.
+- The phase split (one quarter, one quarter, one half) has no getter either. Assume it, and confirm it with `currentPhaseCommit/Reveal/Claim()` at the predicted boundaries.
 - Repeat the check once per round.
-- New setting `redistribution-blocks-per-round`. The default is the inferred value. An operator sets it explicitly only for a deployment of the contracts with a different round length. The phase split (one quarter, one quarter, one half) comes from the same source.
-- When the inferred value, the setting and the contract disagree, the node does not play. It logs one clear error and counts the event in a metric. Today's check runs only before a commit; extend it to reveal and claim.
+- New setting `redistribution-blocks-per-round`. The default is the inferred value. An operator sets it explicitly only for a deployment of the contracts with a different round length.
+- Two disagreements are possible: the setting against the inferred value at startup, and the per-round check against the contract. In either case the node does not play, logs one clear error and counts the event in a metric. Today's round check runs only before a commit, and lets the node commit when the contract call fails. The spec must decide what a failed call does; extend the check to reveal and claim.
 - The contract rejects a transaction in the last block of a phase (`PhaseLastBlock`); the client ignores this today. Do not send a transaction predicted to land in that block.
 - Everything else derived from 152 follows the learned value:
   - the batch balance cut-off (`minBatchBalance`);
   - the stamp time cut-off for a sample (`getPreviousRoundTime`);
   - the timeout of the phase check.
-- **Sample budget check.** Compute the sampling window in seconds: from the start of claim to the start of the next round's reveal, which is 114 blocks today, times the observed block time. Warn when the node's last measured sample time takes more than a set share of it. Operators then learn before a chain change that their node will miss rounds.
+- Two edge cases the spec must cover:
+  - **Round 0.** `getPreviousRoundTime` computes the start of the previous round, which wraps around below zero in round 0. A new local test chain starts there.
+  - **A break in block numbers**, for example if numbering does not continue across the EEZ switch. `minBatchBalance` subtracts block numbers without a check, the freeze check compares the estimated block with one stored by the contract, and the postage listener and stored round data would be wrong. Detect a block number that goes backwards or jumps, and stop playing until it is understood.
+- **Sample budget check.** Compute the sampling window in seconds: from the start of claim to the start of the next round's reveal, which is 114 blocks today, times the observed block time, less the time to get the commit transaction mined and less the last block of the commit phase. Warn when the node's last measured sample time takes more than a set share of it. Operators then learn before a chain change that their node will miss rounds.
 
   **Table: sampling window for 152-block rounds, against measured sample times**
 
@@ -99,7 +112,7 @@ None of this depends on upstream Bee.
   | Gnosis EEZ, 2 s blocks | about 228 s |
   | Ethereum, 12 s blocks | about 23 minutes |
 
-  For comparison, a test node covering eight neighbourhoods (`reserve-capacity-doubling: 3`) took 145 to 192 s for its slowest neighbourhood in October 2026, while other nodes on the machine were syncing.
+  For comparison, a test node covering eight neighbourhoods (`reserve-capacity-doubling: 3`) took 145 to 192 s for its slowest neighbourhood in October 2026, while other nodes on the same machine were syncing. These are working measurements, not yet published in this repository. Related: [#494](https://github.com/crtahlin/wasp/issues/494), [#495](https://github.com/crtahlin/wasp/issues/495), [#566](https://github.com/crtahlin/wasp/issues/566).
 
 ### W4. A chain profile: point a node at any chain by configuration
 
@@ -134,10 +147,10 @@ Proposal:
 |---|---|---|---|
 | `block-time` in whole seconds | `cmd/bee/cmd/cmd.go` | Cannot express sub-second block times | Accept a duration (`250ms`, `2s`); a plain number still means seconds |
 | Postage confirmation depth in blocks | `pkg/postage/listener` | 4 blocks is about 1 s on a chain with 0.25 s blocks and 48 s at 12 s blocks | Option to follow the chain's `finalized` or `safe` block instead |
-| Log page of 5,000 blocks | `pkg/postage/listener` | Providers limit `eth_getLogs` ranges; fast chains need more pages | Page size in the profile, and a smaller page after a failure ([#583](https://github.com/crtahlin/wasp/issues/583)) |
+| Log page of 5,000 blocks (50,000 when replaying the snapshot) | `pkg/postage/listener` | Providers limit `eth_getLogs` ranges; fast chains need more pages | Page size in the profile, and a smaller page after a failure ([#583](https://github.com/crtahlin/wasp/issues/583)) |
 | Failover: an endpoint may lag 8 blocks | `pkg/transaction/failover` | 2 s at 0.25 s blocks, so endpoints would be dropped too often | Express the lag as time |
 | Transaction cancellation depth of 12 blocks | `pkg/node/chain.go` | 3 s at 0.25 s blocks, 144 s at 12 s blocks | Express as time |
-| Block time measured from whole-second header timestamps | `pkg/transaction/wrapped` | On sub-second chains, the difference between two anchors can be 0 or 1 s | Measure over a longer span when the difference is small |
+| Block time measured from whole-second header timestamps | `pkg/transaction/wrapped` | On sub-second chains, the timestamps of the two blocks used for a measurement can differ by 0 or 1 s | Measure over a longer span when the difference is small |
 
 ### W6. Rollup-specific behaviour (record only)
 
@@ -159,9 +172,12 @@ Proposal:
 
 ## Not in wasp's hands
 
-Listed so the picture is complete. These are contract or chain properties, not client changes:
+These are contract or chain properties, not client changes:
 
-- The contracts count in blocks. With 2 s blocks, a round of 152 blocks lasts about 5 minutes, and a price per block buys 2.5 times less wall-clock time. The price and `minimumValidityBlocks` are contract parameters; the client only reads them.
+- The contracts count in blocks. With 2 s blocks, a round of 152 blocks lasts about 5 minutes, and a price per block buys 2.5 times less wall-clock time. The price and `minimumValidityBlocks` are contract parameters with admin setters (`setPrice`, `setMinimumValidityBlocks`); the client only reads them.
+- Other values counted in blocks or rounds in the contracts also become shorter in wall-clock time: the freeze length after a disagreement, and the minimum age of a stake before it may play.
+- The price oracle keeps its own round count; contracts with a different round length involve it as well.
+- Operators who set `block-time: 5` explicitly keep 5 s after the switch and get only a warning. They should remove the setting before the switch.
 - Whatever round length the contracts use, W3 lets the client follow it.
 - Open questions about the EEZ chain:
   - Do block numbers continue across the switch?
@@ -185,19 +201,20 @@ Existing issues are referenced, not duplicated: #541, #545, #547, #548, #552, #5
 
 | Work item | Title | Labels | Priority |
 |---|---|---|---|
-| W1 | transaction: use the gas estimate in transaction debug mode, with 1,000,000 as the minimum | fix | p2 |
-| W1 | storageincentives: base the funds check on the gas the node's own transactions used | fix, area/incentives | p2 |
-| W2 | node: use the observed block time for transaction monitor polling and the wrapped backend's starting estimate | fix | p1 |
-| W2 | storageincentives: check for a phase change every block | fix, area/incentives | p1 |
-| W3 | storageincentives: learn the round structure from the contract, with a `redistribution-blocks-per-round` setting for new deployments | fix, area/incentives, config | p1 |
-| W3 | storageincentives: do not send a commit, reveal or claim into the last block of a phase | fix, area/incentives | p2 |
-| W3 | storageincentives: warn when the last sample took too much of the sampling window | fix, area/incentives | p2 |
-| W4 | config: chain profile file for contracts, ABIs, bytecode hashes and per-chain values | config | p2 |
-| W4 | postage: tie the embedded snapshot to the chain ID | fix, area/postage | p1 |
-| W5 | config: accept a duration for `block-time` | config | p2 |
-| W5 | postage: option to follow the chain's `finalized` or `safe` block instead of a confirmation depth | fix, area/postage, config | p2 |
-| W5 | transaction: express failover lag and cancellation depth as time | fix | p2 |
-| W7 | test: local test chain with chosen block time and round length | chore | p1 |
+| W1 | node: make the fixed gas limit of transaction debug mode a setting | config, needs-spec | p2 |
+| W1 | storageincentives: base the funds check on the gas the node's own transactions used | fix, area/incentives, needs-spec | p2 |
+| W2 | node: poll the transaction monitor at the observed block time | fix, needs-spec | p2 |
+| W2 | storageincentives: check for a phase change every block | fix, area/incentives, needs-spec | p1 |
+| W3 | storageincentives: learn the round structure from the contract, with a `redistribution-blocks-per-round` setting for new deployments | fix, area/incentives, config, stake-risk, needs-spec | p1 |
+| W3 | storageincentives: do not send a commit, reveal or claim into the last block of a phase | fix, area/incentives, needs-spec | p2 |
+| W3 | storageincentives: handle round 0 and a break in block numbers | fix, area/incentives, needs-spec | p1 |
+| W3 | storageincentives: warn when the last sample took too much of the sampling window (see #494, #495, #566) | fix, area/incentives, needs-spec | p2 |
+| W4 | config: chain profile file for contracts, ABIs, bytecode hashes and per-chain values | config, needs-spec | p2 |
+| W4 | postage: tie the embedded snapshot to the chain ID | fix, area/postage, needs-spec | p1 |
+| W5 | config: accept a duration for `block-time` | config, needs-spec | p2 |
+| W5 | postage: option to follow the chain's `finalized` or `safe` block instead of a confirmation depth | fix, area/postage, config, needs-spec | p2 |
+| W5 | transaction: express failover lag and cancellation depth as time | fix, needs-spec | p2 |
+| W7 | test: local test chain with chosen block time and round length | chore, needs-spec | p1 |
 | W6 | storageincentives: rollups whose `block.number` is the parent chain's (record only) | fix, area/incentives, icebox | p2 |
 
 Each issue that turns out to concern unmodified upstream code gets `affects-upstream` once it is shown, not before.
