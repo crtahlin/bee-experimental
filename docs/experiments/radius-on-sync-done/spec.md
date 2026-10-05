@@ -70,63 +70,87 @@ Lower the radius as soon as the puller has finished the historical sync for the 
 
 A stalled worker that makes progress again is counted as running again.
 
-**Where the counts change.** The counts are atomic, so readers never take `syncPeersMtx`. That lock is held during `recalcPeers`, which makes network calls.
+**Where the state is kept.** Each in-scope peer and bin has one entry in a map owned by the puller. The map has its own small mutex, `histMtx`, with these rules:
+- `histMtx` is never held across a network call or a wait;
+- it is never taken while `peer.mtx` is held by a caller that waits for workers;
+- workers take only `histMtx`, never `peer.mtx`, on their exit path.
 
-- **Running count:**
-  - Incremented in `syncPeerBin`, synchronously, in the `cursor > 0` branch, before `safe.Go`. That code runs under `peer.mtx` and `syncPeersMtx`.
-  - Decremented by a `defer` registered after `defer peer.wg.Done()`. Deferred calls run in reverse order, so the decrement happens before `Done`. As a result, when `disconnectPeer` finishes waiting for a peer's workers, they have all decremented.
-  - A worker that becomes stalled decrements once and sets a local flag. If it makes progress again, it increments and clears the flag. Its final decrement runs only while it is counted. The count therefore cannot go negative or stay positive after the worker exits.
-- **On a radius increase,** `cancelBin` does not wait for workers. Cancelled workers decrement when they exit. This only keeps the count pending a little longer, which is safe.
-- **Not-started count and neighbour count:** recomputed under the lock at the end of `onChange`, after `recalcPeers` returns, and stored atomically.
-  - The not-started count includes only in-scope peers whose cursors are missing or wrong and that are not yet stalled.
-  - The neighbour count includes only neighbours (PO ≥ r) whose in-scope bins have all finished cleanly. That guarantees at least one complete source was synced, not merely that a peer exists.
+Workers must not take `peer.mtx` on exit: `stop()` waits for workers while `peer.mtx` is held, so a worker that takes it would deadlock.
 
-**The radius is published last.** The puller stores the radius its counts belong to atomically, at the end of `onChange`, after `recalcPeers` has returned. Every increment for that radius has therefore already happened. Until the first publication, the stored value is a sentinel meaning "none", because radius 0 is valid.
+**Who updates which entry:**
+- `syncPeerBin` sets the entry to running when it starts a historical worker, or to finished when the cursor is 0.
+- The historical worker updates its own entry:
+  - finished, on the `start > cursor` exit;
+  - aborted, on the abort exits;
+  - stalled, after 10 minutes of failures with no progress;
+  - running again, after progress.
 
-On a radius decrease, `onChange` waits for every old worker to exit, through `disconnectPeer` and `wg.Wait`, before the new workers start. The running count is then not reset. If it is not 0 at that point, that is logged at warning level as a bug, instead of being hidden by a reset.
+  Only the historical worker does this. The live worker shares the same closure, so the update is guarded by `isHistorical`.
+- At the end of `onChange`, under `histMtx`:
+  - entries of peers and bins no longer in scope are removed;
+  - in-scope peers with missing or wrong cursors get a not-started entry with its first-seen time;
+  - a not-started entry older than 10 minutes becomes stalled.
 
-**`HistoricalSyncDone(radius uint8) bool`** returns true when:
-1. the published radius equals `radius`;
-2. the running count is 0;
-3. the not-started count is 0;
-4. the neighbour count is at least 1.
+  A radius decrease disconnects every peer, which recreates their entries. Each step therefore starts its stall timers again. A peer that keeps failing adds up to 10 minutes to every step, not only to the first.
 
-**`HistoricalSyncChanged() <-chan struct{}`** is a channel with a buffer of 1, sent to without blocking whenever `HistoricalSyncDone` may have become true:
-- the running count reaches 0;
-- the radius is published;
-- a worker or peer becomes stalled;
-- the neighbour count rises above 0.
+**The radius is published last, and recalculation is visible.** An atomic "recalculating" flag is set at the start of `onChange` and cleared at its end. The puller publishes the radius its map belongs to at the end of `onChange`, after `recalcPeers` has returned. Until the first publication, the published value is a sentinel meaning "none", because radius 0 is valid. While the flag is set, for example while a new neighbour's `GetCursors` call is in flight, the state is not done.
 
-The receiver re-reads the state, so a duplicate signal does no harm, and none of the cases that matter is missed.
+**`HistoricalSyncDone(radius uint8) bool`** returns false while recalculating or when the published radius differs. Otherwise it reads the map under `histMtx` and returns true when:
+1. no entry is running or not started;
+2. at least one neighbour (PO >= radius) has every in-scope bin finished cleanly.
+
+Stalled and aborted entries do not block it and do not count as a finished neighbour. Reading the map costs one pass over about 170 peers times up to 26 bins, about 4,400 entries. That is microseconds, and it runs only when the reserve worker asks.
+
+**`HistoricalSyncChanged() <-chan struct{}`** is a channel with a buffer of 1, sent to without blocking:
+- when an entry changes to finished, stalled or aborted;
+- when an entry is removed;
+- when the published radius changes;
+- when `onChange` changes the set of not-started entries.
+
+A plain `onChange` that changes nothing sends no signal. The receiver re-reads the state, so a duplicate signal does no harm.
+
+**A bin left after `ErrPeerNotFound`.** It keeps its cancel function in `binCancelFuncs`. If the peer reconnects before `onChange` removes it, the bin is not restarted. Today's code behaves the same way. That neighbour then simply does not count as finished, which is safe.
 
 The comment "Number of active historical syncing jobs" on the storer's `Syncer` interface describes `SyncRate()` wrongly, and is corrected.
 
 ### 2. The reserve worker lowers the radius on that state (`pkg/storer/reserve.go`)
 
-**One function, `checkRadius(trigger)`, holds the decision.** It runs the cheap conditions first, then the scan, then the final condition:
+**One function, `checkRadius(trigger)`, holds the decision.**
 
-1. **Cheap conditions, first:**
-   - `radius > minimumRadius`;
-   - the hold times have passed;
-   - `!db.IsSampling()`;
-   - `syncer.HistoricalSyncDone(radius)`.
+- **The ticker** first scans unconditionally, with the combined pass as today. That keeps batch reconciliation, the `ReserveSizeWithinRadius` metric and `/status` current. It then evaluates the rule below.
+- **A signal or an expiry** evaluates the cheap conditions first, and stops if any fails:
+  - `radius > minimumRadius`;
+  - the hold times have passed;
+  - `!db.IsSampling()`;
+  - `syncer.HistoricalSyncDone(radius)`.
 
-   If any fails, it stops before scanning.
-2. **Scan, only when needed.** For a signal-triggered check, it scans only if the last measured count within radius (`reserveSizeWithinRadius`) was below the threshold. That is the situation a signal is for. The ticker always scans, as today, because the scan also removes chunks of batches that no longer exist.
-3. **Final condition:** `count < threshold(capacity)`, then lower by one.
+  It then decides the count as follows:
+  - **Without a scan:** if `reserve.Size()`, which is current and at least the count within radius, is below the threshold, the count is below it too, and no scan is needed.
+  - **Otherwise it scans,** using the count-only pass (`countChunksWithinRadius`), when one of these holds:
+    - the stored count belongs to a different radius;
+    - the stored count is below the threshold;
+    - the trigger is an expiry, because the reserve just got smaller.
+  - **Otherwise it stops.** This is the common case on a full node after a neighbour reconnects.
+
+  Scans started by a signal or an expiry are limited to one every 2 minutes.
+- **The rule:** `count < threshold(capacity)` and the conditions above, then the radius is lowered by one.
+
+**The stored count becomes a field of `DB`,** together with the radius it was measured at. Today `reserveSizeWithinRadius` is a package-level variable, which parallel tests with several `DB`s would share.
+
+**Fallback to today's rule.** If neighbours are connected, but no neighbour has finished cleanly for 4 ticker checks in a row (about an hour), the old rule applies on the ticker: `count < threshold && SyncRate() == 0`. It logs a warning once, and counts the event as `result="fallback"`. This covers peers that all stall, abort or report wrong cursors. In those cases the new rule alone would never lower the radius, while today's eventually does. The change can therefore not be worse than today.
 
 **Hold times, kept in memory:**
-- at least 2 minutes after a decrease;
-- at least 15 minutes after an increase made by `unreserve` while the node runs.
+- 2 minutes after a decrease, and from start;
+- 15 minutes after an increase made by `unreserve`.
 
-They limit how often a cycle of lowering, going over capacity, raising and pulling again can repeat. Today's thresholds of 50 and 100 per cent leave little margin, because lowering the radius roughly doubles the count. The holds do not prevent such a cycle, so the churn metric below watches for it. After a restart, both holds start from the start time.
+There is no 15-minute hold from start, so a new node can make its first step as soon as its sync is done. The holds limit how often a cycle of lowering, going over capacity, raising and pulling again can repeat. Today's thresholds of 50 and 100 per cent leave little margin, because lowering the radius roughly doubles the count. The holds do not prevent such a cycle, so the churn metric watches for it.
 
 **Triggers:**
-- **The ticker,** every `reserve-wakeup-duration` as today, as the fallback.
-- **`HistoricalSyncChanged`.**
-- **`evictExpiredBatches` finishing,** because the reserve got smaller. The cheap conditions run first, so frequent on-chain expiries cost no scan unless the state also says "done".
+- the ticker, every `reserve-wakeup-duration` as today;
+- `HistoricalSyncChanged`;
+- `evictExpiredBatches` finishing.
 
-**Retry with one timer.** A signal-triggered check that is refused by the 2-minute rate limit, a hold or a running sample is not dropped. One timer is set for the earliest time it can pass. While a sample runs, the timer polls `IsSampling` every 30 seconds. Sampling runs only for rounds the node is selected for, and lasts minutes, so the timer never waits for long.
+**Retry with one timer.** A signal-triggered check refused by the scan limit, a hold or a running sample is not dropped. One timer is armed for the earliest time it can pass. While a sample runs, the timer polls `IsSampling` every 30 seconds. While the timer is not armed, its channel is nil. A successful ticker check does not cancel a pending retry, because a second check does no harm.
 
 **Unchanged:**
 - the 50 per cent threshold;
@@ -135,15 +159,14 @@ They limit how often a cycle of lowering, going over capacity, raising and pulli
 
 **Expected cost:**
 - **While a node fills:** a few extra scans per radius step.
-- **On a full, idle node:** neighbour reconnects make the running count go up and back to 0. Each such signal costs only the cheap conditions plus, at most, a scan when the last count was below the threshold. That does not happen on a full node, so it costs no scan.
+- **On a full, idle node:** a neighbour that reconnects starts and finishes its historical workers, which sends signals. Each signal costs a map read and the size check. A full node's size is above the threshold and its stored count belongs to the current radius, so no scan runs.
 
 ### 3. Metrics
 
 - `bee_localstore_radius_check_total{trigger, result}` (the storer's metrics subsystem is `localstore`):
   - `trigger` is one of `ticker`, `sync_done`, `expiry`;
-  - `result` is one of `lowered`, `above_threshold`, `sync_pending`, `held`, `postponed_sampling`, `minimum`, `skipped_scan`.
-- `bee_puller_historical_pending`: the running and not-started counts.
-- `bee_puller_historical_excluded`: the stalled and aborted counts.
+  - `result` is one of `lowered`, `above_threshold`, `sync_pending`, `held`, `postponed_sampling`, `minimum`, `skipped_scan`, `fallback`.
+- `bee_puller_historical_bins{state}`: in-scope peer and bin entries by state (`running`, `not_started`, `finished`, `stalled`, `aborted`).
 
 ## Protocol impact
 
@@ -177,8 +200,10 @@ The timed tests use `testing/synctest`, as `pkg/storer/internal/events` already 
 9. A peer with the wrong number of cursors is counted as not started.
 10. Each abort exit (`nextPeerInterval` error, `MaxUint64`, `addPeerInterval` failure) is excluded. `ErrPeerNotFound` is removed.
 11. A bin cancelled by a radius increase decrements when its worker exits.
-12. The running count never goes negative under `-race`, across disconnects, cancels and radius changes.
-13. Every signal case in section 1 sends a signal.
+12. A neighbour's last bin finishing between two `onChange` calls makes the state done at once, without waiting for the next recalculation.
+13. A new neighbour connecting at an unchanged radius makes the state not done while its `GetCursors` call is in flight.
+14. The map has no entry left for a peer after it disconnects, across disconnects, cancels and radius changes.
+15. Every signal case in section 1 sends a signal, and an `onChange` that changes nothing sends none.
 
 **Reserve worker:**
 1. Historical chunks still arriving through the rate path every few seconds do not stop lowering once the work is done. This fails on today's rule.
@@ -188,15 +213,20 @@ The timed tests use `testing/synctest`, as `pkg/storer/internal/events` already 
 5. A signal during a hold or a sample is retried by the timer, not dropped.
 6. A signal-triggered check does not scan when the last count was above the threshold.
 7. The hold after a raise prevents an immediate lower.
+8. An expiry trigger scans even when the stored count was above the threshold.
+9. The fallback lowers the radius when no neighbour has finished for 4 ticker checks, peers are present and the rate is 0.
+10. The ticker scans even when a cheap condition fails.
 
-**Existing tests.** The reserve tests that build the worker with `NewMockRateReporter(0)` expect a decrease when the rate is 0. About 16 calls in `pkg/storer/*_test.go` move to a mock that reports `HistoricalSyncDone`. `pkg/puller/mock` gains both new methods.
+**Existing tests.** The 16 `NewMockRateReporter` calls in `pkg/storer/*_test.go` move to a mock that also reports `HistoricalSyncDone`. The call that uses rate 1 and expects no decrease (`reserve_test.go`) gets a mock that reports "not done". `pkg/puller/mock` gains both new methods.
 
 **Mutation checks.** Each of these is removed in turn, and each removal must fail one of the tests with a message:
 - the neighbour guard;
 - the radius match;
 - the publication order;
-- the running count;
-- the not-started count;
+- the recalculating flag;
+- the running state;
+- the not-started state;
+- the fallback;
 - each signal case;
 - the hold;
 - the rate limit;
@@ -213,7 +243,7 @@ Runs, three in total:
 - The test nodes are removed between runs.
 - Metrics are read every 60 seconds.
 
-**Recorded per radius step:** the time from the last historical chunk to the radius decrease in the log. The last chunk is when `bee_puller_synced_chunks{type="historical"}` stops rising. Expected: 15 to 45 minutes on `main`, under 3 minutes with the change, at 60-second resolution.
+**Recorded per radius step:** the time from the last historical chunk to the radius decrease in the log. The last chunk is when `bee_puller_synced_chunks{type="historical"}` stops rising. Expected: 15 to 45 minutes on `main`, under 3 minutes with the change, at 60-second resolution, except where a stalled peer adds its 10-minute bound.
 
 **Recorded per fill:**
 - the total fill time;
