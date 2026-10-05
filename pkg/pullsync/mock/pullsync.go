@@ -28,6 +28,22 @@ func WithCursors(v []uint64, e uint64) Option {
 	})
 }
 
+// WithCursorsError makes every GetCursors call return err.
+func WithCursorsError(err error) Option {
+	return WithGetCursorsFunc(func(context.Context, swarm.Address) ([]uint64, uint64, error) {
+		return nil, 0, err
+	})
+}
+
+// WithGetCursorsFunc makes GetCursors return what f returns, instead of
+// the cursors set by WithCursors. f is called without the mock's lock
+// held, so it may block, for example to hold a call in flight.
+func WithGetCursorsFunc(f func(ctx context.Context, peer swarm.Address) ([]uint64, uint64, error)) Option {
+	return optionFunc(func(p *PullSyncMock) {
+		p.getCursorsFunc = f
+	})
+}
+
 func WithReplies(replies ...SyncReply) Option {
 	return optionFunc(func(p *PullSyncMock) {
 		for _, r := range replies {
@@ -49,6 +65,10 @@ type SyncReply struct {
 	// Err, when set, is returned with this reply instead of the mock-wide
 	// error from WithSyncError, so a test can mix failures and successes.
 	Err error
+	// Release, when set, holds the call until the channel is closed, even
+	// if the caller's context ends first. A test uses it to decide when a
+	// worker returns from Sync.
+	Release <-chan struct{}
 }
 
 type PullSyncMock struct {
@@ -58,6 +78,7 @@ type PullSyncMock struct {
 	cursors         []uint64
 	epoch           uint64
 	getCursorsPeers []swarm.Address
+	getCursorsFunc  func(context.Context, swarm.Address) ([]uint64, uint64, error)
 	replies         map[string][]SyncReply
 
 	quit chan struct{}
@@ -85,6 +106,9 @@ func (p *PullSyncMock) Sync(ctx context.Context, peer swarm.Address, bin uint8, 
 		p.replies[id] = p.replies[id][1:]
 		p.syncCalls = append(p.syncCalls, reply)
 		p.mtx.Unlock()
+		if reply.Release != nil {
+			<-reply.Release
+		}
 		if reply.Err != nil {
 			return reply.Topmost, reply.Count, reply.Err
 		}
@@ -95,11 +119,16 @@ func (p *PullSyncMock) Sync(ctx context.Context, peer swarm.Address, bin uint8, 
 	return 0, 0, ctx.Err()
 }
 
-func (p *PullSyncMock) GetCursors(_ context.Context, peer swarm.Address) ([]uint64, uint64, error) {
+func (p *PullSyncMock) GetCursors(ctx context.Context, peer swarm.Address) ([]uint64, uint64, error) {
 	p.mtx.Lock()
-	defer p.mtx.Unlock()
 	p.getCursorsPeers = append(p.getCursorsPeers, peer)
-	return p.cursors, p.epoch, nil
+	f := p.getCursorsFunc
+	if f == nil {
+		defer p.mtx.Unlock()
+		return p.cursors, p.epoch, nil
+	}
+	p.mtx.Unlock()
+	return f(ctx, peer)
 }
 
 func (p *PullSyncMock) ResetCalls(peer swarm.Address) {

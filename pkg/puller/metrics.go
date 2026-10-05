@@ -16,6 +16,7 @@ type metrics struct {
 	SyncWorkerErrCounter  prometheus.Counter     // count number of errors
 	MaxUintErrCounter     prometheus.Counter     // how many times we got maxuint as topmost
 	PullsyncRate          prometheus.GaugeFunc   // rate of historical syncing
+	HistoricalBins        *prometheus.GaugeVec   // in-scope peer and bin entries of the historical sync state, by state
 }
 
 func newMetrics(pullsyncRate func() float64) metrics {
@@ -58,6 +59,12 @@ func newMetrics(pullsyncRate func() float64) metrics {
 			Name:      "pullsync_rate",
 			Help:      "Rate of historical syncing in chunks.",
 		}, pullsyncRate),
+		HistoricalBins: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "historical_bins",
+			Help:      "In-scope peer and bin entries of the historical sync state, by state.",
+		}, []string{"state"}),
 	}
 }
 
