@@ -40,6 +40,8 @@ type radiusOpts struct {
 	wakeup   time.Duration
 	rate     float64
 	done     bool
+	// noNeighbour makes the syncer report no peer at or above the radius.
+	noNeighbour bool
 	// timings, when set, replaces the hold times and intervals:
 	// hold after decrease, hold after raise, scan interval, sampling poll.
 	timings []time.Duration
@@ -68,6 +70,7 @@ func newRadiusEnv(t *testing.T, o radiusOpts) *radiusEnv {
 		db.SetRadiusTimings(o.timings[0], o.timings[1], o.timings[2], o.timings[3])
 	}
 	syncer := pullerMock.NewMockSyncer(o.rate, o.done)
+	syncer.SetHasNeighbour(!o.noNeighbour)
 	ready := make(chan struct{})
 	db.StartReserveWorker(context.Background(), syncer, networkRadiusFunc(o.radius), ready)
 	<-ready
@@ -158,17 +161,18 @@ func TestRadiusLowersWhileRateAboveZero(t *testing.T) {
 
 // Reserve 2: with no peers the puller reports not done, and the radius is
 // not lowered, although the rate is 0. Today's rule would lower it at the
-// first tick. The fallback would lower it at the fourth; this test stops
-// before that.
+// first tick. The fallback does not either, because it requires a
+// neighbour: the rate is 0 only because nothing is synced.
 func TestRadiusNotLoweredWithoutPeers(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
-		e := newRadiusEnv(t, radiusOpts{capacity: 10, radius: 3, wakeup: 15 * time.Minute, rate: 0, done: false})
+		e := newRadiusEnv(t, radiusOpts{capacity: 10, radius: 3, wakeup: 15 * time.Minute, rate: 0, done: false, noNeighbour: true})
 
-		time.Sleep(time.Duration(storer.FallbackChecks-1)*15*time.Minute + time.Minute)
+		time.Sleep(time.Duration(2*storer.FallbackChecks)*15*time.Minute + time.Minute)
 		e.signal()
-		wantRadius(t, e.db, 3, "no peers means the sync is not done")
-		wantChecks(t, e.db, "ticker", "sync_pending", float64(storer.FallbackChecks-1))
+		wantRadius(t, e.db, 3, "no peers means the sync is not done, and the fallback needs a neighbour")
+		wantChecks(t, e.db, "ticker", "sync_pending", float64(2*storer.FallbackChecks))
+		wantChecks(t, e.db, "ticker", "fallback", 0)
 		wantChecks(t, e.db, "sync_done", "sync_pending", 1)
 	})
 }

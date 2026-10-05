@@ -16,6 +16,7 @@ type Syncer struct {
 	mtx       sync.Mutex
 	rate      float64
 	done      bool
+	noNeigh   bool
 	doneCalls int
 	changed   chan struct{}
 }
@@ -42,6 +43,20 @@ func (m *Syncer) HistoricalSyncDone(uint8) bool {
 }
 
 func (m *Syncer) HistoricalSyncChanged() <-chan struct{} { return m.changed }
+
+// HasNeighbour reports true unless SetHasNeighbour(false) was called.
+func (m *Syncer) HasNeighbour(uint8) bool {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+	return !m.noNeigh
+}
+
+// SetHasNeighbour changes the answer of HasNeighbour.
+func (m *Syncer) SetHasNeighbour(has bool) {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+	m.noNeigh = !has
+}
 
 // SetSyncRate changes the reported historical sync rate.
 func (m *Syncer) SetSyncRate(r float64) {

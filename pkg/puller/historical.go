@@ -469,6 +469,22 @@ func (p *Puller) HistoricalSyncDone(radius uint8) bool {
 	return finishedNeighbour
 }
 
+// HasNeighbour reports whether at least one current peer is at or above the
+// given radius. The reserve worker's fallback to the sync rate rule requires
+// it, so that a node with no neighbours does not lower its radius on a rate
+// that is 0 only because nothing is synced. See issue #588.
+func (p *Puller) HasNeighbour(radius uint8) bool {
+	p.histMtx.Lock()
+	defer p.histMtx.Unlock()
+
+	for _, po := range p.histPeers {
+		if po >= radius {
+			return true
+		}
+	}
+	return false
+}
+
 // HistoricalSyncChanged returns a channel that receives a value, without
 // blocking the sender, when the result of HistoricalSyncDone may have
 // changed. The receiver re-reads the state, so a duplicate does no harm.

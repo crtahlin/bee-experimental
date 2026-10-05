@@ -237,7 +237,9 @@ func (c *radiusChecker) checkOnTicker(radius uint8, count int) {
 	}
 
 	thr := threshold(db.reserve.Capacity())
-	oldRule := count < thr && db.syncer.SyncRate() == 0
+	// Today's rule, with the peer guard it lost in 2023: a rate of 0 with no
+	// neighbour means nothing is synced, not that sync is finished.
+	oldRule := count < thr && db.syncer.SyncRate() == 0 && db.syncer.HasNeighbour(radius)
 	if !oldRule {
 		c.fallbackRuns = 0
 	}

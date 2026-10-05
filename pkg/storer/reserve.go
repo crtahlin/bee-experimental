@@ -43,6 +43,9 @@ type Syncer interface {
 	// HistoricalSyncChanged receives a value when HistoricalSyncDone may
 	// have changed.
 	HistoricalSyncChanged() <-chan struct{}
+	// HasNeighbour reports whether at least one peer is at or above the
+	// radius. The fallback to the sync rate rule requires it.
+	HasNeighbour(radius uint8) bool
 }
 
 func threshold(capacity int) int { return capacity * 5 / 10 }
