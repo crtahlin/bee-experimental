@@ -662,6 +662,41 @@ func TestHistoricalCompletionDuringRecalcSignalled(t *testing.T) {
 	})
 }
 
+// Test 11d: a completion signalled before a recalculation, but read while
+// the recalculation runs, is signalled again when it ends. Otherwise the
+// reader sees "not done" and nothing asks again until the ticker.
+func TestHistoricalReadDuringRecalcSignalledAgain(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		a, far := swarm.RandAddress(t), swarm.RandAddress(t)
+		release := make(chan struct{})
+		replies := append(finish(a, 3), mockps.SyncReply{Peer: a, Bin: 4, Start: 1, Topmost: histCursor, Release: release})
+		env := newHistEnv(t, histOpts{radius: 3, bins: 5, peers: []kadMock.AddrTuple{{Addr: a, PO: 3}}, replies: replies})
+		wantDone(t, env.p, 3, false, "a's bin 4 is running")
+		drain(env.p)
+
+		// a's last bin finishes; the reader takes the signal.
+		close(release)
+		synctest.Wait()
+		if !signalled(env.p) {
+			t.Fatal("no signal when the last bin finished")
+		}
+
+		// Before the reader looks, a recalculation starts and is held open.
+		openFar := env.cursors.hold(far)
+		env.kad.AddRevPeers(kadMock.AddrTuple{Addr: far, PO: 0})
+		env.kad.Trigger()
+		synctest.Wait()
+		wantDone(t, env.p, 3, false, "the recalculation runs")
+
+		openFar()
+		if !signalled(env.p) {
+			t.Fatal("no signal when the recalculation ended after a read during it returned not done")
+		}
+		wantDone(t, env.p, 3, true, "a finished, the peer outside the band has no work")
+	})
+}
+
 // Test 12: a neighbour's last bin finishing between two recalculations
 // makes the state done at once.
 func TestHistoricalDoneAtOnceBetweenRecalcs(t *testing.T) {

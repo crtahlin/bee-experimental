@@ -434,7 +434,14 @@ func (p *Puller) HistoricalSyncDone(radius uint8) bool {
 	p.histMtx.Lock()
 	defer p.histMtx.Unlock()
 
-	if p.histRecalculating || p.histRadius != int(radius) {
+	if p.histRecalculating {
+		// The reader may have taken the signal for a completion that
+		// happened before this recalculation. Signal again when it ends, so
+		// the state is read once more instead of waiting for the ticker.
+		p.histPendingSignal = true
+		return false
+	}
+	if p.histRadius != int(radius) {
 		return false
 	}
 

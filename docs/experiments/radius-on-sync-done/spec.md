@@ -115,7 +115,7 @@ Stalled and aborted entries do not block it and do not count as a finished neigh
 - when an entry is removed;
 - when the published radius changes;
 - when `onChange` changes the set of not-started entries;
-- when the recalculating flag is cleared, if any of the events above happened while it was set. A completion during a recalculation would otherwise be read as "not done" and then lost.
+- when the recalculating flag is cleared, if any of the events above happened while it was set, or if `HistoricalSyncDone` was read while it was set. A completion during a recalculation, or one signalled before it but read during it, would otherwise be read as "not done" and then lost.
 
 A plain `onChange` with no such event sends no signal. The receiver re-reads the state, so a duplicate signal does no harm.
 

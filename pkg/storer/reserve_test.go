@@ -525,7 +525,7 @@ func TestRadiusManager(t *testing.T) {
 		})
 	})
 
-	t.Run("radius doesn't change due to non-zero pull rate", func(t *testing.T) {
+	t.Run("radius does not change while historical sync is not finished", func(t *testing.T) {
 		t.Parallel()
 		storer, err := diskStorer(t, dbTestOps(baseAddr, 10, nil, nil, time.Millisecond*500))()
 		if err != nil {
