@@ -243,6 +243,8 @@ func (p *Puller) manage(ctx context.Context) {
 	var prevRadius uint8
 
 	onChange := func() {
+		p.metrics.OnChangeRuns.Inc()
+
 		p.syncPeersMtx.Lock()
 		defer p.syncPeersMtx.Unlock()
 

@@ -59,6 +59,8 @@ func TestDisconnectedIgnoresUncountedPeer(t *testing.T) {
 	addOne(t, sg, kad, ab, counted)
 	waitSignal(t, c)
 
+	recalculations := kad.DepthRecalculations()
+
 	// A light peer and a full peer kademlia never accepted.
 	kad.Disconnected(p2p.Peer{Address: swarm.RandAddressAt(t, base, 3)})
 	kad.Disconnected(p2p.Peer{Address: swarm.RandAddressAt(t, base, 5), FullNode: true})
@@ -71,6 +73,9 @@ func TestDisconnectedIgnoresUncountedPeer(t *testing.T) {
 
 	if got := connectedCount(t, kad); got != 1 {
 		t.Fatalf("got %d connected peers, want 1", got)
+	}
+	if got := kad.DepthRecalculations(); got != recalculations {
+		t.Fatalf("got %v depth recalculations, want %v", got, recalculations)
 	}
 }
 
@@ -93,10 +98,15 @@ func TestDisconnectedRemovesFullPeerMarkedLight(t *testing.T) {
 	addOne(t, sg, kad, ab, peer)
 	waitSignal(t, c)
 
+	recalculations := kad.DepthRecalculations()
+
 	kad.Disconnected(p2p.Peer{Address: peer, FullNode: false})
 	waitSignal(t, c)
 
 	if got := connectedCount(t, kad); got != 0 {
 		t.Fatalf("got %d connected peers, want 0", got)
+	}
+	if got := kad.DepthRecalculations(); got <= recalculations {
+		t.Fatalf("got %v depth recalculations, want more than %v", got, recalculations)
 	}
 }

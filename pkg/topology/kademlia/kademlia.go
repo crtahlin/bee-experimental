@@ -1029,6 +1029,8 @@ func binPruneCount(oversaturationAmount int, staticNode staticPeerFunc) pruneCou
 
 // recalcDepth calculates, assigns the new depth, and returns if depth has changed
 func (k *Kad) recalcDepth() {
+	k.metrics.DepthRecalculations.Inc()
+
 	k.depthMu.Lock()
 	defer k.depthMu.Unlock()
 

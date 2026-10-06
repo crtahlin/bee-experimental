@@ -14,6 +14,7 @@ type metrics struct {
 	PickCalls                             prometheus.Counter
 	PickCallsFalse                        prometheus.Counter
 	CurrentDepth                          prometheus.Gauge
+	DepthRecalculations                   prometheus.Counter
 	CurrentStorageDepth                   prometheus.Gauge
 	CurrentlyKnownPeers                   prometheus.Gauge
 	CurrentlyConnectedPeers               prometheus.Gauge
@@ -56,6 +57,12 @@ func newMetrics() metrics {
 			Subsystem: subsystem,
 			Name:      "current_depth",
 			Help:      "The current value of depth.",
+		}),
+		DepthRecalculations: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "depth_recalculations",
+			Help:      "Number of times the depth was recalculated.",
 		}),
 		CurrentStorageDepth: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: m.Namespace,

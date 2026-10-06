@@ -16,6 +16,7 @@ type metrics struct {
 	SyncWorkerErrCounter  prometheus.Counter     // count number of errors
 	MaxUintErrCounter     prometheus.Counter     // how many times we got maxuint as topmost
 	PullsyncRate          prometheus.GaugeFunc   // rate of historical syncing
+	OnChangeRuns          prometheus.Counter     // recalculations of the sync peers
 }
 
 func newMetrics(pullsyncRate func() float64) metrics {
@@ -58,6 +59,12 @@ func newMetrics(pullsyncRate func() float64) metrics {
 			Name:      "pullsync_rate",
 			Help:      "Rate of historical syncing in chunks.",
 		}, pullsyncRate),
+		OnChangeRuns: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "on_change_runs",
+			Help:      "Number of times the sync peers were recalculated, after a topology change or on the timer.",
+		}),
 	}
 }
 
