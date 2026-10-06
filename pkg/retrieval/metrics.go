@@ -63,9 +63,10 @@ type metrics struct {
 	LocalOnlyMisses   prometheus.Counter
 	LocalOnlyLimited  prometheus.Counter
 	// LightPeerDebitRefusals counts light-peer requests refused before any
-	// work because serving them would have overdrawn the peer. Each one is a
-	// disconnect that did not happen, unless the client re-asks at once and
-	// overdraws later. See wasp #596.
+	// work because serving them would have overdrawn the peer. Most are a
+	// disconnect that did not happen. Some, in the second in which the peer's
+	// allowance was refreshed, are requests the old path would have served,
+	// because the check then allows no refresh headroom (#603). See wasp #596.
 	LightPeerDebitRefusals prometheus.Counter
 }
 

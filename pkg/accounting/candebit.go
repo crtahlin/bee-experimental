@@ -129,7 +129,8 @@ func (a *Accounting) debitOverdraws(accountingPeer *accountingPeer, nextBalance 
 }
 
 // CanDebit reports whether debiting peer by price now would leave it below
-// the point where debit.Apply disconnects it. It changes nothing.
+// the point where debit.Apply disconnects it. It changes no balance; it may
+// create the in-memory record for a peer it has not seen, as PrepareDebit does.
 //
 // The answer is advisory. CanDebit reserves nothing, so two requests from the
 // same peer, or a push-sync debit between this check and the debit, can both
