@@ -5,6 +5,9 @@
 package libp2p
 
 import (
+	"time"
+
+	"github.com/ethersphere/bee/v2/pkg/swarm"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 )
@@ -32,3 +35,27 @@ func (s *Service) LightPeerRefusals(reason string) float64 {
 func (s *Service) KickedOutPeers() float64 {
 	return counterValue(s.metrics.KickedOutPeersCount)
 }
+
+// LightAnnouncementsSkipped returns how many announcements to light peers
+// were skipped.
+func (s *Service) LightAnnouncementsSkipped() float64 {
+	return counterValue(s.metrics.LightAnnouncementsSkipped)
+}
+
+// LightAnnounceGate exposes the announcement gate for tests.
+type LightAnnounceGate struct{ g *lightAnnounceGate }
+
+func NewLightAnnounceGate(size int, interval time.Duration, now func() time.Time) LightAnnounceGate {
+	g := newLightAnnounceGate(size, interval)
+	g.now = now
+	return LightAnnounceGate{g: g}
+}
+
+func (g LightAnnounceGate) Recent(overlay swarm.Address) bool { return g.g.recent(overlay) }
+func (g LightAnnounceGate) Record(overlay swarm.Address)      { g.g.record(overlay) }
+func (g LightAnnounceGate) Len() int                          { return g.g.len() }
+
+const (
+	LightAnnounceInterval = lightAnnounceInterval
+	LightAnnounceMaxPeers = lightAnnounceMaxPeers
+)

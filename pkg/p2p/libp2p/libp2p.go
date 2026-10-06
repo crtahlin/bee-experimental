@@ -113,6 +113,7 @@ type Service struct {
 	lightNodes         lightnodes
 	lightNodeLimit     int
 	bootnodeMode       bool
+	lightAnnounced     *lightAnnounceGate
 	protocolsmu        sync.RWMutex
 	reacher            p2p.Reacher
 	networkStatus      atomic.Int32
@@ -502,6 +503,7 @@ func New(ctx context.Context, signer beecrypto.Signer, networkID uint64, overlay
 		ready:              make(chan struct{}),
 		halt:               make(chan struct{}),
 		lightNodes:         lightNodes,
+		lightAnnounced:     newLightAnnounceGate(lightAnnounceMaxPeers, lightAnnounceInterval),
 		HeadersRWTimeout:   o.HeadersRWTimeout,
 		autoNAT:            autoNAT,
 		autoTLSCertManager: certManager,
@@ -753,9 +755,16 @@ func (s *Service) handleIncoming(stream network.Stream) {
 			} else {
 				s.lightNodes.Connected(s.ctx, peer)
 			}
-			// light node announces explicitly
-			if err := s.notifier.Announce(s.ctx, peer.Address, i.FullNode); err != nil {
+			// light node announces explicitly, but a light peer that
+			// received an announcement recently gets none, so a client
+			// that reconnects often does not get the same list each time.
+			// Only a successful announcement is recorded.
+			if s.lightAnnounced.recent(peer.Address) {
+				s.metrics.LightAnnouncementsSkipped.Inc()
+			} else if err := s.notifier.Announce(s.ctx, peer.Address, i.FullNode); err != nil {
 				s.logger.Debug("stream handler: notifier.Announce failed", "peer", peer.Address, "error", err)
+			} else {
+				s.lightAnnounced.record(peer.Address)
 			}
 
 			// Only a bootnode gets here over its limit, because every

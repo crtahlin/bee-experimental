@@ -26,6 +26,7 @@ type metrics struct {
 	UnexpectedProtocolReqCount prometheus.Counter
 	KickedOutPeersCount        prometheus.Counter
 	LightPeerRefusals          *prometheus.CounterVec
+	LightAnnouncementsSkipped  prometheus.Counter
 	StreamHandlerErrResetCount prometheus.Counter
 	HeadersExchangeDuration    prometheus.Histogram
 }
@@ -112,6 +113,12 @@ func newMetrics() metrics {
 			Name:      "light_peer_refusals",
 			Help:      "Number of inbound light peers refused at a light limit, by reason.",
 		}, []string{"reason"}),
+		LightAnnouncementsSkipped: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "light_announcements_skipped",
+			Help:      "Number of announcements not sent to a light peer because it received one recently.",
+		}),
 		StreamHandlerErrResetCount: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: m.Namespace,
 			Subsystem: subsystem,
