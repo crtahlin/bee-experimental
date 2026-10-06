@@ -25,6 +25,7 @@ type metrics struct {
 	ConnectBreakerCount        prometheus.Counter
 	UnexpectedProtocolReqCount prometheus.Counter
 	KickedOutPeersCount        prometheus.Counter
+	LightPeerRefusals          *prometheus.CounterVec
 	StreamHandlerErrResetCount prometheus.Counter
 	HeadersExchangeDuration    prometheus.Histogram
 }
@@ -105,6 +106,12 @@ func newMetrics() metrics {
 			Name:      "kickedout_peers_count",
 			Help:      "Number of total kicked-out peers.",
 		}),
+		LightPeerRefusals: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "light_peer_refusals",
+			Help:      "Number of inbound light peers refused at a light limit, by reason.",
+		}, []string{"reason"}),
 		StreamHandlerErrResetCount: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: m.Namespace,
 			Subsystem: subsystem,

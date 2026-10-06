@@ -975,6 +975,7 @@ func NewBee(
 		WelcomeMessage:              o.WelcomeMessage,
 		FullNode:                    o.FullNodeMode,
 		LightNodeLimit:              o.LightNodeLimit,
+		BootnodeMode:                o.BootnodeMode,
 		Nonce:                       nonce,
 		AllowPrivateCIDRs:           o.AllowPrivateCIDRs,
 		Registry:                    registry,

@@ -146,6 +146,9 @@ func TestConnectToLightPeer(t *testing.T) {
 	expectPeersEventually(t, s1)
 }
 
+// TestLightPeerLimit checks that a node at its light limit refuses the next
+// light peer in the handshake, at the picker, and keeps every light peer it
+// already has. No light peer is evicted and no reservation is left behind.
 func TestLightPeerLimit(t *testing.T) {
 	t.Parallel()
 
@@ -167,24 +170,47 @@ func TestLightPeerLimit(t *testing.T) {
 
 	addr := serviceUnderlayAddress(t, sf)
 
-	for range 5 {
+	accepted := make([]swarm.Address, 0, limit)
+	for range limit {
+		sl, overlay := newService(t, 1, libp2pServiceOpts{
+			notifier: notifier,
+			libp2pOpts: libp2p.Options{
+				FullNode: false,
+			},
+		})
+		if _, err := sl.Connect(ctx, addr); err != nil {
+			t.Fatal(err)
+		}
+		accepted = append(accepted, overlay)
+	}
+	expectPeersEventually(t, sf, accepted...)
+
+	for range 2 {
 		sl, _ := newService(t, 1, libp2pServiceOpts{
 			notifier: notifier,
 			libp2pOpts: libp2p.Options{
 				FullNode: false,
 			},
 		})
-		_, err := sl.Connect(ctx, addr)
-		if err != nil {
-			t.Fatal(err)
-		}
+		// The dialer may or may not see an error, depending on when the
+		// reset reaches it. What matters is what the full node keeps.
+		_, _ = sl.Connect(ctx, addr)
+		expectPeersEventually(t, sl)
 	}
 
-	err := spinlock.Wait(time.Second, func() bool {
-		return container.Count() == limit
-	})
-	if err != nil {
-		t.Fatal("timed out waiting for correct number of lightnodes")
+	expectPeersEventually(t, sf, accepted...)
+	if got := container.Count(); got != limit {
+		t.Fatalf("got %d light peers, want %d", got, limit)
+	}
+	used, reserved, _, _ := container.Slots()
+	if used != limit || reserved != 0 {
+		t.Fatalf("got %d used and %d reserved slots, want %d and 0", used, reserved, limit)
+	}
+	if got := sf.LightPeerRefusals(libp2p.LightRefusalPicker); got != 2 {
+		t.Fatalf("got %v refusals at the picker, want 2", got)
+	}
+	if got := sf.KickedOutPeers(); got != 0 {
+		t.Fatalf("got %v evicted light peers, want 0", got)
 	}
 }
 
