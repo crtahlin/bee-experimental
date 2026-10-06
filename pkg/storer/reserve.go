@@ -13,7 +13,6 @@ import (
 	"math/bits"
 	"slices"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/ethersphere/bee/v2/pkg/postage"
@@ -31,15 +30,22 @@ const (
 	batchExpiryDone     = "batchExpiryDone"
 )
 
-var (
-	errMaxRadius            = errors.New("max radius reached")
-	reserveSizeWithinRadius atomic.Uint64
-)
+var errMaxRadius = errors.New("max radius reached")
 
 type Syncer interface {
-	// Number of active historical syncing jobs.
+	// SyncRate is the rate of historical chunks the puller stored, over a
+	// moving window. It is not a count of syncing jobs.
 	SyncRate() float64
 	Start(context.Context)
+	// HistoricalSyncDone reports whether the historical sync for the given
+	// storage radius is finished. See issue #588.
+	HistoricalSyncDone(radius uint8) bool
+	// HistoricalSyncChanged receives a value when HistoricalSyncDone may
+	// have changed.
+	HistoricalSyncChanged() <-chan struct{}
+	// HasNeighbour reports whether at least one peer is at or above the
+	// radius. The fallback to the sync rate rule requires it.
+	HasNeighbour(radius uint8) bool
 }
 
 func threshold(capacity int) int { return capacity * 5 / 10 }
@@ -193,9 +199,8 @@ func (db *DB) countWithinRadius(ctx context.Context) (int, error) {
 		err = errors.Join(err, db.EvictBatch(ctx, []byte(batch)))
 	}
 
-	db.metrics.ReserveSizeWithinRadius.Set(float64(count))
 	db.metrics.ReserveMissingBatch.Set(float64(missing))
-	reserveSizeWithinRadius.Store(uint64(count))
+	db.setWithinRadius(count, radius)
 
 	return count, err
 }
@@ -218,12 +223,12 @@ func (db *DB) reserveWakeupScan(ctx context.Context, lastSweep *time.Time) (int,
 		return db.countWithinRadius(ctx)
 	}
 
+	radius := db.StorageRadius()
 	count, err := db.countChunksWithinRadius()
 	if err != nil {
 		return 0, err
 	}
-	db.metrics.ReserveSizeWithinRadius.Set(float64(count))
-	reserveSizeWithinRadius.Store(uint64(count))
+	db.setWithinRadius(count, radius)
 	return count, nil
 }
 
@@ -239,8 +244,11 @@ func (db *DB) reserveWorker(ctx context.Context, ready chan<- struct{}) {
 	thresholdTicker := time.NewTicker(db.reserveOptions.wakeupDuration)
 	defer thresholdTicker.Stop()
 
+	syncChanged := db.syncer.HistoricalSyncChanged()
+
 	_, _ = db.countWithinRadius(ctx)
-	lastSweep := time.Now()
+	rc := newRadiusChecker(db, time.Now())
+	defer rc.stop()
 
 	if !db.reserve.IsWithinCapacity() {
 		db.events.Trigger(reserveOverCapacity)
@@ -272,35 +280,40 @@ func (db *DB) reserveWorker(ctx context.Context, ready chan<- struct{}) {
 				db.events.Trigger(reserveOverCapacity)
 			}
 
+			// The reserve just got smaller, so the radius may now be
+			// lowered. See issue #588.
+			if err := rc.check(ctx, triggerExpiry); err != nil {
+				return
+			}
+
 		case <-overCapTrigger:
 
 			db.metrics.OverCapTriggerCount.Inc()
-			if err := db.unreserve(ctx); err != nil {
+			before := db.reserve.Radius()
+			err := db.unreserve(ctx)
+			if db.reserve.Radius() > before {
+				rc.raised(time.Now())
+			}
+			if err != nil {
 				if errors.Is(err, ErrDBQuit) {
 					return
 				}
 				db.logger.Warning("reserve worker unreserve", "error", err)
 			}
 
-		case <-thresholdTicker.C:
-
-			radius := db.reserve.Radius()
-			count, err := db.reserveWakeupScan(ctx, &lastSweep)
-			if err != nil {
-				if errors.Is(err, ErrDBQuit) {
-					return
-				}
-				db.logger.Warning("reserve worker count within radius", "error", err)
-				continue
+		case <-syncChanged:
+			if err := rc.check(ctx, triggerSyncDone); err != nil {
+				return
 			}
 
-			if count < threshold(db.reserve.Capacity()) && db.syncer.SyncRate() == 0 && radius > db.reserveOptions.minimumRadius {
-				radius--
-				if err := db.reserve.SetRadius(radius); err != nil {
-					db.logger.Error(err, "reserve set radius")
-				}
-				db.metrics.StorageRadius.Set(float64(radius))
-				db.logger.Info("reserve radius decrease", "radius", radius)
+		case <-rc.retryC:
+			if err := rc.check(ctx, rc.fired()); err != nil {
+				return
+			}
+
+		case <-thresholdTicker.C:
+			if err := rc.check(ctx, triggerTicker); err != nil {
+				return
 			}
 		}
 	}
@@ -610,7 +623,8 @@ func (db *DB) ReserveSize() int {
 }
 
 func (db *DB) ReserveSizeWithinRadius() uint64 {
-	return reserveSizeWithinRadius.Load()
+	count, _, _ := db.storedWithinRadius()
+	return uint64(count)
 }
 
 func (db *DB) IsWithinStorageRadius(addr swarm.Address) bool {

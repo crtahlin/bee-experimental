@@ -11,6 +11,7 @@ import (
 	"errors"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/ethersphere/bee/v2/pkg/postage"
@@ -77,7 +78,7 @@ func TestIndexCollision(t *testing.T) {
 			t.Fatal(err)
 		}
 		readyC := make(chan struct{})
-		storer.StartReserveWorker(context.Background(), pullerMock.NewMockRateReporter(0), networkRadiusFunc(0), readyC)
+		storer.StartReserveWorker(context.Background(), pullerMock.NewMockSyncer(0, true), networkRadiusFunc(0), readyC)
 		select {
 		case <-readyC:
 		case <-t.Context().Done():
@@ -93,7 +94,7 @@ func TestIndexCollision(t *testing.T) {
 			t.Fatal(err)
 		}
 		readyC := make(chan struct{})
-		storer.StartReserveWorker(context.Background(), pullerMock.NewMockRateReporter(0), networkRadiusFunc(0), readyC)
+		storer.StartReserveWorker(context.Background(), pullerMock.NewMockSyncer(0, true), networkRadiusFunc(0), readyC)
 		select {
 		case <-readyC:
 		case <-t.Context().Done():
@@ -177,7 +178,7 @@ func TestReplaceOldIndex(t *testing.T) {
 			t.Fatal(err)
 		}
 		readyC := make(chan struct{})
-		storer.StartReserveWorker(context.Background(), pullerMock.NewMockRateReporter(0), networkRadiusFunc(0), readyC)
+		storer.StartReserveWorker(context.Background(), pullerMock.NewMockSyncer(0, true), networkRadiusFunc(0), readyC)
 		select {
 		case <-readyC:
 		case <-t.Context().Done():
@@ -193,7 +194,7 @@ func TestReplaceOldIndex(t *testing.T) {
 			t.Fatal(err)
 		}
 		readyC := make(chan struct{})
-		storer.StartReserveWorker(context.Background(), pullerMock.NewMockRateReporter(0), networkRadiusFunc(0), readyC)
+		storer.StartReserveWorker(context.Background(), pullerMock.NewMockSyncer(0, true), networkRadiusFunc(0), readyC)
 		select {
 		case <-readyC:
 		case <-t.Context().Done():
@@ -213,7 +214,7 @@ func TestEvictBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	readyC := make(chan struct{})
-	st.StartReserveWorker(context.Background(), pullerMock.NewMockRateReporter(0), networkRadiusFunc(0), readyC)
+	st.StartReserveWorker(context.Background(), pullerMock.NewMockSyncer(0, true), networkRadiusFunc(0), readyC)
 	select {
 	case <-readyC:
 	case <-t.Context().Done():
@@ -379,7 +380,7 @@ func TestUnreserveCap(t *testing.T) {
 			t.Fatal(err)
 		}
 		readyC := make(chan struct{})
-		storer.StartReserveWorker(context.Background(), pullerMock.NewMockRateReporter(0), networkRadiusFunc(0), readyC)
+		storer.StartReserveWorker(context.Background(), pullerMock.NewMockSyncer(0, true), networkRadiusFunc(0), readyC)
 		select {
 		case <-readyC:
 		case <-t.Context().Done():
@@ -396,7 +397,7 @@ func TestUnreserveCap(t *testing.T) {
 			t.Fatal(err)
 		}
 		readyC := make(chan struct{})
-		storer.StartReserveWorker(context.Background(), pullerMock.NewMockRateReporter(0), networkRadiusFunc(0), readyC)
+		storer.StartReserveWorker(context.Background(), pullerMock.NewMockSyncer(0, true), networkRadiusFunc(0), readyC)
 		select {
 		case <-readyC:
 		case <-t.Context().Done():
@@ -417,7 +418,7 @@ func TestNetworkRadius(t *testing.T) {
 			t.Fatal(err)
 		}
 		readyC := make(chan struct{})
-		storer.StartReserveWorker(context.Background(), pullerMock.NewMockRateReporter(0), networkRadiusFunc(1), readyC)
+		storer.StartReserveWorker(context.Background(), pullerMock.NewMockSyncer(0, true), networkRadiusFunc(1), readyC)
 		select {
 		case <-readyC:
 		case <-t.Context().Done():
@@ -436,7 +437,7 @@ func TestNetworkRadius(t *testing.T) {
 			t.Fatal(err)
 		}
 		readyC := make(chan struct{})
-		storer.StartReserveWorker(context.Background(), pullerMock.NewMockRateReporter(0), networkRadiusFunc(1), readyC)
+		storer.StartReserveWorker(context.Background(), pullerMock.NewMockSyncer(0, true), networkRadiusFunc(1), readyC)
 		select {
 		case <-readyC:
 		case <-t.Context().Done():
@@ -476,55 +477,62 @@ func TestRadiusManager(t *testing.T) {
 
 	t.Run("radius decrease due to under utilization", func(t *testing.T) {
 		t.Parallel()
-		bs := batchstore.New()
+		// In a synctest bubble, because each decrease is followed by a
+		// 2 minute hold. See issue #588.
+		synctest.Test(t, func(t *testing.T) {
+			bs := batchstore.New()
 
-		storer, err := memStorer(t, dbTestOps(baseAddr, 10, bs, nil, time.Millisecond*500))()
-		if err != nil {
-			t.Fatal(err)
-		}
-		readyC := make(chan struct{})
-		storer.StartReserveWorker(context.Background(), pullerMock.NewMockRateReporter(0), networkRadiusFunc(3), readyC)
-		select {
-		case <-readyC:
-		case <-t.Context().Done():
-			t.Fatal("start reserve worker timeout")
-		}
-		batch := postagetesting.MustNewBatch()
-		err = bs.Save(batch)
-		if err != nil {
-			t.Fatal(err)
-		}
+			storer, err := storer.New(context.Background(), "", dbTestOps(baseAddr, 10, bs, nil, time.Millisecond*500))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := storer.Close(); err != nil {
+					t.Errorf("close: %v", err)
+				}
+				time.Sleep(time.Minute) // let the index store's goroutine end in the bubble
+			})
+			readyC := make(chan struct{})
+			storer.StartReserveWorker(context.Background(), pullerMock.NewMockSyncer(0, true), networkRadiusFunc(3), readyC)
+			<-readyC
+			batch := postagetesting.MustNewBatch()
+			err = bs.Save(batch)
+			if err != nil {
+				t.Fatal(err)
+			}
 
-		putter := storer.ReservePutter()
+			putter := storer.ReservePutter()
 
-		for i := range 4 {
-			for range 10 {
-				ch := chunk.GenerateTestRandomChunkAt(t, baseAddr, i).WithStamp(postagetesting.MustNewBatchStamp(batch.ID))
-				err := putter.Put(context.Background(), ch)
-				if err != nil {
-					t.Fatal(err)
+			for i := range 4 {
+				for range 10 {
+					ch := chunk.GenerateTestRandomChunkAt(t, baseAddr, i).WithStamp(postagetesting.MustNewBatchStamp(batch.ID))
+					err := putter.Put(context.Background(), ch)
+					if err != nil {
+						t.Fatal(err)
+					}
 				}
 			}
-		}
 
-		waitForSize(t, storer.Reserve(), 10)
-		waitForRadius(t, storer.Reserve(), 3)
+			waitForSize(t, storer.Reserve(), 10)
+			waitForRadius(t, storer.Reserve(), 3)
 
-		err = storer.EvictBatch(context.Background(), batch.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		waitForRadius(t, storer.Reserve(), 0)
+			err = storer.EvictBatch(context.Background(), batch.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(10 * time.Minute)
+			waitForRadius(t, storer.Reserve(), 0)
+		})
 	})
 
-	t.Run("radius doesn't change due to non-zero pull rate", func(t *testing.T) {
+	t.Run("radius does not change while historical sync is not finished", func(t *testing.T) {
 		t.Parallel()
 		storer, err := diskStorer(t, dbTestOps(baseAddr, 10, nil, nil, time.Millisecond*500))()
 		if err != nil {
 			t.Fatal(err)
 		}
 		readyC := make(chan struct{})
-		storer.StartReserveWorker(context.Background(), pullerMock.NewMockRateReporter(1), networkRadiusFunc(3), readyC)
+		storer.StartReserveWorker(context.Background(), pullerMock.NewMockSyncer(1, false), networkRadiusFunc(3), readyC)
 		select {
 		case <-readyC:
 		case <-t.Context().Done():
@@ -815,7 +823,7 @@ func TestNeighborhoodStats(t *testing.T) {
 			t.Fatal(err)
 		}
 		readyC := make(chan struct{})
-		storer.StartReserveWorker(context.Background(), pullerMock.NewMockRateReporter(0), networkRadiusFunc(responsibiliyDepth), readyC)
+		storer.StartReserveWorker(context.Background(), pullerMock.NewMockSyncer(0, true), networkRadiusFunc(responsibiliyDepth), readyC)
 		select {
 		case <-readyC:
 		case <-t.Context().Done():
@@ -836,7 +844,7 @@ func TestNeighborhoodStats(t *testing.T) {
 			t.Fatal(err)
 		}
 		readyC := make(chan struct{})
-		storer.StartReserveWorker(context.Background(), pullerMock.NewMockRateReporter(0), networkRadiusFunc(responsibiliyDepth), readyC)
+		storer.StartReserveWorker(context.Background(), pullerMock.NewMockSyncer(0, true), networkRadiusFunc(responsibiliyDepth), readyC)
 		select {
 		case <-readyC:
 		case <-t.Context().Done():

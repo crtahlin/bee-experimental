@@ -134,6 +134,18 @@ type Puller struct {
 	// test can change them before Start without racing other tests. See #573.
 	retryBackoffBase time.Duration
 	retryBackoffMax  time.Duration
+
+	// Historical sync state per peer and bin, for the radius decision in the
+	// reserve worker. See historical.go and issue #588. histMtx is a leaf
+	// lock taken after syncPeersMtx and peer.mtx.
+	histMtx           sync.Mutex
+	histEntries       map[histKey]*histEntry
+	histPeers         map[string]uint8 // current peers and their proximity order
+	histNextToken     uint64
+	histRadius        int // published radius, noHistoricalRadius before the first publication
+	histRecalculating bool
+	histPendingSignal bool
+	histChanged       chan struct{}
 }
 
 func New(
@@ -180,6 +192,11 @@ func New(
 
 		retryBackoffBase: defaultRetryBackoffBase,
 		retryBackoffMax:  defaultRetryBackoffMax,
+
+		histEntries: make(map[histKey]*histEntry),
+		histPeers:   make(map[string]uint8),
+		histRadius:  noHistoricalRadius,
+		histChanged: make(chan struct{}, 1),
 	}
 
 	return p
@@ -223,8 +240,9 @@ func (p *Puller) Start(ctx context.Context) {
 		cctx, cancel := context.WithCancel(ctx)
 		p.cancel = cancel
 
-		p.wg.Add(1)
+		p.wg.Add(2)
 		go p.manage(cctx)
+		go p.histStallChecker(cctx)
 	})
 }
 
@@ -245,6 +263,11 @@ func (p *Puller) manage(ctx context.Context) {
 	onChange := func() {
 		p.syncPeersMtx.Lock()
 		defer p.syncPeersMtx.Unlock()
+
+		// Until histEndRecalc, the historical sync state reads as not done:
+		// peers may be half-removed and new peers may still be fetching
+		// their cursors.
+		p.histBeginRecalc()
 
 		newRadius := p.radius.StorageRadius()
 
@@ -278,6 +301,10 @@ func (p *Puller) manage(ctx context.Context) {
 		}
 
 		p.recalcPeers(ctx, newRadius)
+
+		// Publish the radius the historical state belongs to only now,
+		// after recalcPeers has waited for every syncPeer call.
+		p.histEndRecalc(newRadius, p.histPeerSnapshot())
 	}
 
 	tick := time.NewTicker(p.recalcPeersDur)
@@ -306,6 +333,24 @@ func (p *Puller) disconnectPeer(addr swarm.Address) {
 		peer.mtx.Unlock()
 	}
 	delete(p.syncPeers, addr.ByteString())
+	// stop() has returned, so no worker of this peer can write any more.
+	p.histRemovePeer(addr)
+}
+
+// histPeerSnapshot reads, under each peer's lock, what the end of onChange
+// needs to know about the peers. Must be called under syncPeersMtx.
+func (p *Puller) histPeerSnapshot() []histPeer {
+	peers := make([]histPeer, 0, len(p.syncPeers))
+	for _, peer := range p.syncPeers {
+		peer.mtx.Lock()
+		peers = append(peers, histPeer{
+			address:    peer.address,
+			po:         peer.po,
+			cursorsSet: peer.cursors != nil && len(peer.cursors) == int(p.bins),
+		})
+		peer.mtx.Unlock()
+	}
+	return peers
 }
 
 // recalcPeers starts or stops syncing process for peers per bin depending on the current sync radius.
@@ -429,7 +474,18 @@ func (p *Puller) syncPeerBin(parentCtx context.Context, peer *syncPeer, bin uint
 	ctx, cancel := context.WithCancel(parentCtx)
 	peer.setBinCancel(cancel, bin)
 
+	var token uint64
+	if cursor > 0 {
+		token = p.histStartWorker(peer.address, bin)
+	} else {
+		p.histNothingToSync(peer.address, bin)
+	}
+
 	sync := func(isHistorical bool, address swarm.Address, start uint64) {
+		// hist updates this worker's entry in the historical state. It does
+		// nothing for the live worker, which shares this closure.
+		hist := histWorker{p: p, historical: isHistorical, addr: address, bin: bin, token: token}
+
 		p.metrics.SyncWorkerCounter.Inc()
 
 		defer p.wg.Done()
@@ -447,11 +503,13 @@ func (p *Puller) syncPeerBin(parentCtx context.Context, peer *syncPeer, bin uint
 				if err != nil {
 					p.metrics.SyncWorkerErrCounter.Inc()
 					p.logger.Error(err, "syncWorker nextPeerInterval failed, quitting")
+					hist.aborted("next interval failed")
 					return
 				}
 
 				// historical sync has caught up to the cursor, exit
 				if start > cursor {
+					hist.finished()
 					return
 				}
 			}
@@ -467,8 +525,13 @@ func (p *Puller) syncPeerBin(parentCtx context.Context, peer *syncPeer, bin uint
 			// quiet store. This holds back only historical pulling; pushsync and
 			// retrieval are separate protocols and keep working, so uploads are
 			// not stalled. See issue #23.
-			if p.waitWhileSampling(ctx) != nil {
-				return
+			if p.radius.IsSampling() {
+				// A worker cancelled while it waits writes nothing.
+				hist.sampling(true)
+				if p.waitWhileSampling(ctx) != nil {
+					return
+				}
+				hist.sampling(false)
 			}
 
 			p.metrics.SyncWorkerIterCounter.Inc()
@@ -478,6 +541,7 @@ func (p *Puller) syncPeerBin(parentCtx context.Context, peer *syncPeer, bin uint
 			if top == math.MaxUint64 {
 				p.metrics.MaxUintErrCounter.Inc()
 				p.logger.Error(nil, "syncWorker max uint64 encountered, quitting", "peer_address", address, "bin", bin, "from", start, "topmost", top)
+				hist.aborted("max uint64 topmost")
 				return
 			}
 
@@ -485,6 +549,7 @@ func (p *Puller) syncPeerBin(parentCtx context.Context, peer *syncPeer, bin uint
 				p.metrics.SyncWorkerErrCounter.Inc()
 				if errors.Is(err, p2p.ErrPeerNotFound) {
 					p.logger.Debug("syncWorker interval failed, quitting", "error", err, "peer_address", address, "bin", bin, "cursor", cursor, "start", start, "topmost", top)
+					hist.gone()
 					return
 				}
 				errCount := countErrors(err)
@@ -518,8 +583,10 @@ func (p *Puller) syncPeerBin(parentCtx context.Context, peer *syncPeer, bin uint
 				if err := p.addPeerInterval(address, bin, start, top); err != nil {
 					p.metrics.SyncWorkerErrCounter.Inc()
 					p.logger.Error(err, "syncWorker could not persist interval for peer, quitting", "peer_address", address)
+					hist.aborted("persist interval failed")
 					return
 				}
+				hist.progress()
 				start = top + 1
 			}
 		}

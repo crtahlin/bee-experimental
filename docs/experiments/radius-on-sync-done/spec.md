@@ -115,7 +115,7 @@ Stalled and aborted entries do not block it and do not count as a finished neigh
 - when an entry is removed;
 - when the published radius changes;
 - when `onChange` changes the set of not-started entries;
-- when the recalculating flag is cleared, if any of the events above happened while it was set. A completion during a recalculation would otherwise be read as "not done" and then lost.
+- when the recalculating flag is cleared, if any of the events above happened while it was set, or if `HistoricalSyncDone` was read while it was set. A completion during a recalculation, or one signalled before it but read during it, would otherwise be read as "not done" and then lost.
 
 A plain `onChange` with no such event sends no signal. The receiver re-reads the state, so a duplicate signal does no harm.
 
@@ -147,14 +147,14 @@ The comment "Number of active historical syncing jobs" on the storer's `Syncer` 
 
 **The stored count becomes a field of `DB`,** together with the radius it was measured at. Today `reserveSizeWithinRadius` is a package-level variable, which parallel tests with several `DB`s would share.
 
-**Fallback to today's rule.** On each ticker check, the reserve worker also evaluates today's condition: `count < threshold && SyncRate() == 0`. If that condition held, but the new rule did not lower the radius, on 4 ticker checks in a row (about an hour), the radius is lowered by the old rule. Then:
+**Fallback to today's rule.** On each ticker check, the reserve worker also evaluates today's condition, with the peer guard it lost in 2023: `count < threshold && SyncRate() == 0`, and at least one peer at or above the radius (`HasNeighbour`). Without that guard, the fallback would lower the radius of a node with no peers after an hour, because its rate is 0 only because nothing is synced. If that condition held, but the new rule did not lower the radius, on 4 ticker checks in a row (about an hour), the radius is lowered by the old rule. Then:
 - it logs a warning, once for each run of 4 such checks;
 - it counts the event as `result="fallback"`;
 - the run count resets when the radius changes, or when a check finds the old condition false.
 
 The fallback respects the hold after a raise and is postponed while a sample runs, like every other check.
 
-This covers every case in which the new rule refuses but today's rule would lower the radius, whatever the cause. In the worst case, the change therefore lowers the radius about one hour later than today would. It never stays higher forever when today's rule would not.
+This covers every case in which the new rule refuses but today's rule would lower the radius while a neighbour is connected, whatever the cause. In the worst case, the change therefore lowers the radius about one hour later than today would. It never stays higher forever when today's rule would not.
 
 During a fallback, today's rule brings back its own weakness: a rate of 0 during a sampling pause, or with peers in backoff. That is acceptable, because the fallback only runs when the new rule has been refusing for an hour. A new node whose sync takes more than an hour does not reach the fallback, because its rate is above 0.
 
