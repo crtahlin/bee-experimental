@@ -1363,58 +1363,34 @@ func (a *Accounting) PrepareDebit(ctx context.Context, peer swarm.Address, price
 func (a *Accounting) increaseBalance(peer swarm.Address, _ *accountingPeer, price *big.Int) (*big.Int, error) {
 	loggerV2 := a.logger.V(2).Register()
 
-	cost := new(big.Int).Set(price)
-	// see if peer has surplus balance to deduct this transaction of
+	// wasp #596: the arithmetic lives in projectDebit, which CanDebit shares,
+	// so the advisory check and this debit cannot compute different balances.
+	// The writes and their order are unchanged: the surplus is written first,
+	// even when reading the balance then fails.
+	projected, err := a.projectDebit(peer, price)
 
-	surplusBalance, err := a.SurplusBalance(peer)
+	if projected.nextSurplus != nil {
+		if projected.coveredBySurplus {
+			loggerV2.Debug("surplus debiting peer", "peer_address", peer, "price", price, "new_balance", projected.nextSurplus)
+		} else {
+			loggerV2.Debug("surplus debiting peer", "peer_address", peer, "amount", projected.cost, "new_balance", 0)
+		}
+
+		if putErr := a.store.Put(peerSurplusBalanceKey(peer), projected.nextSurplus); putErr != nil {
+			return nil, fmt.Errorf("failed to persist surplus balance: %w", putErr)
+		}
+	}
+
 	if err != nil {
-		return nil, fmt.Errorf("failed to get surplus balance: %w", err)
+		return nil, err
 	}
 
-	if surplusBalance.Cmp(big.NewInt(0)) > 0 {
-		// get new surplus balance after deduct
-		newSurplusBalance := new(big.Int).Sub(surplusBalance, cost)
-
-		// if nothing left for debiting, store new surplus balance and return from debit
-		if newSurplusBalance.Cmp(big.NewInt(0)) >= 0 {
-			loggerV2.Debug("surplus debiting peer", "peer_address", peer, "price", price, "new_balance", newSurplusBalance)
-
-			err = a.store.Put(peerSurplusBalanceKey(peer), newSurplusBalance)
-			if err != nil {
-				return nil, fmt.Errorf("failed to persist surplus balance: %w", err)
-			}
-
-			return a.Balance(peer)
-		}
-
-		// if surplus balance didn't cover full transaction, let's continue with leftover part as cost
-		debitIncrease := new(big.Int).Sub(price, surplusBalance)
-
-		// a sanity check
-		if debitIncrease.Cmp(big.NewInt(0)) <= 0 {
-			return nil, errors.New("sanity check failed for partial debit after surplus balance drawn")
-		}
-		cost.Set(debitIncrease)
-
-		// if we still have something to debit, than have run out of surplus balance,
-		// let's store 0 as surplus balance
-		loggerV2.Debug("surplus debiting peer", "peer_address", peer, "amount", debitIncrease, "new_balance", 0)
-
-		err = a.store.Put(peerSurplusBalanceKey(peer), big.NewInt(0))
-		if err != nil {
-			return nil, fmt.Errorf("failed to persist surplus balance: %w", err)
-		}
+	// if nothing left for debiting, the balance is unchanged and not written
+	if projected.coveredBySurplus {
+		return projected.nextBalance, nil
 	}
 
-	currentBalance, err := a.Balance(peer)
-	if err != nil {
-		if !errors.Is(err, ErrPeerNoBalance) {
-			return nil, fmt.Errorf("failed to load balance: %w", err)
-		}
-	}
-
-	// Get nextBalance by increasing current balance with price
-	nextBalance := new(big.Int).Add(currentBalance, cost)
+	nextBalance := projected.nextBalance
 
 	loggerV2.Debug("debiting peer", "peer_address", peer, "price", price, "new_balance", nextBalance)
 
@@ -1453,18 +1429,8 @@ func (d *debitAction) Apply() error {
 	a.metrics.TotalDebitedAmount.Add(tot)
 	a.metrics.DebitEventsCount.Inc()
 
-	timeElapsedInSeconds := min(a.timeNow().Unix()-d.accountingPeer.refreshReceivedTimestamp, 1)
-
-	// get appropriate refresh rate
-	refreshRate := new(big.Int).Set(a.refreshRate)
-	if !d.accountingPeer.fullNode {
-		refreshRate = new(big.Int).Set(a.lightRefreshRate)
-	}
-
-	refreshDue := new(big.Int).Mul(big.NewInt(timeElapsedInSeconds), refreshRate)
-	disconnectLimit := new(big.Int).Add(d.accountingPeer.disconnectLimit, refreshDue)
-
-	if nextBalance.Cmp(disconnectLimit) >= 0 {
+	// wasp #596: the same check CanDebit makes, see debitOverdraws.
+	if a.debitOverdraws(d.accountingPeer, nextBalance) {
 		// peer too much in debt
 		a.metrics.AccountingDisconnectsOverdrawCount.Inc()
 

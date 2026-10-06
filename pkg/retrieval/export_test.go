@@ -106,3 +106,17 @@ func FirstOverdraft(since map[string]time.Time, peer swarm.Address, now time.Tim
 func (s *Service) SetProviderCreditWait(d time.Duration) {
 	s.providerWait = d
 }
+
+// ErrLightPeerDebtLimit is the refusal a light peer receives when serving it
+// would overdraw it. See wasp #596.
+var ErrLightPeerDebtLimit = errLightPeerDebtLimit
+
+// LightPeerDebitRefusalsForTest reports the refusal counter. See wasp #596.
+func (s *Service) LightPeerDebitRefusalsForTest(tb testing.TB) float64 {
+	tb.Helper()
+	var m dto.Metric
+	if err := s.metrics.LightPeerDebitRefusals.Write(&m); err != nil {
+		tb.Fatalf("reading the counter: %v", err)
+	}
+	return m.GetCounter().GetValue()
+}

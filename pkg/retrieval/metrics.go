@@ -62,6 +62,12 @@ type metrics struct {
 	PreferredRebuilds prometheus.Counter
 	LocalOnlyMisses   prometheus.Counter
 	LocalOnlyLimited  prometheus.Counter
+	// LightPeerDebitRefusals counts light-peer requests refused before any
+	// work because serving them would have overdrawn the peer. Most are a
+	// disconnect that did not happen. Some, in the second in which the peer's
+	// allowance was refreshed, are requests the old path would have served,
+	// because the check then allows no refresh headroom (#603). See wasp #596.
+	LightPeerDebitRefusals prometheus.Counter
 }
 
 func newMetrics() metrics {
@@ -188,6 +194,12 @@ func newMetrics() metrics {
 			Subsystem: subsystem,
 			Name:      "local_only_limited",
 			Help:      "Local-only misses answered with the limit error.",
+		}),
+		LightPeerDebitRefusals: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "light_peer_debit_refusals",
+			Help:      "Light-peer requests refused before serving because the debit would have passed the peer's disconnect limit.",
 		}),
 	}
 }
