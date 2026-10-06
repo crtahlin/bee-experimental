@@ -103,6 +103,31 @@ func TestLightAnnouncementOncePerInterval(t *testing.T) {
 	}
 }
 
+// TestLightAnnouncementBootnodeNotGated checks that a bootnode announces to
+// a light peer on every connection: light clients get their first peer list
+// from bootnodes, and bootnode mode keeps today's behaviour.
+func TestLightAnnouncementBootnodeNotGated(t *testing.T) {
+	t.Parallel()
+
+	rec := newAnnounceRecorder()
+	sf, _ := newLightLimitedNode(t, 10, mockAnnouncingNotifier(rec.Announce, rec.AnnounceTo), libp2p.Options{BootnodeMode: true})
+	sl, overlay := newLightNode(t)
+
+	connectLight(t, sf, sl, overlay)
+	expectCount(t, "announcements", func() int { return rec.announced(overlay) }, 1)
+
+	if err := sf.Disconnect(overlay, "test: reconnect"); err != nil {
+		t.Fatal(err)
+	}
+	expectPeersEventually(t, sf)
+	connectLight(t, sf, sl, overlay)
+
+	expectCount(t, "announcements", func() int { return rec.announced(overlay) }, 2)
+	if got := sf.LightAnnouncementsSkipped(); got != 0 {
+		t.Fatalf("got %v skipped announcements on a bootnode, want 0", got)
+	}
+}
+
 // TestLightAnnouncementFailureNotRecorded checks that a failed announcement
 // does not suppress the next one.
 func TestLightAnnouncementFailureNotRecorded(t *testing.T) {

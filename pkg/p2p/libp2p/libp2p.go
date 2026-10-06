@@ -739,8 +739,10 @@ func (s *Service) handleIncoming(stream network.Stream) {
 			// light node announces explicitly, but a light peer that
 			// received an announcement recently gets none, so a client
 			// that reconnects often does not get the same list each time.
-			// Only a successful announcement is recorded.
-			if s.lightAnnounced.recent(peer.Address) {
+			// Only a successful announcement is recorded. A bootnode keeps
+			// announcing every time: light clients get their first list from
+			// it, and bootnode mode keeps today's behaviour.
+			if !s.bootnodeMode && s.lightAnnounced.recent(peer.Address) {
 				s.metrics.LightAnnouncementsSkipped.Inc()
 			} else if err := s.notifier.Announce(s.ctx, peer.Address, i.FullNode); err != nil {
 				s.logger.Debug("stream handler: notifier.Announce failed", "peer", peer.Address, "error", err)
