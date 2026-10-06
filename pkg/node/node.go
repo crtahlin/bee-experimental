@@ -182,6 +182,9 @@ type Options struct {
 	FullNodeMode                    bool
 	LightNodeLimit                  int
 	UltraLightNodeLimit             int
+	P2PMaxConnectionsPerIP          int
+	P2PConnectionRatePerIP          float64
+	P2PConnectionBurstPerIP         int
 	GasLimitFallback                uint64
 	Logger                          log.Logger
 	MinimumGasTipCap                uint64
@@ -978,6 +981,9 @@ func NewBee(
 		LightNodeLimit:              o.LightNodeLimit,
 		BootnodeMode:                o.BootnodeMode,
 		UltraLightNodeLimit:         o.UltraLightNodeLimit,
+		MaxConnectionsPerIP:         o.P2PMaxConnectionsPerIP,
+		ConnectionRatePerIP:         o.P2PConnectionRatePerIP,
+		ConnectionBurstPerIP:        o.P2PConnectionBurstPerIP,
 		Nonce:                       nonce,
 		AllowPrivateCIDRs:           o.AllowPrivateCIDRs,
 		Registry:                    registry,

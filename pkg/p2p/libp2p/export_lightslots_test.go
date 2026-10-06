@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/ethersphere/bee/v2/pkg/swarm"
+	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
+	libp2prate "github.com/libp2p/go-libp2p/x/rate"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 )
@@ -61,3 +63,11 @@ const (
 )
 
 var UltraLightNodeLimit = ultraLightNodeLimit
+
+// PerIPLimits returns the per-IP limits built for the configured values:
+// the IPv4 and IPv6 connection counts with their prefix lengths, and the
+// rate limiter.
+func PerIPLimits(maxConns int, rate float64, burst int) (ipv4, ipv6 []rcmgr.ConnLimitPerSubnet, limiter *libp2prate.Limiter) {
+	l := buildPerIPLimits(maxConns, rate, burst)
+	return l.ipv4Conns, l.ipv6Conns, l.rate
+}

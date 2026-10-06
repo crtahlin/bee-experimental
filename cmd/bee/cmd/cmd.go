@@ -81,6 +81,9 @@ const (
 	optionNameFullNode                     = "full-node"
 	optionNameLightNodeLimit               = "light-node-limit"
 	optionNameUltraLightNodeLimit          = "ultra-light-node-limit"
+	optionNameP2PMaxConnectionsPerIP       = "p2p-max-connections-per-ip"
+	optionNameP2PConnectionRatePerIP       = "p2p-connection-rate-per-ip"
+	optionNameP2PConnectionBurstPerIP      = "p2p-connection-burst-per-ip"
 	optionNamePostageContractAddress       = "postage-stamp-address"
 	optionNamePostageContractStartBlock    = "postage-stamp-start-block"
 	optionNamePriceOracleAddress           = "price-oracle-address"
@@ -410,6 +413,9 @@ func (c *command) setAllFlags(cmd *cobra.Command) {
 	cmd.Flags().String(optionNameChequebookMinBalance, "110000000000000000", "minimum chequebook token balance required for verification, in token small units (default 11 BZZ)")
 	cmd.Flags().Bool(optionNameFullNode, false, "cause the node to start in full mode")
 	cmd.Flags().Int(optionNameLightNodeLimit, 100, "light node limit")
+	cmd.Flags().Int(optionNameP2PMaxConnectionsPerIP, 200, "open connections accepted from one IPv4 address or one IPv6 /56 subnet; 0 uses the default of 200. Raising it lets one address hold more of this node's connections, handshakes and light slots; lowering it can refuse users who share one address behind a carrier NAT, who must then use other nodes")
+	cmd.Flags().Float64(optionNameP2PConnectionRatePerIP, 10, "new connections per second accepted from one IPv4 address or one IPv6 /56 subnet; 0 uses the default of 10. Raising it lets one address open connections faster and spend more of this node's handshakes; lowering it slows the reconnects of peers that share one address behind a carrier NAT, who then wait or try other nodes")
+	cmd.Flags().Int(optionNameP2PConnectionBurstPerIP, 40, "new connections accepted at once from one IPv4 address or one IPv6 /56 subnet above the per-second rate; 0 uses the default of 40. Raising it lets one address open more connections at once; lowering it can refuse the reconnects of a restarting peer, or of users behind a shared carrier NAT, who then wait or try other nodes")
 	cmd.Flags().Int(optionNameUltraLightNodeLimit, 0, "light-node slots that ultra-light peers (light peers without a chequebook) may take; 0 means the same as light-node-limit, and a larger value is reduced to it. Raising it lets clients that cannot pay take more of the node's free bandwidth and handshakes; lowering it refuses such clients sooner and sends them to other nodes, while paying light peers keep their slots")
 	cmd.Flags().String(optionNamePostageContractAddress, "", "postage stamp contract address")
 	cmd.Flags().Uint64(optionNamePostageContractStartBlock, 0, "postage stamp contract start block number")

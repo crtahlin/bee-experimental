@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/netip"
 	"os"
 	"runtime"
 	"slices"
@@ -57,7 +56,6 @@ import (
 	libp2pping "github.com/libp2p/go-libp2p/p2p/protocol/ping"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
 	ws "github.com/libp2p/go-libp2p/p2p/transport/websocket"
-	libp2prate "github.com/libp2p/go-libp2p/x/rate"
 	ma "github.com/multiformats/go-multiaddr"
 	manet "github.com/multiformats/go-multiaddr/net"
 	"github.com/multiformats/go-multistream"
@@ -183,6 +181,13 @@ type Options struct {
 	// take. Zero means the same as the light limit, and a larger value is
 	// reduced to it.
 	UltraLightNodeLimit int
+
+	// Per-IP connection limits, applied per IPv4 address and per IPv6
+	// /56 subnet: open connections, new connections per second, and the
+	// burst of new connections above that rate. Zero uses the default.
+	MaxConnectionsPerIP  int
+	ConnectionRatePerIP  float64
+	ConnectionBurstPerIP int
 }
 
 func New(ctx context.Context, signer beecrypto.Signer, networkID uint64, overlay swarm.Address, addr string, ab addressbook.GetPutter, storer storage.StateStorer, lightNodes *lightnode.Container, logger log.Logger, tracer *tracing.Tracer, o Options) (s *Service, returnErr error) {
@@ -262,43 +267,9 @@ func New(ctx context.Context, signer beecrypto.Signer, networkID uint64, overlay
 		return nil, err
 	}
 
-	limitPerIp := rcmgr.WithLimitPerSubnet(
-		[]rcmgr.ConnLimitPerSubnet{{PrefixLength: 32, ConnCount: 200}}, // IPv4 /32 (Single IP) -> 200 conns
-		[]rcmgr.ConnLimitPerSubnet{{PrefixLength: 56, ConnCount: 200}}, // IPv6 /56 subnet -> 200 conns
-	)
+	perIP := buildPerIPLimits(o.MaxConnectionsPerIP, o.ConnectionRatePerIP, o.ConnectionBurstPerIP)
 
-	// Custom rate limiter for connection attempts
-	// 20 peers cluster adaptation:
-	// Allow bursts of connection attempts (e.g. restart) but prevent DDOS.
-	connLimiter := &libp2prate.Limiter{
-		// Allow unlimited local connections (same as default)
-		NetworkPrefixLimits: []libp2prate.PrefixLimit{
-			{Prefix: netip.MustParsePrefix("127.0.0.0/8"), Limit: libp2prate.Limit{}},
-			{Prefix: netip.MustParsePrefix("::1/128"), Limit: libp2prate.Limit{}},
-		},
-		GlobalLimit: libp2prate.Limit{}, // Unlimited global
-		SubnetRateLimiter: libp2prate.SubnetLimiter{
-			IPv4SubnetLimits: []libp2prate.SubnetLimit{
-				{
-					PrefixLength: 32, // Apply limits per individual IPv4 address (/32)
-					// Allow 10 connection attempts per second per IP, burst up to 40
-					Limit: libp2prate.Limit{RPS: 10.0, Burst: 40},
-				},
-			},
-			IPv6SubnetLimits: []libp2prate.SubnetLimit{
-				{
-					PrefixLength: 56, // Apply limits per /56 IPv6 subnet
-					// Allow 10 connection attempts per second per IP, burst up to 40
-					// Subnet-level limiting prevents flooding from multiple addresses in the same block.
-					Limit: libp2prate.Limit{RPS: 10.0, Burst: 40},
-				},
-			},
-			// Duration to retain state for an IP or subnet after it becomes inactive.
-			GracePeriod: 10 * time.Second,
-		},
-	}
-
-	rm, err := rcmgr.NewResourceManager(limiter, rcmgr.WithTraceReporter(str), limitPerIp, rcmgr.WithConnRateLimiters(connLimiter))
+	rm, err := rcmgr.NewResourceManager(limiter, append([]rcmgr.Option{rcmgr.WithTraceReporter(str)}, perIP.options()...)...)
 	if err != nil {
 		return nil, err
 	}
