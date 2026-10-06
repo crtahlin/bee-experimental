@@ -1359,6 +1359,16 @@ func (k *Kad) onConnected(ctx context.Context, addr swarm.Address) error {
 
 // Disconnected is called when peer disconnects.
 func (k *Kad) Disconnected(peer p2p.Peer) {
+	// Only peers in kademlia's own peer list change its depth, its
+	// neighbours or the sync peers. Light peers are never in that list,
+	// so their disconnects return here without any further work. The
+	// check is on the list and not on peer.FullNode, because the peer
+	// registry can drop the full-node flag before it reports the
+	// disconnect, so a full peer can arrive here marked as light.
+	if !k.connectedPeers.Exists(peer.Address) {
+		return
+	}
+
 	k.logger.Debug("disconnected peer", "peer_address", peer.Address)
 
 	k.connectedPeers.Remove(peer.Address)
