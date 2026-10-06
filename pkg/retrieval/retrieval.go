@@ -753,6 +753,13 @@ func (s *Service) handler(p2pctx context.Context, p p2p.Peer, stream p2p.Stream)
 		span.End()
 	}()
 
+	// wasp #596: a light peer whose debit would overdraw it is refused here,
+	// before the lookup and any forwarding, with an error delivery rather than
+	// a disconnect after serving. Full peers are not checked.
+	if err := s.checkLightPeerDebit(ctx, p, addr); err != nil {
+		return err
+	}
+
 	chunk, err := s.storer.Lookup().Get(ctx, addr)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {

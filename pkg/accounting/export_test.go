@@ -67,3 +67,13 @@ func (a *Accounting) SafeAccrualCapForTest(threshold *big.Int) *big.Int {
 func (a *Accounting) SettleRefreshDue(peer swarm.Address, now time.Time) *big.Int {
 	return a.settleRefreshDue(a.getAccountingPeer(peer), now)
 }
+
+// HoldPeerLockForTest takes a peer's accounting lock and returns the function
+// that releases it, so a test can make a TryLock fail deterministically. A
+// cancelled context alone does not, because TryLock picks at random between a
+// free lock and a done context. See wasp #596.
+func (a *Accounting) HoldPeerLockForTest(peer swarm.Address) (release func()) {
+	accountingPeer := a.getAccountingPeer(peer)
+	accountingPeer.lock.Lock()
+	return accountingPeer.lock.Unlock
+}
