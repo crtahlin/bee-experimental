@@ -59,3 +59,5 @@ const (
 	LightAnnounceInterval = lightAnnounceInterval
 	LightAnnounceMaxPeers = lightAnnounceMaxPeers
 )
+
+var UltraLightNodeLimit = ultraLightNodeLimit

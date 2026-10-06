@@ -7,7 +7,9 @@ package libp2p
 import (
 	"errors"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethersphere/bee/v2/pkg/p2p"
+	"github.com/ethersphere/bee/v2/pkg/p2p/libp2p/internal/handshake"
 	"github.com/ethersphere/bee/v2/pkg/topology/lightnode"
 )
 
@@ -50,4 +52,27 @@ func lightRefusalReason(err error) string {
 		return lightRefusalUltraLight
 	}
 	return lightRefusalReserve
+}
+
+// isUltraLight reports whether a peer is ultra-light: a light peer whose
+// signed address carries the zero chequebook address, so it declares that
+// it cannot pay for bandwidth. This is advisory. A light peer's chequebook
+// address is covered only by its own signature and is not checked on chain,
+// so a client can claim one to avoid the ultra-light limit. It then still
+// counts against the light limit.
+func isUltraLight(i *handshake.Info) bool {
+	return !i.FullNode && i.BzzAddress.ChequebookAddress == (common.Address{})
+}
+
+// ultraLightNodeLimit returns the ultra-light limit to apply for the
+// configured value: zero means the same as the light limit, and a larger
+// value is reduced to the light limit, which reduced reports.
+func ultraLightNodeLimit(lightLimit, configured int) (limit int, reduced bool) {
+	if configured <= 0 {
+		return 0, false
+	}
+	if configured > lightLimit {
+		return lightLimit, true
+	}
+	return configured, false
 }

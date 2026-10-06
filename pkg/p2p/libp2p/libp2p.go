@@ -177,6 +177,12 @@ type Options struct {
 	// a random one, because light clients get their first announcement
 	// from bootnodes.
 	BootnodeMode bool
+
+	// UltraLightNodeLimit is the number of light slots that ultra-light
+	// peers, light peers whose signed address carries no chequebook, may
+	// take. Zero means the same as the light limit, and a larger value is
+	// reduced to it.
+	UltraLightNodeLimit int
 }
 
 func New(ctx context.Context, signer beecrypto.Signer, networkID uint64, overlay swarm.Address, addr string, ab addressbook.GetPutter, storer storage.StateStorer, lightNodes *lightnode.Container, logger log.Logger, tracer *tracing.Tracer, o Options) (s *Service, returnErr error) {
@@ -524,8 +530,12 @@ func New(ctx context.Context, signer beecrypto.Signer, networkID uint64, overlay
 		s.lightNodeLimit = o.LightNodeLimit
 	}
 	s.bootnodeMode = o.BootnodeMode
+	ultraLightLimit, reduced := ultraLightNodeLimit(s.lightNodeLimit, o.UltraLightNodeLimit)
+	if reduced {
+		logger.Warning("ultra-light node limit is above the light node limit and is reduced to it", "ultra_light_node_limit", o.UltraLightNodeLimit, "light_node_limit", s.lightNodeLimit)
+	}
 	if lightNodes != nil {
-		lightNodes.SetLimits(s.lightNodeLimit, 0)
+		lightNodes.SetLimits(s.lightNodeLimit, ultraLightLimit)
 	}
 
 	// Construct protocols.
@@ -690,7 +700,7 @@ func (s *Service) handleIncoming(stream network.Stream) {
 		lightSlotCommitted bool
 	)
 	if !i.FullNode && !s.bootnodeMode {
-		lightSlot, err = s.lightNodes.TryReserve(false)
+		lightSlot, err = s.lightNodes.TryReserve(isUltraLight(i))
 		if err != nil {
 			s.metrics.LightPeerRefusals.WithLabelValues(lightRefusalReason(err)).Inc()
 			s.logger.Debug("stream handler: light peer refused", "peer_address", overlay, "error", err)

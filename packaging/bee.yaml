@@ -317,3 +317,11 @@ password-file: "/var/lib/bee/password"
 
 ## limit of possible connected light nodes (default: 100)
 # light-node-limit: 100
+
+## light-node slots that ultra-light peers (light peers without a chequebook)
+## may take; 0 means the same as light-node-limit, and a larger value is
+## reduced to it. Raising it lets clients that cannot pay take more of the
+## node's free bandwidth and handshakes; lowering it refuses such clients
+## sooner and sends them to other nodes, while paying light peers keep their
+## slots
+# ultra-light-node-limit: 0

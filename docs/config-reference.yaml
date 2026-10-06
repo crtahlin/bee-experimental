@@ -460,5 +460,13 @@
 ## initial overlay
 # target-neighborhood: ""
 
+## light-node slots that ultra-light peers (light peers without a chequebook)
+## may take; 0 means the same as light-node-limit, and a larger value is
+## reduced to it. Raising it lets clients that cannot pay take more of the
+## node's free bandwidth and handshakes; lowering it refuses such clients
+## sooner and sends them to other nodes, while paying light peers keep their
+## slots
+# ultra-light-node-limit: 0
+
 ## maximum node warmup duration; proceeds when stable or after this time
 # warmup-time: 5m0s
