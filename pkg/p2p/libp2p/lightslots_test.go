@@ -204,6 +204,30 @@ func TestLightPeerRefusedCanReconnect(t *testing.T) {
 	expectPeersEventually(t, sf, secondOverlay)
 }
 
+// TestPickerWrapperPassesFullPeersToKademlia checks that the light-slot
+// picker leaves full peers to kademlia's own Pick: when kademlia refuses, a
+// full peer is refused, whatever the light slots.
+func TestPickerWrapperPassesFullPeersToKademlia(t *testing.T) {
+	t.Parallel()
+
+	sf, container := newLightLimitedNode(t, 10, mockNotifier(noopCf, noopDf, false), libp2p.Options{})
+	addr := serviceUnderlayAddress(t, sf)
+
+	full, _ := newService(t, 1, libp2pServiceOpts{
+		notifier:   mockNotifier(noopCf, noopDf, true),
+		libp2pOpts: libp2p.Options{FullNode: true},
+	})
+	if _, err := full.Connect(t.Context(), addr); err == nil {
+		// The dialer may only see the refusal when it closes the handshake
+		// stream; either way the full peer must not stay connected.
+		expectPeersEventually(t, sf)
+	}
+	expectPeersEventually(t, sf)
+	if got := container.Count(); got != 0 {
+		t.Fatalf("got %d light peers, want 0", got)
+	}
+}
+
 // TestLightPeerLimitBootnodeEvicts checks that a bootnode keeps accepting
 // light peers over its limit and evicts one to stay at it.
 func TestLightPeerLimitBootnodeEvicts(t *testing.T) {

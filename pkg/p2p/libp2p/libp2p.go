@@ -1314,7 +1314,11 @@ func (s *Service) Disconnect(overlay swarm.Address, reason string) (err error) {
 	if s.notifier != nil {
 		s.notifier.Disconnected(peer)
 	}
-	if s.lightNodes != nil {
+	// A light peer that reconnected with the same overlay while this
+	// disconnect was on its way is registered again, and the container
+	// already counts it. Removing it now would leave the live connection
+	// uncounted and let the light limit be passed by one. See #593.
+	if s.lightNodes != nil && !s.peers.Exists(peer.Address) {
 		s.lightNodes.Disconnected(peer)
 	}
 	if s.reacher != nil {
@@ -1354,7 +1358,11 @@ func (s *Service) disconnected(address swarm.Address) {
 	if s.notifier != nil {
 		s.notifier.Disconnected(peer)
 	}
-	if s.lightNodes != nil {
+	// A light peer that reconnected with the same overlay while this
+	// disconnect was on its way is registered again, and the container
+	// already counts it. Removing it now would leave the live connection
+	// uncounted and let the light limit be passed by one. See #593.
+	if s.lightNodes != nil && !s.peers.Exists(peer.Address) {
 		s.lightNodes.Disconnected(peer)
 	}
 	if s.reacher != nil {

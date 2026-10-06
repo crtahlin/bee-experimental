@@ -95,6 +95,7 @@ func TestLightAnnouncementOncePerInterval(t *testing.T) {
 		t.Fatal(err)
 	}
 	expectPeersEventually(t, sf)
+	expectPeersEventually(t, sl)
 	connectLight(t, sf, sl, overlay)
 
 	expectCount(t, "skipped announcements", func() int { return int(sf.LightAnnouncementsSkipped()) }, 1)
@@ -120,6 +121,7 @@ func TestLightAnnouncementBootnodeNotGated(t *testing.T) {
 		t.Fatal(err)
 	}
 	expectPeersEventually(t, sf)
+	expectPeersEventually(t, sl)
 	connectLight(t, sf, sl, overlay)
 
 	expectCount(t, "announcements", func() int { return rec.announced(overlay) }, 2)
@@ -145,6 +147,7 @@ func TestLightAnnouncementFailureNotRecorded(t *testing.T) {
 		t.Fatal(err)
 	}
 	expectPeersEventually(t, sf)
+	expectPeersEventually(t, sl)
 	connectLight(t, sf, sl, overlay)
 
 	expectCount(t, "announcements", func() int { return rec.announced(overlay) }, 2)
