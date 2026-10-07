@@ -33,6 +33,7 @@ All references are to `pkg/topology/kademlia/kademlia.go` on `origin/main` (`a6d
 2. **A successful dial** sets the retry entry to `tryAfter` now plus `ShortRetry` **with `failedAttempts` 0** (line 467: `k.waitNext.Set(peer.addr, time.Now().Add(k.opt.ShortRetry), 0)`).
 3. **A disconnect** (`Disconnected`, line 1366) sets only `tryAfter`, to now plus `TimeToRetry`, and keeps `failedAttempts` as it is.
 4. **An inbound connection** (`onConnected`, line 1351) removes the retry entry altogether.
+5. **A connection that fails kademlia's own peer announcement** (`Announce`, lines 1238 to 1243, called at the end of `connect`) is disconnected by kademlia, and `connect` returns the error. The dial handler's last error branch (line 462) only logs it: the count is neither increased nor reset, and the disconnect then sets `tryAfter` to 20 s as in point 3. A peer that drops us while the announcement is being sent is therefore also dialled again indefinitely, through a path that never touches the count.
 
 So a peer that accepts the connection and drops it at once resets the failure count every time it accepts. With roughly one success in three dials, the count never reaches 4 or 6, the peer is never pruned, and it is dialled again about 20 s after each event, plus up to 15 s until the manage loop's next pass. That is the 25-second cycle in the logs.
 
@@ -66,20 +67,24 @@ If node 6's disconnects come mainly from this cycle, its kademlia disconnect cou
 
 New methods in `internal/waitnext`, under the existing mutex:
 
-- **`Connected(addr, now, tryAfter)`**: create the entry if missing; keep `failedAttempts` and `shortLived`; set `connectedAt` to `now` unless it is already set (a second success while connected must not move it); set `tryAfter`.
+- **`Connected(addr, now, tryAfter)`**: create the entry if missing; keep `failedAttempts` and `shortLived`; set `connectedAt` to `now`; set `tryAfter`.
 - **`Disconnected(addr, now, base) (shortLived bool)`**:
-  - no entry, or `connectedAt` zero: set `tryAfter` to `now + base`, as `SetTryAfter` does today, and return false;
+  - no entry, or `connectedAt` zero: set `tryAfter` to `now + base`, as `SetTryAfter` does today, unless the entry already holds a later `tryAfter`, and return false;
   - otherwise clear `connectedAt`, then
     - if the connection lasted at least `stableConnection` (one minute): set `failedAttempts` and `shortLived` to 0 and `tryAfter` to `now + base`, and return false. This is today's behaviour after a disconnect;
     - if it was shorter: increase `shortLived`, set `tryAfter` to `now + backoff(shortLived, base)`, keep `failedAttempts`, and return true.
+- **`ShortLived(addr, now, base)`**: the same as the short branch of `Disconnected`, for a connection that never got a `connectedAt` (point 5 of the Problem).
 - **`Failed(addr, now, tryAfter, attempts)`** replaces `Set` on the failure path: it updates `failedAttempts` and sets `tryAfter` to the **later** of the given time and `now + backoff(shortLived, base)`, and keeps `shortLived`. Without this, a failed dial between two short connections would bring the next dial back to 20 s and undo the backoff.
+
+No method shortens a `tryAfter` that is already later than the one it would set. Today `SetTryAfter` can shorten one, for example a longer wait from a `ConnectionBackoffError`; keeping the later of the two is what stops a disconnect from undoing a backoff that was just set.
 
 `backoff(n, base)` is `base * 2^(n-1)`, capped at `maxShortLivedBackoff` (15 minutes), and `base` when `n` is 0. With the default `TimeToRetry` of 20 s the waits are 20 s, 40 s, 80 s, 160 s, 320 s, 640 s, then 15 minutes.
 
 ### 2. Kademlia uses them
 
 In `pkg/topology/kademlia/kademlia.go`:
-- **Successful dial (line 467):** `k.waitNext.Connected(peer.addr, now, now+ShortRetry)` instead of `Set(..., 0)`. The failure count is no longer reset here.
+- **Successful dial:** in `connect`, directly after `k.p2p.Connect` succeeds and before `Announce`, call `k.waitNext.Connected(peer, now, now+ShortRetry)`. Line 467 no longer touches the retry entry, so the failure count is no longer reset on a success. The call moves into `connect` because a remote that drops us within a second can close the connection while `Announce` is still running: recorded at line 467, after `Announce`, the disconnect could arrive first and find no `connectedAt`. The already-connected case (`p2p.ErrAlreadyConnected` with the same overlay) does not call `Connected`, so the start time of the existing connection is kept.
+- **Announcement failed:** when `Announce` returns an error in `connect`, call `k.waitNext.ShortLived(peer, now, TimeToRetry)` and increase the short-lived counter. Kademlia disconnects the peer itself in that case; the disconnect that follows finds `connectedAt` cleared and, by the rule above, does not shorten the wait. (`Connected` was called just before, so `ShortLived` also clears `connectedAt`.)
 - **Inbound connection and bootnode connection (`onConnected`, line 1351):** `k.waitNext.Connected(addr, now, now)` instead of `Remove`. A connected peer is never dialled, so a `tryAfter` of now changes nothing while it is connected; what changes is that the counts survive until the connection has shown it lasts.
 - **Disconnect (line 1366):** `k.waitNext.Disconnected(peer.Address, now, TimeToRetry)` instead of `SetTryAfter`. When it returns true, increase a new counter `bee_kademlia_short_lived_connections` and log at debug level with the peer and the connection's duration.
 - **Failed dial (line 1157):** `Failed` instead of `Set`. The prune decision at line 1149 is unchanged: it still counts only failed dials, and still uses 4 and 6.
@@ -109,9 +114,15 @@ In `internal/waitnext`:
 
 The time comes from a parameter, so the tests need no sleeping.
 
-In `pkg/topology/kademlia` (with the existing mock p2p service): a peer that accepts every dial and is disconnected at once is dialled with growing gaps, and the short-lived counter increases; a peer that alternates two failed dials and one short connection is pruned from the address book; a peer that stays connected past the threshold and then disconnects is retried after `TimeToRetry` with counts at 0.
+In `pkg/topology/kademlia` (with the existing mock p2p service, `pkg/p2p/mock`, and mock discovery):
+- a peer whose announcement fails is backed off, and the following disconnect does not shorten the wait;
+- a disconnect that arrives before `Connected` for the same connection costs at most one uncounted short connection, and the next one is counted; a peer that accepts every dial and is disconnected at once is dialled with growing gaps, and the short-lived counter increases; a peer that alternates two failed dials and one short connection is pruned from the address book; a peer that stays connected past the threshold and then disconnects is retried after `TimeToRetry` with counts at 0.
 
-Mutation checks (lifecycle playbook, step 4): removing the duration check, removing the doubling, and putting back the reset at line 467 must each fail at least one test.
+Mutation checks (lifecycle playbook, step 4): removing the duration check, removing the doubling, putting back the reset at line 467, dropping the `ShortLived` call on a failed announcement, and letting a disconnect shorten `tryAfter` must each fail at least one test.
+
+### 6. A remaining race
+
+A disconnect can still arrive between `k.p2p.Connect` returning and the `Connected` call that follows it. The disconnect then sees no `connectedAt`, and `Connected` marks a connection that is already gone. The effect is one short connection that is not counted; the next successful dial overwrites `connectedAt`, so nothing goes stale. The window is a few instructions long. Today the same race lets kademlia add a peer to its peer list after it has gone (line 469); that existing behaviour is not changed here.
 
 ## Protocol impact
 
@@ -139,13 +150,13 @@ If they fall to the level of the control node, the cycle was the main cause of n
 
 ## Rollout and rollback
 
-There is no setting. The change ships in a wasp release and is on for every node running it.
+There is no setting. The change ships in a wasp release and is on for every node running it. The implementation pull request adds the new counter `bee_kademlia_short_lived_connections` and the changed retry behaviour to `docs/DIFFERENCES.md` (rule 13).
 
 Rollback is the previous build. The retry entries are in memory only, so going back needs no migration and leaves nothing behind.
 
 ## Upstream portability
 
-The change is self-contained: `internal/waitnext` (two fields, three methods), four call sites in `kademlia.go`, one counter in `metrics.go`, and tests. It uses nothing wasp-specific. The lines it replaces are the same in `upstream/v2.8.2` and `upstream/master` (see Problem), so the patch applies to either with only line offsets.
+The change is self-contained: `internal/waitnext` (two fields, four methods), five call sites in `kademlia.go`, one counter in `metrics.go`, and tests. It uses nothing wasp-specific. The lines it replaces are the same in `upstream/v2.8.2` and `upstream/master` (see Problem), so the patch applies to either with only line offsets.
 
 The only interaction with wasp code is the light-peer churn change (#594), which makes `Disconnected` return early for peers kademlia never counted. Upstream has no such check; there the `connectedAt` test in `Disconnected` gives the same result for those peers.
 
