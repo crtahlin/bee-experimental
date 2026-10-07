@@ -40,10 +40,11 @@ Today every limit on new connections is **per address**. Verified in the source 
 
 So a client with 100 addresses can make one node run about 1,000 security handshakes per second. At 13 ms each that is about 13 CPU cores, on any build (estimate from the measured cost, not measured at that rate). On a machine that runs several nodes, this also takes CPU from the reserve samples of the others.
 
-**Today's load, for scale** (from the 24-hour baseline, 11 nodes, counter `bee_libp2p_handled_connection_count` read every 5 minutes; the per-node numbers are posted on #599 [here](https://github.com/crtahlin/wasp/issues/599#issuecomment-6045010083)):
+**Today's load, for scale** (from the 24-hour baseline, 11 nodes, counter `bee_libp2p_handled_connection_count` read every 5 minutes; the per-node numbers are posted on #599 [here](https://github.com/crtahlin/wasp/issues/599#issuecomment-6045010083), with a [correction of the stake-1 row](https://github.com/crtahlin/wasp/issues/599#issuecomment-6045125372)):
 - average 0.13 to 0.28 connections per second per node;
-- highest 5-minute average on a settled node: 0.72 per second;
-- highest overall: 2.8 per second, on two nodes during their first hours after creation.
+- highest 5-minute average on a settled node, outside a restart: 0.72 per second (stake-1);
+- in the 5 minutes that contain a restart: 2.9 per second (stake-1, its one restart in the window, counted as the counter value after the restart);
+- 2.5 and 2.8 per second on two new sw-1 nodes during their first hours after creation.
 
 The counter counts connections in both directions, and only after the security handshake and the connection setup that follows it. The check in this spec also sees port scans and failed handshakes, so the rate it sees is higher than this counter by an unknown amount. Section 4 adds a counter for it.
 
@@ -96,22 +97,27 @@ A wrapper is used, not a connection gater: a gater's `InterceptAccept` runs befo
 
 ### 2. The set of known full peers
 
-**Added:** the remote address key of a full peer, inbound or outbound, after `notifier.Connected` returns without error. That is the last check that can still disconnect the peer (kademlia's acceptance), and it comes after the blocklist check, the address-book write and the `ConnectIn` hooks. The address-book write runs only when the peer's addresses are in the peerstore (`len(peerAddrs) > 0`); the known set does not depend on it, because the key comes from the connection's own remote address. So a full peer behind NAT is recorded by the address it connects from.
+**Added:** the remote address key of a full peer, in two places.
+- **Inbound,** in `handleIncoming`, after `notifier.Connected` returns without error. That is the last check that can still disconnect the peer (kademlia's acceptance), and it comes after the blocklist check, the address-book write and the `ConnectIn` hooks.
+- **Outbound,** at the end of `Connect`, after its final `peers.Exists` check, for a peer that declared itself full. The outbound path never calls `notifier.Connected` (verified); kademlia dialled the peer itself, so it wanted it.
+
+ The address-book write runs only when the peer's addresses are in the peerstore (`len(peerAddrs) > 0`); the known set does not depend on it, because the key comes from the connection's own remote address. So a full peer behind NAT is recorded by the address it connects from.
 
 **Kept:** a plain `lru.Cache` from `hashicorp/golang-lru/v2` (v2.0.7) with at most 10,000 keys, each holding the time it was last seen. This follows `lightannounce.go` in PR #606, which uses the plain cache because the expiring cache runs a cleanup goroutine that never stops and reads the real clock.
 - "Last seen" is refreshed when the full peer connects, when it disconnects, and by a pass over the connected full peers every hour. A full peer that stays connected for days therefore stays in the set. A connection that ends in the "peer already exists" early return in `handleIncoming` does not refresh it; the hourly pass covers that peer.
 - A key expires 24 hours after it was last seen. A sweep every 10 minutes removes expired keys. It runs on a goroutine that stops with the libp2p service, and reads an injected clock, so tests can move time.
+- The sweep's read, expiry check and removal are not one step, so a refresh in between could be undone. All writers (the refreshes, the hourly pass and the sweep) therefore take one mutex of their own. The accept path never takes it.
 - **The hot path reads with `Peek`**, which does not change the LRU order and takes only the cache's own lock. Writes (`Add`, the sweep) happen off the accept path.
 
 **After a restart** the set is empty. The node's own outbound dials to full peers are not limited and refill it. Whether they refill it quickly enough is a hypothesis: an address learned from an outbound dial is the remote's listen address, and its inbound connections can come from another address (several network interfaces, NAT, IPv6 temporary addresses). Until then, full peers that reconnect inbound use the general bucket, whose burst is sized for a restart (Configuration). The restart run in the measurement tests this.
 
 **What a dishonest peer gains:**
-- Declaring `FullNode = true` costs nothing unless `chequebook-verification` is on. A peer that kademlia accepts as full gets its key into the set, and then draws from the known-full-peer bucket. It is still held to the per-address rate, so it can take at most a third of that bucket.
+- Declaring `FullNode = true` costs nothing unless `chequebook-verification` is on. A peer that kademlia accepts as full gets its key into the set, and then draws from the known-full-peer bucket. It is still held to the per-address rate, so it can take at most a third of that bucket. **So an attacker with three known keys empties the known-full-peer bucket.** Without `chequebook-verification`, a key costs one full-node handshake that kademlia accepts. The exemption therefore protects known full peers against floods from unknown addresses only, not against an attacker who has made itself known from three addresses.
 - **Pushing real peers out of the set:** with IPv6, an attacker can use many /56 keys. Each key enters the set only through a full-node handshake that kademlia accepts, and kademlia accepts a bounded number of peers per bin. Repeated over time this can still cycle fake keys through the 10,000 entries and push real full peers out. The real peers' own reconnects and the hourly pass put them back; until then, they use the general bucket. With `chequebook-verification` on, each fake full peer needs a deployed chequebook, which costs gas.
 
 ### 3. Bootnode mode
 
-A node in bootnode mode keeps today's behaviour: no total rate, unless the operator sets one. A bootnode is the first contact for new nodes and clients, so every caller is unknown and would use the general bucket. This matches the light-peer churn spec, where bootnodes also keep today's behaviour.
+A node in bootnode mode keeps today's behaviour: no total rate, unless the operator sets one. Because 0 or below means the default, "sets one" is read with the configuration's `IsSet` check on `p2p-inbound-connection-rate`, as `cmd/bee/cmd/start.go` already does for other options. A bootnode is the first contact for new nodes and clients, so every caller is unknown and would use the general bucket. This matches the light-peer churn spec, where bootnodes also keep today's behaviour.
 
 ### 4. Metrics
 
@@ -140,7 +146,7 @@ They are one token bucket and are proposed under one issue. To turn the limit of
 
 **Why these values:**
 - **Rate:** three times the per-address rate of 10, so one address takes at most a third of a bucket. It is about 10 times the highest 5-minute average seen in 24 hours on 11 nodes (2.8 per second, on new nodes).
-- **Burst:** after a restart, up to the light-node limit (100) plus the inbound full peers (about 50 today) reconnect within seconds, while the known set is still empty. 200 leaves a third more than that. Today's nodes hold at most 7 light peers, so a plain restart reconnects only about 57; the measurement restarts a node while test clients fill its light slots.
+- **Burst:** after a restart, up to the light-node limit (100) plus the inbound full peers (about 50 today) reconnect within seconds, while the known set is still empty. 200 leaves a third more than that. Today's nodes hold at most 7 light peers, so a plain restart reconnects only about 57. Run 2 restarts a node with test clients in its light slots, but its light limit is 4 for that run, so it also exercises only about 58 reconnects: it tests the mechanism at small scale. The case of about 150 reconnects is not tested.
 
 **Worst-case CPU at the defaults** (estimate): at most 60 connections per second (two buckets of 30) reach the security handshake. At the measured 13 ms for a refused light attempt, that is about 0.8 cores per node, against no bound today. Connections that go further cost more: a full peer that kademlia accepts, or a light peer that gets a slot. Those are limited by kademlia's bins and by `light-node-limit`.
 
@@ -181,7 +187,7 @@ They are one token bucket and are proposed under one issue. To turn the limit of
 
 ### On a node
 
-**What our hosts can produce.** On #599, 8 stock ultra-light clients on bench-1, each asking to connect every 500 ms, produced about 5.3 inbound connection attempts per second in total, about 0.67 per client. Each client holds about 137 connections, and the network bench-1 is on held about 1,100 to 1,865 connections in earlier tests. So bench-1 and bench-2 together can produce roughly 10 to 20 attempts per second (estimate), below the default rate of 30. The flood runs therefore lower the target's rate through the setting for the test. They test the mechanism and its cost per refused attempt, not the default values. The defaults are tested for false refusals by runs 1 and 2.
+**What our hosts can produce.** In the [load test on #599](https://github.com/crtahlin/wasp/issues/599#issuecomment-6040276978), 8 stock ultra-light clients on bench-1, each asking to connect every 500 ms, produced about 5.3 inbound connection attempts per second in total, about 0.67 per client. The 8 clients held about 1,100 connections together, about 137 each, from one host behind a home network, and that comment notes that larger client counts need a host on a public address. Whether bench-2 is on a public address is not stated in the repository documentation; it is to be confirmed before the run. So the test can count on about 5.3 attempts per second from bench-1, and about 10.7 if bench-2 can run 8 more clients, both below the default rate of 30. The flood runs therefore lower the target's rate through the setting for the test. They test the mechanism and its cost per refused attempt, not the default values. The defaults are tested for false refusals by runs 1 and 2.
 
 **1. Today's load.** Two sw-1 nodes on this build at the defaults against two on the build of PR #606, over three windows of 8 hours each (rule 7: three runs, reported with the spread). Accepted when the refusal counters stay at zero, the admitted counter shows the margin to the limits, and the connection and kademlia counters match the other nodes within the spread.
 
@@ -189,22 +195,24 @@ They are one token bucket and are proposed under one issue. To turn the limit of
 
 **3. A flood, 3 runs of 20 minutes per condition.** Against one sw-1 node (the target):
 - **Test settings on the target:** `p2p-inbound-connection-rate: 2`, `p2p-inbound-connection-burst: 10`, and the per-address limits raised (`p2p-connection-rate-per-ip` and `p2p-max-connections-per-ip`), so that the clients behind one public address are not refused by the per-address limit first.
-- **General bucket:** 16 ultra-light clients on bench-1 and bench-2, each asking to connect every 500 ms, about 10 attempts per second. Before each run, the target's `/peers` is checked for a full node from the bench network; if one is connected, the bench address is already known, and the run records that it tested the known-full-peer bucket instead.
-- **Known-full-peer bucket:** 8 ultra-light clients on sw-1 itself, dialling the target's public address. Their source is sw-1's address, which is known once another sw-1 node is connected to the target as a full peer; this is checked in `bee_libp2p_known_full_addresses` and the target's `/peers` before the run. The clients take CPU on the same machine, so only the target process's CPU is compared.
+- **General bucket:** 8 ultra-light clients on bench-1, and 8 more on bench-2 if it is confirmed able to run them, each asking to connect every 500 ms: about 5.3 or 10.7 attempts per second. Before each run, the target's `/peers` is checked for a full node from the bench network; if one is connected, the bench address is already known, and the run records that it tested the known-full-peer bucket instead.
+- **Known-full-peer bucket:** 8 ultra-light clients on sw-1 itself, dialling the target's public address. Their source is sw-1's address, which is known once another sw-1 node is connected to the target as a full peer; this is checked in `bee_libp2p_known_full_addresses` and the target's `/peers` before the run. Whether the clients' connections really arrive from that key depends on routing on sw-1, so the run counts only if `bee_libp2p_inbound_admitted{bucket="known_full"}` and that bucket's refusals both move. The clients take CPU on the same machine, so only the target process's CPU is compared. The other sw-1 nodes share the flooded bucket with these clients and are expected to be refused during this run.
 - **Conditions:** the build of PR #606 without this change, and this change with the test settings.
 - **Recorded:** the target process's CPU over idle, admissions and refusals by bucket, kademlia's connected full peers, the node's reachability as reported by `/topology`, a worst-case reserve sample per run, and whether a full peer on another bench machine still holds the target in its address book after the run.
 
 **Accepted when:**
-- the CPU per refused attempt, over idle, is much lower than the 13 ms of a refusal at the light limit, because no security handshake runs;
+- **the CPU per refused attempt falls**, measured from a 45-second CPU profile per run as on #599: the CPU in the connection upgrade (`upgrader.(*upgrader).upgrade`, which contains the security handshake) divided by all inbound attempts in the profile window. Without this change every attempt runs the upgrade; with it only the admitted ones do. Pass: this cost per attempt falls by at least half in all 3 runs. Inconclusive: fewer than 0.5 s of profile samples in the upgrade in either condition, or the runs disagree.
+- **Process CPU is recorded but is not a pass criterion.** The expected saving is about 3.3 refused attempts per second x 13 ms = 0.04 cores with bench-1 alone, or 8.7 x 13 ms = 0.11 cores with bench-2 too, the same size as the spread between runs on #599 (0.12 to 0.19 cores).
 - admissions stay at the bucket rate;
-- kademlia's connected full peers do not fall below their level before the flood, full peers still connect, and the full peer on the other bench machine still has the target in its address book;
+- kademlia's connected full peers do not fall below their level before the flood, full peers still connect (in the known-full-peer run, excluding the other sw-1 nodes, which share the flooded bucket), and the full peer on the other bench machine still has the target in its address book;
 - the target stays reachable;
 - the reserve sample stays within the spread of its baseline.
 
 **A negative result looks like:**
 - the CPU per refused attempt does not fall, because the work moved to accepting TCP connections or to the resource manager;
 - kademlia loses full peers, full peers drop the target from their address books, or the target judges itself unreachable;
-- the defaults refuse connections at today's load or through a restart.
+- the defaults refuse connections at today's load or through a restart;
+- the known-full-peer bucket empties under a flood from unknown addresses, so known full peers are refused.
 
 Any of these stops the change at its current design.
 
