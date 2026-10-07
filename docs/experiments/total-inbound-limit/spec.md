@@ -46,7 +46,7 @@ So a client with 100 addresses can make one node run about 1,000 security handsh
 - in the 5 minutes that contain a restart: 2.9 per second (stake-1, its one restart in the window, counted as the counter value after the restart);
 - 2.5 and 2.8 per second on two new sw-1 nodes during their first hours after creation.
 
-The counter counts connections in both directions, and only after the security handshake and the connection setup that follows it. The check in this spec also sees port scans and failed handshakes, so the rate it sees is higher than this counter by an unknown amount. Section 4 adds a counter for it.
+The counter counts connections in both directions, and only after the security handshake and the connection setup that follows it. The check in this spec also sees port scans and failed handshakes, so the rate it sees is higher than this counter by an unknown amount. Section 5 adds a counter for it.
 
 ### Corrections to the issue text
 
@@ -117,9 +117,21 @@ A wrapper is used, not a connection gater: a gater's `InterceptAccept` runs befo
 
 ### 3. Bootnode mode
 
-A node in bootnode mode keeps today's behaviour: no total rate, unless the operator sets one. Because 0 or below means the default, "sets one" is read with the configuration's `IsSet` check on `p2p-inbound-connection-rate`, as `cmd/bee/cmd/start.go` already does for other options. A bootnode is the first contact for new nodes and clients, so every caller is unknown and would use the general bucket. This matches the light-peer churn spec, where bootnodes also keep today's behaviour.
+A node in bootnode mode keeps today's behaviour: no total rate, unless the operator sets one. Because 0 means the default, "sets one" is read with the configuration's `IsSet` check on `p2p-inbound-connection-rate`, as `cmd/bee/cmd/start.go` already does for other options. A bootnode is the first contact for new nodes and clients, so every caller is unknown and would use the general bucket. This matches the light-peer churn spec, where bootnodes also keep today's behaviour.
 
-### 4. Metrics
+### 4. This node's own reachability during a flood
+
+**How the node learns it is reachable** (verified in `pkg/p2p/libp2p/libp2p.go` and go-libp2p v0.48.0, `p2p/host/autonat`): `reachabilityOverridePublic` is `"false"`, so AutoNAT decides. The node's AutoNAT client asks one of its connected peers to dial it back. The peer is picked at random among the connected peers that support the AutoNAT protocol and have a public address that is not on this node's own IP (`getPeerToProbe`, `dialPolicy.skipPeer`). So other nodes on the same machine are never asked. The asked peer dials back from its own AutoNAT dialer host, a separate libp2p host on the same machine, with its own peer ID and a new port, but normally the same IP as the peer's main connection (`autoNATService.doDial` with `config.dialer`; the node creates that host with `o.hostFactory`).
+
+**So the dial-backs normally come from known full peers' addresses**, because the asked peers are connected peers with public addresses, which are in practice full peers that completed a handshake with this node. They use the known-full-peer bucket. A light peer with a public address that supports AutoNAT could also be asked; its dial-back uses the general bucket. A peer whose dialer host leaves from another IP than its main connection (several network interfaces) also uses the general bucket.
+
+**How many refusals turn the node private** (verified in `autonat.go`): when the node is public with full confidence (3), each failed dial-back lowers the confidence by one, and the fourth failure in a row switches it to private. While public and receiving inbound connections, a probe runs every 30 minutes (`refreshInterval` of 15 minutes, doubled); after the first failure, every 90 seconds (`retryInterval`). So a flood must refuse the dial-backs for about 4.5 minutes after a failed probe before the node turns private. One successful dial-back switches it back to public at once. While private, `IsReachable()` is false, and the node stops storing pushed chunks for its own neighbourhood (`pkg/pushsync/pushsync.go`).
+
+**Decision:** no exemption for dial-backs. They cannot be recognised before the security handshake: the dialer host's peer ID is unknown until then, and only the IP is available. That IP is a known full peer's, so the dial-backs already fall in the known-full-peer bucket. The remaining risk is a flood that empties that bucket, which section 2 bounds to an attacker with three known keys. The change adds:
+- the gauge `bee_libp2p_reachability_public` (1 when public), and
+- a warning in the log when the node turns private while the wrapper has refused connections in the last 5 minutes, naming both, so the cause can be seen.
+
+### 5. Metrics
 
 - `bee_libp2p_inbound_admitted{bucket}`, with `general` and `known_full`: connections the wrapper admitted, so the margin to the limit is visible, not only the refusals.
 - `bee_libp2p_inbound_refusals{bucket}`, with the same labels.
@@ -135,14 +147,16 @@ The behaviour other nodes see does change while a bucket is empty: their dials t
 
 ## Configuration
 
-Two new settings, next to the per-IP settings of #597, with the same rule: a value of 0 or below means the default.
+Two new settings, next to the per-IP settings of #597. Like every node option, each can be set in the configuration file, as a command-line flag, or as a `BEE_` environment variable. A value of 0 means the default, as for the per-IP settings. A value of -1 turns the limit off, which is today's behaviour. Any other negative value is refused at start with an error. This differs from the per-IP settings, where every value of 0 or below means the default; the documentation of both states it.
 
 | Setting | Type | Default | What it limits |
 |---|---|---|---|
 | `p2p-inbound-connection-rate` | float, connections per second | 30 | the refill rate of each bucket (general, and known full peers) |
 | `p2p-inbound-connection-burst` | integer | 200 | the burst of each bucket |
 
-They are one token bucket and are proposed under one issue. To turn the limit off, an operator sets a rate far above any real load, for example `p2p-inbound-connection-rate: 1000000`; the documentation names that value. Bootnodes have it off unless set.
+They are one token bucket and are proposed under one issue. Setting either to -1 turns the limit off. Bootnodes have it off unless set.
+
+**Decided by the operator: the limit is on by default.** Rule 8 asks for the current value as the default, and today there is no total limit. The operator decided that this protection ships on, because it is a protection rather than a tuning, and the defaults are far above the measured load (30 per second against at most 2.9 seen). The defaults are accepted only if runs 1 and 2 show no refusals; otherwise they are raised.
 
 **Why these values:**
 - **Rate:** three times the per-address rate of 10, so one address takes at most a third of a bucket. It is about 10 times the highest 5-minute average seen in 24 hours on 11 nodes (2.8 per second, on new nodes).
@@ -158,7 +172,7 @@ They are one token bucket and are proposed under one issue. To turn the limit of
 - **New light clients wait longer**, and go to other full nodes, which then carry more load.
 - **Full peers that do not know this node stop trying.** A stock node counts each failed dial as a failed attempt. After 4 failed attempts (`maxConnAttempts` in `pkg/topology/kademlia/kademlia.go`, verified at `upstream/v2.8.2`; 6 inside its neighbourhood) it removes this node from its known peers and from its address book. A flood that lasts about a minute can therefore make new full peers forget this node.
 - **Other nodes may judge this node unreachable.** They check reachability with their ping dialer before kademlia keeps this node. If that dial is refused, they mark this node as not publicly reachable, and their kademlia drops it before other peers. The dial comes from the other node's own address, which is in the known set if that node has completed a full-node handshake with this one; from an unknown address it uses the general bucket.
-- **This node may judge itself unreachable** (open question below).
+- **This node may judge itself unreachable** if its own reachability checks are refused (section 4).
 - **This node's own dials are not affected**, so it keeps reaching full peers itself.
 
 ## Measurement
@@ -174,7 +188,8 @@ They are one token bucket and are proposed under one issue. To turn the limit of
   - loopback takes no token;
   - an IPv4 address carried as IPv6 gets the IPv4 key; an IPv6 address is keyed by its /56;
   - outbound connections are passed through unchanged;
-  - values of 0 or below give the defaults; bootnode mode has no limit.
+  - 0 gives the defaults, -1 turns the limit off, and any other negative value is refused at start; bootnode mode has no limit unless set;
+  - the warning is logged when the reachability changes to private within 5 minutes of a refusal, and not otherwise.
 - **Known set:**
   - with an injected clock, a key expires 24 hours after it was last seen, and a connected full peer refreshed by the hourly pass does not expire;
   - a peer that kademlia refuses (`notifier.Connected` returns an error) is not recorded;
@@ -187,15 +202,15 @@ They are one token bucket and are proposed under one issue. To turn the limit of
 
 ### On a node
 
-**What our hosts can produce.** In the [load test on #599](https://github.com/crtahlin/wasp/issues/599#issuecomment-6040276978), 8 stock ultra-light clients on bench-1, each asking to connect every 500 ms, produced about 5.3 inbound connection attempts per second in total, about 0.67 per client. The 8 clients held about 1,100 connections together, about 137 each, from one host behind a home network, and that comment notes that larger client counts need a host on a public address. Whether bench-2 is on a public address is not stated in the repository documentation; it is to be confirmed before the run. So the test can count on about 5.3 attempts per second from bench-1, and about 10.7 if bench-2 can run 8 more clients, both below the default rate of 30. The flood runs therefore lower the target's rate through the setting for the test. They test the mechanism and its cost per refused attempt, not the default values. The defaults are tested for false refusals by runs 1 and 2.
+**What our hosts can produce.** In the [load test on #599](https://github.com/crtahlin/wasp/issues/599#issuecomment-6040276978), 8 stock ultra-light clients on bench-1, each asking to connect every 500 ms, produced about 5.3 inbound connection attempts per second in total, about 0.67 per client. The 8 clients held about 1,100 connections together, about 137 each, from one host behind a home network, and that comment notes that larger client counts need a host on a public address. bench-2 is behind NAT with a port forward, so its outbound connections also pass through a NAT that may cap how many connections it holds, as bench-1's home network is limited. The client count on each host must therefore stay at what that host's network has been seen to hold (8 clients, about 1,100 connections, on bench-1), or that host's ceiling is measured first, by raising the client count step by step and watching the clients' connection count stop growing. So the test can count on about 5.3 attempts per second from bench-1, and about 10.7 if bench-2's network holds 8 more clients, both below the default rate of 30. The flood runs therefore lower the target's rate through the setting for the test. They test the mechanism and its cost per refused attempt, not the default values. The defaults are tested for false refusals by runs 1 and 2.
 
 **1. Today's load.** Two sw-1 nodes on this build at the defaults against two on the build of PR #606, over three windows of 8 hours each (rule 7: three runs, reported with the spread). Accepted when the refusal counters stay at zero, the admitted counter shows the margin to the limits, and the connection and kademlia counters match the other nodes within the spread.
 
 **2. A restart under load, 3 times.** On the target node, `light-node-limit` is set to 4, and 8 test clients from bench-1 fill its light slots, as on #599. The node is restarted at the default rate and burst. Recorded: refusals and the admitted rate in the first 10 minutes. Accepted when there are no refusals.
 
-**3. A flood, 3 runs of 20 minutes per condition.** Against one sw-1 node (the target):
+**3. A flood, 3 runs of 45 minutes per condition.** 45 minutes, so that at least one reachability probe (every 30 minutes while public) and the 4.5 minutes of retries after it fall inside each run. Against one sw-1 node (the target):
 - **Test settings on the target:** `p2p-inbound-connection-rate: 2`, `p2p-inbound-connection-burst: 10`, and the per-address limits raised (`p2p-connection-rate-per-ip` and `p2p-max-connections-per-ip`), so that the clients behind one public address are not refused by the per-address limit first.
-- **General bucket:** 8 ultra-light clients on bench-1, and 8 more on bench-2 if it is confirmed able to run them, each asking to connect every 500 ms: about 5.3 or 10.7 attempts per second. Before each run, the target's `/peers` is checked for a full node from the bench network; if one is connected, the bench address is already known, and the run records that it tested the known-full-peer bucket instead.
+- **General bucket:** 8 ultra-light clients on bench-1, and 8 more on bench-2 if its network is measured to hold them, each asking to connect every 500 ms: about 5.3 or 10.7 attempts per second. Before each run, the target's `/peers` is checked for a full node from the bench network; if one is connected, the bench address is already known, and the run records that it tested the known-full-peer bucket instead.
 - **Known-full-peer bucket:** 8 ultra-light clients on sw-1 itself, dialling the target's public address. Their source is sw-1's address, which is known once another sw-1 node is connected to the target as a full peer; this is checked in `bee_libp2p_known_full_addresses` and the target's `/peers` before the run. Whether the clients' connections really arrive from that key depends on routing on sw-1, so the run counts only if `bee_libp2p_inbound_admitted{bucket="known_full"}` and that bucket's refusals both move. The clients take CPU on the same machine, so only the target process's CPU is compared. The other sw-1 nodes share the flooded bucket with these clients and are expected to be refused during this run.
 - **Conditions:** the build of PR #606 without this change, and this change with the test settings.
 - **Recorded:** the target process's CPU over idle, admissions and refusals by bucket, kademlia's connected full peers, the node's reachability as reported by `/topology`, a worst-case reserve sample per run, and whether a full peer on another bench machine still holds the target in its address book after the run.
@@ -205,7 +220,7 @@ They are one token bucket and are proposed under one issue. To turn the limit of
 - **Process CPU is recorded but is not a pass criterion.** The expected saving is about 3.3 refused attempts per second x 13 ms = 0.04 cores with bench-1 alone, or 8.7 x 13 ms = 0.11 cores with bench-2 too, the same size as the spread between runs on #599 (0.12 to 0.19 cores).
 - admissions stay at the bucket rate;
 - kademlia's connected full peers do not fall below their level before the flood, full peers still connect (in the known-full-peer run, excluding the other sw-1 nodes, which share the flooded bucket), and the full peer on the other bench machine still has the target in its address book;
-- the target stays reachable;
+- the target stays public in every run: `bee_libp2p_reachability_public` stays 1, and `/topology` reports it public. In the known-full-peer run this is the residual risk of section 4; a switch to private there is a negative result and calls for an exemption design;
 - the reserve sample stays within the spread of its baseline.
 
 **A negative result looks like:**
@@ -218,7 +233,7 @@ Any of these stops the change at its current design.
 
 ## Rollout and rollback
 
-On by default at the values above, except in bootnode mode. An operator turns the limit off with a very high rate. Rolling back means running a build without the change. Nothing new is stored on disk. The implementation pull request adds the two settings and the new behaviour to `docs/DIFFERENCES.md` (rule 13).
+On by default at the values above, except in bootnode mode, by the operator's decision (Configuration). An operator turns the limit off with -1, in the configuration file or as a flag. Rolling back means running a build without the change. Nothing new is stored on disk. The implementation pull request adds the two settings and the new behaviour to `docs/DIFFERENCES.md` (rule 13).
 
 ## Upstream portability
 
@@ -226,11 +241,14 @@ On by default at the values above, except in bootnode mode. An operator turns th
 
 This is a missing protection, not a defect in existing code, so it gets no `affects-upstream` label (rule 11).
 
-## Open questions for the operator
+## Decided
 
-- **On by default (rule 8).** Rule 8 asks for the current value as the default, and today there is no total limit. This spec proposes the limit on by default, because it is a protection and today's load is far below it, and accepts the defaults only if runs 1 and 2 show no refusals. The operator decides whether a protection may ship on, or must ship off with the values documented.
-- **Own reachability under a flood.** The node learns whether it is reachable from AutoNAT dial-backs (`reachabilityOverridePublic` is `"false"`, `pkg/p2p/libp2p/libp2p.go`). Those dial-backs are inbound to the main host and use the general bucket unless they come from a known full peer's address. If they are refused during a flood, the node may judge itself not publicly reachable, and `IsReachable()` gates storing pushed chunks in its neighbourhood (`pkg/pushsync/pushsync.go`). Run 3 records reachability; if it changes, the dial-backs need an exemption.
-- **AutoTLS (hypothesis, not checked).** The certificate registration for WSS may dial the node back to confirm it is reachable. If so, those dials use the general bucket during a flood and could delay a certificate renewal. To check in the implementation.
+- **On by default (rule 8):** decided by the operator; see Configuration.
+- **Own reachability during a flood:** left to the implementers by the operator; the decision and its evidence are in section 4.
+
+## To check during implementation
+
+- **AutoTLS (hypothesis, not checked).** The certificate registration for WSS may dial the node back to confirm it is reachable. If so, those dials use the general bucket during a flood and could delay a certificate renewal.
 
 ## Review notes not applied
 
