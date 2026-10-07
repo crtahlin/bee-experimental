@@ -86,8 +86,10 @@ All under the existing mutex. "Keep the later" means `tryAfter` becomes the late
 | `Disconnected(addr, now, base)`, no entry or `connectedAt` zero | `Kad.Disconnected` | stays zero | kept | kept | keep the later of current and `now + base` |
 | `Disconnected`, connection lasted at least `stableConnection` | `Kad.Disconnected` | cleared | **0** | **0** | **overwrite** with `now + base` |
 | `Disconnected`, connection shorter than `stableConnection` | `Kad.Disconnected`; returns true | cleared | kept | **+1** | keep the later of current and `now + backoff(shortLived, base)` |
-| `Failed(addr, now, retryAt, attempts)` | `connect`, failed dial and breaker refusal | not changed | set to `attempts` | kept | keep the later of current, `retryAt` and `now + backoff(shortLived, TimeToRetry)` |
-| `Pruned(addr, now)` | prune at line 1149 | cleared | **0** | kept | kept; sets `expiresAt` (section 3) |
+| `Failed(addr, now, retryAt, attempts)` | `connect`, failed dial and breaker refusal | not changed | set to `attempts` | kept | keep the later of current, `retryAt` and `now + backoff(shortLived, TimeToRetry)`; so a breaker refusal waits at least `TimeToRetry` (20 s) even if the breaker closes sooner, where today it waits exactly until the breaker closes (line 1135). That is harmless: the breaker refuses every dial while it is open. |
+| `Pruned(addr, now, base)` | prune at line 1149 | cleared | **0** | kept | keep the later of current and `now + backoff(shortLived, base)`; sets `expiresAt` to the resulting `tryAfter + prunedEntryTTL` (section 4) |
+
+`Pruned` must set a new wait itself. Pruning happens only in the failed-dial branch (lines 1149 to 1155), and that dial ran only because `Waiting` returned false, so at prune time the current `tryAfter` is now or earlier.
 
 Only one method overwrites `tryAfter` with an earlier time: the stable branch of `Disconnected`. That is deliberate. A connection that lasted shows the peer is healthy again, so any backoff from earlier short connections ends there. Every other method keeps the later time, so a disconnect can no longer shorten a wait set by the connection breaker, which `SetTryAfter` can do today.
 
@@ -100,7 +102,7 @@ In `pkg/topology/kademlia/kademlia.go`:
 - **Failed announcement:** nothing extra. `Announce` disconnects the peer, libp2p calls `Kad.Disconnected` synchronously before `connect` returns (Problem, point 5), and `Disconnected` finds `connectedAt` set and counts one short-lived connection. A second call of `Kad.Disconnected` for the same connection, from libp2p's own handler, finds `connectedAt` cleared and only keeps the later `tryAfter`, so it counts nothing.
 - **Failed dial (line 1157):** `Failed` instead of `Set`, with `attempts` increased by one as today. The prune decision at line 1149 still counts only failed dials, with 4 and 6.
 - **Breaker refusal (lines 1132 to 1137):** `Failed` with `attempts` equal to the current `k.waitNext.Attempts(peer)`, not 0, and `retryAt` the time the breaker closes. A breaker refusal is not the peer's fault, so it neither increases nor resets the count, and `shortLived` is kept.
-- **Prune (lines 1149 to 1155):** `Pruned` instead of `Remove` when the entry has `shortLived` above 0; `Remove` as today otherwise. The `remove` helper at line 437 (a dial that turned out to be a light node, an overlay mismatch) keeps `Remove`: those peers are not being backed off.
+- **Prune (lines 1149 to 1155):** `Pruned(peer, now, TimeToRetry)` instead of `Remove` when the entry has `shortLived` above 0; `Remove` as today otherwise. The `remove` helper at line 437 (a dial that turned out to be a light node, an overlay mismatch) keeps `Remove`: those peers are not being backed off.
 - **Inbound connection and bootnode connection (`onConnected`, line 1351):** `Connected` instead of `Remove`. `onConnected` runs **after** `Announce`, so a remote that drops an inbound connection within the announcement is not counted as short-lived. That is consistent with today, where inbound connections never touch the count, and kademlia does not dial such a peer while it holds no backoff for it.
 - **Disconnect (line 1366):** `Disconnected` instead of `SetTryAfter`. When it returns true, increase a new counter `bee_kademlia_short_lived_connections` and log at debug level with the peer and the connection's duration.
 
@@ -110,9 +112,9 @@ Short-lived connections do not count towards pruning. The peer is reachable, and
 
 Neighbours re-announce each other every 15 minutes (the loop at lines 672 to 698) and on every new connection, so a pruned neighbour that keeps dropping us comes back quickly. If pruning deleted the entry, as it does today, `shortLived` would be lost and the 20-second cycle would start again, and the 15-minute bound would not hold.
 
-So pruning a peer with `shortLived` above 0 keeps a reduced entry: `tryAfter` and `shortLived` as they are, `failedAttempts` and `connectedAt` cleared, and `expiresAt` set to `tryAfter + prunedEntryTTL` (1 hour). When the peer is announced again, its dial still waits for `tryAfter`, and the next short connection continues the doubling from where it was. Any later event on the entry clears `expiresAt` again.
+So pruning a peer with `shortLived` above 0 keeps a reduced entry: `shortLived` as it is, `failedAttempts` and `connectedAt` cleared, `tryAfter` set to the later of its current value and `now + backoff(shortLived, TimeToRetry)`, and `expiresAt` set to that `tryAfter + prunedEntryTTL` (1 hour). When the peer is announced again, it is not dialled before that `tryAfter`, and the next short connection continues the doubling from where it was. Any later event on the entry clears `expiresAt` again.
 
-Expired entries are deleted by a sweep in the existing loop that runs every `PruneWakeup` (5 minutes, line 634), and by `Waiting` and `Attempts` when they meet one.
+Expired entries are deleted by a sweep called in the body of the existing loop that runs every `PruneWakeup` (5 minutes, lines 626 to 637), next to the `PruneFunc` call and not inside `pruneOversaturatedBins`: `PruneFunc` can be replaced through the options, and a node with a replaced one would otherwise never sweep. `Waiting` and `Attempts` also delete an expired entry when they meet one.
 
 **Memory bound:** one reduced entry per peer pruned with a short-lived history in the last `maxShortLivedBackoff + prunedEntryTTL` (75 minutes). Each entry is about a hundred bytes. On node 6 that is the 4 known peers; even every known peer, a few thousand, is well under a megabyte.
 
@@ -128,11 +130,12 @@ Retry entries are also no longer deleted when a peer connects inbound, so each c
 - **Our own disconnects:** a disconnect that this node causes within a minute of connecting also counts as short-lived: a blocklisting, an accounting disconnect, or `pruneOversaturatedBins`. The peer then waits longer before we dial it again. That is acceptable: in each case we chose to drop the peer, and dialling it again at once would repeat the cost.
 - **Bootnodes:** a node in bootnode mode never dials (the manage loop skips dialling in bootnode mode), so nothing changes for it. `connectBootNodes` does not consult the retry entry, so a node with no peers still reaches its bootnodes at once. A bootnode that this node dials as an ordinary peer and that drops it quickly (bootnodes evict a random peer when a bin is full) is now dialled less often, which reduces the load on the bootnode.
 - **Light peers:** kademlia never dials them and never calls `Connected` for them, so their entries never get `connectedAt` and their disconnects behave as today. If the light-peer churn change (#594, in PR #606) lands first, `Disconnected` returns before this code for peers kademlia never counted, which gives the same result.
+  Out of scope here, and the same today: without that change, every light peer that disconnects leaves a retry entry that is never deleted, because `SetTryAfter` today, and the first branch of `Disconnected` here, create an entry when none exists.
 - **Static peers (`static-nodes`):** they go through the same dial path, so a static peer that drops us within a minute also backs off, up to 15 minutes. This is listed as an open question below.
 
 ### 6. Tests
 
-**Test hook.** The three durations are package-level variables in `pkg/topology/kademlia` (`stableConnection`, `maxShortLivedBackoff`, `prunedEntryTTL`), passed to `waitnext.New` in `kademlia.New`. `export_test.go` exposes a setter for each that returns a function restoring the old value. Tests that use a setter do not call `t.Parallel()`, because the variables are shared. In the kademlia tests, which run on real time, `stableConnection` is set to about 200 ms and `TimeToRetry` to 500 ms as the existing tests already do (`kademlia_test.go` around line 778).
+**Test hook.** The three durations are package-level variables in `pkg/topology/kademlia` (`stableConnection`, `maxShortLivedBackoff`, `prunedEntryTTL`), passed to `waitnext.New` in `kademlia.New`. `export_test.go` exposes a setter for each; a test calls it **before** `kademlia.New`, because the values are read at construction, and restores the old value with `t.Cleanup`. Tests that use a setter do not call `t.Parallel()`, because the variables are shared. In the kademlia tests, which run on real time, `stableConnection` is set to about 200 ms and `TimeToRetry` to 500 ms as the existing tests already do (`kademlia_test.go` around line 778). Those tests assert growing gaps between dials and dial counts within generous bounds, not exact timings.
 
 In `internal/waitnext` (time is a parameter, so no sleeping):
 - a connection shorter than `stableConnection` increases `shortLived` and sets the doubled wait; a longer one resets both counts;
@@ -140,16 +143,16 @@ In `internal/waitnext` (time is a parameter, so no sleeping):
 - for each method in the table, whether it overwrites or keeps the later `tryAfter`, including that the stable branch of `Disconnected` overwrites a running 15-minute backoff and that the other methods never shorten it;
 - `Connected` overwrites a stale `connectedAt`;
 - a second `Disconnected` for the same connection counts nothing;
-- `Pruned` keeps `shortLived` and `tryAfter`, clears `failedAttempts`, and the entry expires after `tryAfter + prunedEntryTTL`; the sweep deletes it.
+- `Pruned` keeps `shortLived`, clears `failedAttempts`, sets `tryAfter` to `now + backoff(shortLived, base)` when the current one has passed, and the entry expires after that `tryAfter + prunedEntryTTL`; the sweep deletes it.
 
 In `pkg/topology/kademlia` (with the existing mock p2p service `pkg/p2p/mock`, whose `Disconnect` also notifies synchronously, and mock discovery):
-- a peer that accepts every dial and is disconnected at once is dialled with growing gaps, and the short-lived counter increases by one per connection. This test is also run on an `upstream/v2.8.2` checkout, where it must show the loop (Problem, rule 11);
+- a peer that accepts every dial and is disconnected at once is dialled with growing gaps, and the short-lived counter increases by one per connection. This test is also run on an `upstream/v2.8.2` checkout, where it must show the loop (Problem, rule 11). That checkout has neither the new counter nor the setters, so there the test asserts only the number of dials within a fixed time, which stays high because the gaps do not grow;
 - a peer whose announcement fails counts **one** short-lived connection, and its next wait is 20 s, not 40 s;
-- a peer that alternates two failed dials and one short connection is pruned from the address book, and when it is announced again it is not dialled before its `tryAfter`;
+- a peer that alternates two failed dials and one short connection is pruned from the address book, and when it is announced again at once, it is **not dialled** until the wait set by `Pruned` has passed;
 - a breaker refusal leaves `failedAttempts` and `shortLived` as they were;
 - a peer that stays connected past `stableConnection` and then disconnects is retried after `TimeToRetry` with both counts at 0.
 
-Mutation checks (lifecycle playbook, step 4): removing the duration check, removing the doubling, putting back the reset at line 467, deleting the entry on prune, resetting the count on a breaker refusal, and letting a disconnect shorten `tryAfter` must each fail at least one test.
+Mutation checks (lifecycle playbook, step 4): removing the duration check, removing the doubling, putting back the reset at line 467, deleting the entry on prune, `Pruned` not setting a later `tryAfter`, resetting the count on a breaker refusal, and letting a disconnect shorten `tryAfter` must each fail at least one test.
 
 ### 7. A remaining race
 
@@ -171,14 +174,15 @@ None. This changes when the node dials a peer, which is local scheduling. No mes
 - **Counters every 5 minutes:** `bee_kademlia_total_inbound_disconnections`, `bee_kademlia_total_outbound_connection_attempts`, `bee_kademlia_total_outbound_connection_failed_attempts`, `bee_kademlia_total_outbound_connections`, and process CPU time.
 - **Topology health every 5 minutes:** connected full peers, depth, and neighbourhood size (connected peers at or above the depth), from `/topology`.
 
-**Accepted when**, on node 6, in each new-build window compared with the mean of its neighbouring old-build windows:
+On node 6, each new-build window is compared with the mean of its neighbouring old-build windows. The change is **accepted** when criteria 1 and 3 hold in all three new-build windows:
 1. failed dials to each of the peers that keep dropping us fall from the measured level (about 85 an hour for the worst) to **at most 10 an hour**;
-2. kademlia inbound disconnects fall by **at least 75 %**, reported with the spread of the three runs;
-3. **healthy peers are not penalised:** connected full peers, depth and neighbourhood size stay within 10 % of the old-build windows and move with the control node; and the distinct peers counted as short-lived are the known peers that keep dropping us plus at most a few others, each of which is checked in the log to have really dropped us within a minute.
+3. **healthy peers are not penalised:** connected full peers, depth and neighbourhood size stay within 10 % of the old-build windows and move with the control node; and every peer counted as short-lived, other than the known peers that keep dropping us, is shown in the log to have really dropped us within a minute.
 
-If disconnects fall to the level of the control node, the cycle was the main cause of node 6's count, and that is recorded as verified. If they fall but stay well above it, the cycle was one cause among others, and the rest is reported as unexplained.
+Criterion 2 tests the diagnosis, not the fix, and does not decide acceptance:
 
-**A negative result** looks like this: criteria 1 and 2 are not met while the short-lived counter is non-zero. That would mean the dials come from somewhere this change does not touch. A short-lived counter that stays at zero means the remote peers stopped the behaviour during the run; the run must then be repeated when it is seen again, and is counted as neither result. A failed criterion 3 is a regression and blocks the change, whatever 1 and 2 show.
+2. kademlia inbound disconnects on node 6, reported as the fall against the old-build windows with the spread of the three runs. If they reach the control node's level, the cycle was the main cause of node 6's count, and that is recorded as **verified**. If they fall but stay above it, the diagnosis is recorded as **partial**: the cycle was one cause among others, and the rest is reported as unexplained.
+
+**A negative result** looks like this: criterion 1 is not met while the short-lived counter is non-zero. That would mean the dials come from somewhere this change does not touch. A short-lived counter that stays at zero means the remote peers stopped the behaviour during the run; the run must then be repeated when it is seen again, and is counted as neither result. A failed criterion 3 is a regression and blocks the change, whatever criterion 1 shows.
 
 ## Rollout and rollback
 
