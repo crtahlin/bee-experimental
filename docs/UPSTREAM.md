@@ -34,7 +34,7 @@ commits below are wasp's own.
   column's job is to find the issue.
 
 Derived from the experiment ledger ([`experiments/INDEX.md`](experiments/INDEX.md))
-and the history, last revised 2026-09-22, against the upstream base
+and the history, last revised 2026-10-07, against the upstream base
 `v2.8.2`. Three issues (#73, #76, #430) were closed not planned. Wasp issue
 numbers can collide with upstream Bee pull-request numbers in the shared
 history, so the commits here were resolved from fork-only merges, not by issue
@@ -129,6 +129,7 @@ whether upstream has the problem. See
 | [#573](https://github.com/crtahlin/wasp/issues/573) | Puller: a peer that keeps failing pull-sync is retried with no pause (2,000 attempts/s, 1.4 cores) | done | `fix/573-puller-retry-backoff` | [`ab7ed195`](https://github.com/crtahlin/wasp/commit/ab7ed195) |
 | [#578](https://github.com/crtahlin/wasp/issues/578) | Postage listener: a failed log query during catch-up is retried with no pause | done | `fix/578-listener-retry-backoff` | [`cd539e76`](https://github.com/crtahlin/wasp/commit/cd539e76) |
 | [#579](https://github.com/crtahlin/wasp/issues/579) | Swap: each invalid first cheque costs a chain call under a global lock, and the peer can repeat it at once | open | - | - |
+| [#607](https://github.com/crtahlin/wasp/issues/607) | kademlia: a peer that drops us right after connecting is re-dialled forever, because each brief success resets the failed-attempt count | open | - | - |
 
 #301 and #302 are done, and they settle only half of what #300 says. Its per
 peer half stands: the three chain calls were confirmed directly, and the rate at
