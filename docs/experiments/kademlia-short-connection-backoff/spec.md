@@ -131,7 +131,7 @@ Retry entries are also no longer deleted when a peer connects inbound, so each c
 - **Bootnodes:** a node in bootnode mode never dials (the manage loop skips dialling in bootnode mode), so nothing changes for it. `connectBootNodes` does not consult the retry entry, so a node with no peers still reaches its bootnodes at once. A bootnode that this node dials as an ordinary peer and that drops it quickly (bootnodes evict a random peer when a bin is full) is now dialled less often, which reduces the load on the bootnode.
 - **Light peers:** kademlia never dials them and never calls `Connected` for them, so their entries never get `connectedAt` and their disconnects behave as today. If the light-peer churn change (#594, in PR #606) lands first, `Disconnected` returns before this code for peers kademlia never counted, which gives the same result.
   Out of scope here, and the same today: without that change, every light peer that disconnects leaves a retry entry that is never deleted, because `SetTryAfter` today, and the first branch of `Disconnected` here, create an entry when none exists.
-- **Static peers (`static-nodes`):** they go through the same dial path, so a static peer that drops us within a minute also backs off, up to 15 minutes. This is listed as an open question below.
+- **Static peers (`static-nodes`):** not exempt (decided, see Decisions). A static peer that drops us within a minute backs off like any other peer.
 
 ### 6. Tests
 
@@ -210,7 +210,9 @@ No new settings. Three new compiled-in durations in `pkg/topology/kademlia`, pac
 
 **Cost to other nodes:** fewer dials from us to a peer that keeps dropping us, so less handshake work on its side as well. A peer that drops us briefly and then would have accepted us gets our next dial up to 15 minutes later.
 
-## Open questions for the operator
+## Decisions
 
-1. Should static peers (`static-nodes`) be exempt from the backoff? An operator who configures one probably wants it dialled at today's rate even if it drops us. Exempting them is one check in `Disconnected`.
-2. Is one minute the right threshold, or should it be above the default prune interval of 5 minutes, so that a remote that prunes us periodically also backs us off? The longer value treats more legitimate short connections as short-lived.
+Both questions raised in review were decided by the operator on 7 October 2026.
+
+1. **Static peers are not exempt from the backoff.** `static-nodes` (`cmd/bee/cmd/cmd.go` line 432, "protect nodes from getting kicked out on bootnode") only keeps those peers out of bin saturation and out of the pruning of oversaturated bins (`pkg/topology/kademlia/kademlia.go` lines 183, 279 and 826, through `binSaturated` and `binPruneCount`), and out of the random choice of a peer that a bootnode evicts (`randomPeer`, line 1764). Nothing gives them special dialling, and bootnodes, where the setting is meant to be used, do not dial. So the backoff hardly affects them, and an exemption would add a special case for little effect. Verified against `origin/main` (`a6d045a0`).
+2. **The threshold stays at one minute** (`stableConnection`), as specified. A longer value, above the 5-minute prune interval, would also back off a remote that prunes us periodically, but would treat more legitimate short connections as short-lived.
