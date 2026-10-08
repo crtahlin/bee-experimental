@@ -119,11 +119,12 @@ type listener struct {
 
 	// Sync health (#583). Written by the loop and the watcher, read by
 	// Stale and the node.
-	listening    atomic.Bool
-	lastProgress atomic.Int64 // unix nanoseconds of the last applied page
-	// staleFrom is when the current or last stale period began (unix
-	// nanoseconds), caughtUpAt when a caught-up page was last applied. The
-	// batch store is stale while staleFrom is the later of the two.
+	listening atomic.Bool
+	// lastProgress is when the last page was applied, staleFrom when the
+	// current or last stale period began, and caughtUpAt when a caught-up
+	// page was last applied, all as monoNow values. The batch store is
+	// stale while staleFrom is the later of the last two.
+	lastProgress atomic.Int64
 	staleFrom    atomic.Int64
 	caughtUpAt   atomic.Int64
 	caughtUpOnce atomic.Bool  // a caught-up page was applied since Listen
@@ -183,6 +184,15 @@ func New(
 	return l
 }
 
+// processStart anchors the listener's progress times. They are kept as the
+// time since this point, read from the monotonic clock, so a step of the
+// wall clock (an NTP correction, a manual change) cannot make the node stale
+// or keep it stale (#583).
+var processStart = time.Now()
+
+// monoNow returns the monotonic time since processStart, in nanoseconds.
+func monoNow() int64 { return int64(time.Since(processStart)) }
+
 // Option configures a listener.
 type Option func(*listener)
 
@@ -201,9 +211,9 @@ func (l *listener) Stale() bool {
 	}
 	// The clock is read first: progress loaded after it can only be newer,
 	// so a delay between the two cannot make fresh progress look stale.
-	now := time.Now()
+	now := monoNow()
 	last := l.lastProgress.Load()
-	if now.Sub(time.Unix(0, last)) >= l.stallingTimeout {
+	if time.Duration(now-last) >= l.stallingTimeout {
 		l.markStale(last)
 		return true
 	}
@@ -226,7 +236,7 @@ func (l *listener) markStale(lastProgress int64) {
 
 // markCaughtUp records an applied page that reached the confirmed head.
 func (l *listener) markCaughtUp() {
-	l.caughtUpAt.Store(time.Now().UnixNano())
+	l.caughtUpAt.Store(monoNow())
 }
 
 // CaughtUp reports whether a page that reached the confirmed head has been
@@ -241,7 +251,7 @@ func (l *listener) SinceProgress() time.Duration {
 	if !l.listening.Load() {
 		return 0
 	}
-	return time.Since(time.Unix(0, l.lastProgress.Load()))
+	return time.Duration(monoNow() - l.lastProgress.Load())
 }
 
 // StaleEndedAt returns when the stale state last ended, or the zero time if
@@ -443,7 +453,7 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 		}
 	}
 
-	l.lastProgress.Store(time.Now().UnixNano())
+	l.lastProgress.Store(monoNow())
 	l.staleFrom.Store(0)
 	l.caughtUpAt.Store(0)
 	l.caughtUpOnce.Store(false)
@@ -585,7 +595,7 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 			}
 
 			from = to + 1
-			l.lastProgress.Store(time.Now().UnixNano())
+			l.lastProgress.Store(monoNow())
 			errWait = l.backoffTime
 			if page < pageSize {
 				pagesAtSize++

@@ -19,14 +19,14 @@ func TestStaleWriteAfterCatchUp(t *testing.T) {
 	l := &listener{stallingTimeout: time.Minute}
 	l.listening.Store(true)
 
-	old := time.Now().Add(-2 * time.Minute).UnixNano()
+	old := monoNow() - int64(2*time.Minute)
 	l.lastProgress.Store(old)
 	if !l.Stale() {
 		t.Fatal("not stale two minutes after the last progress")
 	}
 
 	// The read in Stale happened here; the loop applies a caught-up page.
-	l.lastProgress.Store(time.Now().UnixNano())
+	l.lastProgress.Store(monoNow())
 	l.markCaughtUp()
 	// The delayed write from that read, a moment later.
 	time.Sleep(time.Millisecond)
