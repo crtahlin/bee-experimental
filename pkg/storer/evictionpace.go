@@ -234,9 +234,15 @@ func (db *DB) evictionHooks(ctx context.Context, expired bool, expiry <-chan str
 	// eviction, so a long eviction of one batch is not the only work that
 	// cannot be stopped. A nil expiry channel never fires.
 	stop := func() error {
+		// A shutdown first, on its own: select picks at random among ready
+		// cases, and a shutdown that also ends the context must stop the
+		// eviction as a shutdown, not as a context error the worker logs.
 		select {
 		case <-db.quit:
 			return ErrDBQuit
+		default:
+		}
+		select {
 		case <-expiry:
 			return errEvictionExpiry
 		case <-ctx.Done():
