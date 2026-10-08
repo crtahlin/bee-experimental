@@ -11,8 +11,11 @@ import (
 	"testing"
 	"testing/synctest"
 
+	"github.com/ethersphere/bee/v2/pkg/log"
 	"github.com/ethersphere/bee/v2/pkg/p2p/streamtest"
 	"github.com/ethersphere/bee/v2/pkg/postage"
+	"github.com/ethersphere/bee/v2/pkg/pullsync"
+	"github.com/ethersphere/bee/v2/pkg/soc"
 	soctesting "github.com/ethersphere/bee/v2/pkg/soc/testing"
 	testingc "github.com/ethersphere/bee/v2/pkg/storage/testing"
 	"github.com/ethersphere/bee/v2/pkg/storer"
@@ -185,6 +188,44 @@ func TestSyncHoldRequiresContentAddress(t *testing.T) {
 		}
 		if n := holder.heldCount(); n != 0 {
 			t.Fatalf("holder got %d chunks, want 0", n)
+		}
+	})
+}
+
+// TestSyncUnwrapsHeldChunk checks that a held chunk is handed to pss like a
+// stored one, so a message it carries is not delayed until catch-up (#583).
+func TestSyncUnwrapsHeldChunk(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ch := testingc.GenerateTestRandomChunk()
+		stampHash, err := ch.Stamp().Hash()
+		if err != nil {
+			t.Fatal(err)
+		}
+		results := []*storer.BinC{{Address: ch.Address(), BatchID: ch.Stamp().BatchID(), BinID: 1, StampHash: stampHash}}
+		ps, _ := newPullSync(t, nil, 10, mock.WithSubscribeResp(results, nil), mock.WithChunks(ch))
+		recorder := streamtest.New(streamtest.WithProtocols(ps.Protocol()))
+
+		unwrapped := make(chan swarm.Address, 1)
+		client := pullsync.New(recorder, mock.NewReserve(), func(c swarm.Chunk) { unwrapped <- c.Address() }, func(*soc.SOC) {},
+			func(swarm.Chunk) (swarm.Chunk, error) { return nil, postage.ErrNotFound }, log.Noop, 0, pullsync.DefaultMaxChunksPerSecond)
+		t.Cleanup(func() { _ = client.Close() })
+		holder := &holderMock{}
+		client.SetChunkHolder(holder)
+
+		if _, _, err := client.Sync(context.Background(), swarm.ZeroAddress, 0, 0); err != nil {
+			t.Fatalf("sync: %v", err)
+		}
+		if holder.heldCount() != 1 {
+			t.Fatalf("held %d chunks, want 1", holder.heldCount())
+		}
+		synctest.Wait()
+		select {
+		case addr := <-unwrapped:
+			if !addr.Equal(ch.Address()) {
+				t.Fatalf("unwrapped %s, want %s", addr, ch.Address())
+			}
+		default:
+			t.Fatal("held chunk was not unwrapped")
 		}
 	})
 }

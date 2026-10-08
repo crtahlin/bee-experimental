@@ -367,6 +367,7 @@ func (s *Syncer) Sync(ctx context.Context, peer swarm.Address, bin uint8, start 
 			// this node has not seen yet is held instead of dropped, so the
 			// interval can advance without losing it (#583).
 			if held, hold := s.hold(ctx, newChunk.WithStamp(stamp), err); held {
+				s.unwrapHeld(newChunk.WithStamp(stamp))
 				continue
 			} else if hold != nil {
 				// It could have been kept but was not: do not advance
@@ -453,6 +454,20 @@ func (s *Syncer) hold(ctx context.Context, ch swarm.Chunk, cause error) (bool, e
 		s.metrics.Held.Inc()
 	}
 	return held, err
+}
+
+// unwrapHeld hands a held chunk to pss or gsoc, as a stored one is. Push-sync
+// also unwraps before it checks the stamp, so a message carried by a held
+// chunk is delivered now rather than after the batch store catches up. The
+// holder has verified the chunk's content address.
+func (s *Syncer) unwrapHeld(ch swarm.Chunk) {
+	if cac.Valid(ch) {
+		go s.unwrap(ch)
+		return
+	}
+	if sc, err := soc.FromChunk(ch); err == nil {
+		s.gsocHandler(sc)
+	}
 }
 
 // makeOffer tries to assemble an offer for a given requested interval.
