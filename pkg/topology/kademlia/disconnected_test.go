@@ -62,8 +62,21 @@ func TestDisconnectedIgnoresUncountedPeer(t *testing.T) {
 	recalculations := kad.DepthRecalculations()
 
 	// A light peer and a full peer kademlia never accepted.
-	kad.Disconnected(p2p.Peer{Address: swarm.RandAddressAt(t, base, 3)})
-	kad.Disconnected(p2p.Peer{Address: swarm.RandAddressAt(t, base, 5), FullNode: true})
+	light := swarm.RandAddressAt(t, base, 3)
+	refused := swarm.RandAddressAt(t, base, 5)
+	kad.Disconnected(p2p.Peer{Address: light})
+	kad.Disconnected(p2p.Peer{Address: refused, FullNode: true})
+
+	// Neither gets a retry entry: nothing dials light peers, and a refused
+	// full peer has no recorded connection to count.
+	for _, a := range []swarm.Address{light, refused} {
+		if _, ok := kad.RetryWaitTryAfter(a); ok {
+			t.Fatalf("retry entry created for %s, a peer kademlia never counted", a)
+		}
+	}
+	if got := kad.ShortLivedConnections(); got != 0 {
+		t.Fatalf("got %v short-lived connections, want 0", got)
+	}
 
 	select {
 	case <-c:
