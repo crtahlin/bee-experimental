@@ -25,6 +25,7 @@ type metrics struct {
 	TotalInboundConnections               prometheus.Counter
 	TotalInboundDisconnections            prometheus.Counter
 	TotalOutboundConnections              prometheus.Counter
+	ShortLivedConnections                 prometheus.Counter
 	TotalOutboundConnectionAttempts       prometheus.Counter
 	TotalOutboundConnectionFailedAttempts prometheus.Counter
 	TotalBootNodesConnectionAttempts      prometheus.Counter
@@ -125,6 +126,12 @@ func newMetrics() metrics {
 			Subsystem: subsystem,
 			Name:      "total_outbound_connections",
 			Help:      "Total outbound connections made.",
+		}),
+		ShortLivedConnections: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "short_lived_connections",
+			Help:      "Connections that ended within a minute of being made, after which the peer is dialled again only after a growing wait.",
 		}),
 		TotalOutboundConnectionAttempts: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: m.Namespace,

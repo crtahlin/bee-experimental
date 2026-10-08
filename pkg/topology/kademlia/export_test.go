@@ -5,10 +5,14 @@
 package kademlia
 
 import (
+	"testing"
+	"time"
+
 	"github.com/ethersphere/bee/v2/pkg/swarm"
 	"github.com/ethersphere/bee/v2/pkg/topology"
 	im "github.com/ethersphere/bee/v2/pkg/topology/kademlia/internal/metrics"
 	"github.com/ethersphere/bee/v2/pkg/topology/pslice"
+	dto "github.com/prometheus/client_model/go"
 )
 
 var (
@@ -113,4 +117,56 @@ func (k *Kad) Trigger() {
 // tests to assert iterator filtering behavior.
 func (k *Kad) MarkAsBootnode(addr swarm.Address) {
 	k.collector.Record(addr, im.IsBootnode(true))
+}
+
+// setDuration sets a package duration for one test and restores it when the
+// test ends. The durations are read in New, so call it before New, and do
+// not use it in a test that calls t.Parallel.
+func setDuration(t *testing.T, v *time.Duration, d time.Duration) {
+	t.Helper()
+	old := *v
+	*v = d
+	t.Cleanup(func() { *v = old })
+}
+
+// SetStableConnection sets how long a connection must last to count as
+// stable, for one test.
+func SetStableConnection(t *testing.T, d time.Duration) {
+	t.Helper()
+	setDuration(t, &stableConnection, d)
+}
+
+// SetMaxShortLivedBackoff sets the cap on the wait after short-lived
+// connections, for one test.
+func SetMaxShortLivedBackoff(t *testing.T, d time.Duration) {
+	t.Helper()
+	setDuration(t, &maxShortLivedBackoff, d)
+}
+
+// SetPrunedEntryTTL sets how long a pruned peer's reduced retry entry is
+// kept, for one test.
+func SetPrunedEntryTTL(t *testing.T, d time.Duration) {
+	t.Helper()
+	setDuration(t, &prunedEntryTTL, d)
+}
+
+// ShortLivedConnections returns the value of the short-lived connection
+// counter.
+func (k *Kad) ShortLivedConnections() float64 {
+	m := &dto.Metric{}
+	if err := k.metrics.ShortLivedConnections.Write(m); err != nil {
+		return -1
+	}
+	return m.GetCounter().GetValue()
+}
+
+// RetryWaitShortLived returns the short-lived count kept for a peer.
+func (k *Kad) RetryWaitShortLived(addr swarm.Address) int { return k.waitNext.ShortLived(addr) }
+
+// RetryWaitAttempts returns the failed-dial count kept for a peer.
+func (k *Kad) RetryWaitAttempts(addr swarm.Address) int { return k.waitNext.Attempts(addr) }
+
+// RetryWaitTryAfter returns when a peer may be dialled again.
+func (k *Kad) RetryWaitTryAfter(addr swarm.Address) (time.Time, bool) {
+	return k.waitNext.TryAfter(addr)
 }
