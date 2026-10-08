@@ -120,7 +120,11 @@ type listener struct {
 	// Stale and the node.
 	listening    atomic.Bool
 	lastProgress atomic.Int64 // unix nanoseconds of the last applied page
-	staleLatched atomic.Bool  // stale until a caught-up page is applied
+	// staleFrom is when the current or last stale period began (unix
+	// nanoseconds), caughtUpAt when a caught-up page was last applied. The
+	// batch store is stale while staleFrom is the later of the two.
+	staleFrom    atomic.Int64
+	caughtUpAt   atomic.Int64
 	caughtUpOnce atomic.Bool  // a caught-up page was applied since Listen
 	staleSince   atomic.Int64 // unix nanoseconds the stale state began, 0 if not stale
 	staleEndedAt atomic.Int64 // unix nanoseconds the stale state last ended, 0 if never
@@ -194,11 +198,31 @@ func (l *listener) Stale() bool {
 	if !l.listening.Load() {
 		return false
 	}
-	if time.Since(time.Unix(0, l.lastProgress.Load())) >= l.stallingTimeout {
-		l.staleLatched.Store(true)
+	last := l.lastProgress.Load()
+	if time.Since(time.Unix(0, last)) >= l.stallingTimeout {
+		l.markStale(last)
 		return true
 	}
-	return l.staleLatched.Load()
+	return l.staleFrom.Load() > l.caughtUpAt.Load()
+}
+
+// markStale records a stale period that began one stall timeout after the
+// given last progress. The start comes from the progress that was read, not
+// from the time of the write, so a write that lands after a caught-up page
+// cannot leave the node stale: the page was applied after that start.
+func (l *listener) markStale(lastProgress int64) {
+	from := lastProgress + int64(l.stallingTimeout)
+	for {
+		old := l.staleFrom.Load()
+		if old >= from || l.staleFrom.CompareAndSwap(old, from) {
+			return
+		}
+	}
+}
+
+// markCaughtUp records an applied page that reached the confirmed head.
+func (l *listener) markCaughtUp() {
+	l.caughtUpAt.Store(time.Now().UnixNano())
 }
 
 // CaughtUp reports whether a page that reached the confirmed head has been
@@ -415,7 +439,8 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 	}
 
 	l.lastProgress.Store(time.Now().UnixNano())
-	l.staleLatched.Store(false)
+	l.staleFrom.Store(0)
+	l.caughtUpAt.Store(0)
 	l.caughtUpOnce.Store(false)
 	l.listening.Store(true)
 	lastConfirmedBlock := uint64(0)
@@ -563,7 +588,7 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 			if caughtUpPage {
 				// Caught up: the stale state ends only here, not on any
 				// applied page, and the startup wait ends (#583).
-				l.staleLatched.Store(false)
+				l.markCaughtUp()
 				l.caughtUpOnce.Store(true)
 				sendSynced(nil)
 			}
