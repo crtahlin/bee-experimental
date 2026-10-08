@@ -15,6 +15,22 @@ import (
 // area is full (#583).
 var ErrHeldAreaFull = errors.New("postage: held area full")
 
+// HoldResult says what HoldUnvalidated did with a chunk.
+type HoldResult int
+
+const (
+	// NotHeld: the chunk was not held.
+	NotHeld HoldResult = iota
+	// HeldNew: the chunk is held, and its address was not held before.
+	HeldNew
+	// HeldAgain: the chunk is held, and its address was held already,
+	// with this stamp or another one.
+	HeldAgain
+)
+
+// Held reports whether the chunk is held.
+func (r HoldResult) Held() bool { return r != NotHeld }
+
 // ChunkHolder keeps chunks whose stamp cannot be validated yet because the
 // batch store is stale (#583). The storer implements it.
 //
@@ -25,13 +41,14 @@ type ChunkHolder interface {
 	// HoldUnvalidated holds ch, whose stamp failed validation with cause,
 	// when the batch store is stale and cause says the batch or its depth
 	// is not known yet (ErrNotFound or ErrInvalidIndex). It reports whether
-	// the chunk is held. A chunk that qualifies but finds the held area full
-	// returns ErrHeldAreaFull. Otherwise it returns false and nil, and the
-	// caller handles the stamp error as before.
+	// the chunk is held, and whether its address is newly held, so a caller
+	// acts on the chunk's content once. A chunk that qualifies but finds the
+	// held area full returns ErrHeldAreaFull. Otherwise it returns NotHeld
+	// and nil, and the caller handles the stamp error as before.
 	//
 	// The holder verifies the chunk's full content address (cac.Valid or
 	// soc.Valid) itself and holds nothing that fails it.
-	HoldUnvalidated(ctx context.Context, ch swarm.Chunk, cause error) (held bool, err error)
+	HoldUnvalidated(ctx context.Context, ch swarm.Chunk, cause error) (HoldResult, error)
 }
 
 // HoldsUnvalidated reports whether a stamp validation error is one a held

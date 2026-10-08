@@ -118,7 +118,7 @@ var errUnknownBatch = fmt.Errorf("batchstore get: %w, %w", storage.ErrNotFound, 
 
 func (f *heldFixture) hold(t *testing.T, ch swarm.Chunk) {
 	t.Helper()
-	held, err := f.db.HoldUnvalidated(context.Background(), ch, errUnknownBatch)
+	held, err := holdBool(f.db, context.Background(), ch, errUnknownBatch)
 	if err != nil || !held {
 		t.Fatalf("hold: held %v, error %v", held, err)
 	}
@@ -130,18 +130,18 @@ func TestHoldOnlyWhileStale(t *testing.T) {
 	f := newHeldFixture(t, "")
 	ch, _ := f.unknownChunk(t)
 
-	if held, err := f.db.HoldUnvalidated(context.Background(), ch, postage.ErrOwnerMismatch); held || err != nil {
+	if held, err := holdBool(f.db, context.Background(), ch, postage.ErrOwnerMismatch); held || err != nil {
 		t.Fatalf("held %v, error %v for an owner mismatch, want neither", held, err)
 	}
 
 	f.health.set(false, time.Time{})
-	if held, err := f.db.HoldUnvalidated(context.Background(), ch, errUnknownBatch); held || err != nil {
+	if held, err := holdBool(f.db, context.Background(), ch, errUnknownBatch); held || err != nil {
 		t.Fatalf("held %v, error %v while the batch store is current, want neither", held, err)
 	}
 
 	f.health.set(true, time.Time{})
 	f.hold(t, ch)
-	if held, err := f.db.HoldUnvalidated(context.Background(), ch, postage.ErrInvalidIndex); !held || err != nil {
+	if held, err := holdBool(f.db, context.Background(), ch, postage.ErrInvalidIndex); !held || err != nil {
 		t.Fatalf("held %v, error %v for an index beyond the known depth, want held", held, err)
 	}
 }
@@ -180,7 +180,7 @@ func TestHeldRoomPerAddress(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			other := swarm.NewChunk(ch.Address(), ch.Data()).WithStamp(postagetesting.MustNewBatchStamp(postagetesting.MustNewID()))
-			if held, err := f.db.HoldUnvalidated(context.Background(), other, errUnknownBatch); !held || err != nil {
+			if held, err := holdBool(f.db, context.Background(), other, errUnknownBatch); !held || err != nil {
 				t.Errorf("held %v, error %v", held, err)
 			}
 		}()
@@ -203,7 +203,7 @@ func TestHeldAreaFull(t *testing.T) {
 	f.hold(t, second)
 
 	third, _ := f.unknownChunk(t)
-	if held, err := f.db.HoldUnvalidated(context.Background(), third, errUnknownBatch); held || !errors.Is(err, postage.ErrHeldAreaFull) {
+	if held, err := holdBool(f.db, context.Background(), third, errUnknownBatch); held || !errors.Is(err, postage.ErrHeldAreaFull) {
 		t.Fatalf("held %v, error %v on a full area, want ErrHeldAreaFull", held, err)
 	}
 	if !f.db.HeldFull() {
@@ -437,7 +437,7 @@ func TestHeldConcurrentClaimOnce(t *testing.T) {
 	for range 8 {
 		ch := swarm.NewChunk(base.Address(), base.Data()).WithStamp(postagetesting.MustNewBatchStamp(postagetesting.MustNewID()))
 		wg.Go(func() {
-			held, err := f.db.HoldUnvalidated(context.Background(), ch, errUnknownBatch)
+			held, err := holdBool(f.db, context.Background(), ch, errUnknownBatch)
 			if err == nil && !held {
 				err = errors.New("not held")
 			}
@@ -466,7 +466,7 @@ func TestHeldRequiresContentAddress(t *testing.T) {
 	socData := soctesting.GenerateMockSOC(t, []byte("payload")).Chunk().Data()
 	foreign := swarm.NewChunk(genuine.Address(), socData).WithStamp(postagetesting.MustNewBatchStamp(batch))
 
-	held, err := f.db.HoldUnvalidated(context.Background(), foreign, errUnknownBatch)
+	held, err := holdBool(f.db, context.Background(), foreign, errUnknownBatch)
 	if err != nil || held {
 		t.Fatalf("hold: held %v, error %v; want not held, nil", held, err)
 	}
@@ -547,7 +547,7 @@ func TestHeldPerAddressCap(t *testing.T) {
 	for range 8 {
 		f.hold(t, stamped())
 	}
-	held, err := f.db.HoldUnvalidated(context.Background(), stamped(), errUnknownBatch)
+	held, err := holdBool(f.db, context.Background(), stamped(), errUnknownBatch)
 	if err != nil || held {
 		t.Fatalf("ninth stamp: held %v, error %v; want not held, nil", held, err)
 	}
@@ -588,5 +588,34 @@ func TestHeldPassReachesEveryEntry(t *testing.T) {
 				t.Fatalf("held count %d after one pass with a round of 2, want 0", got)
 			}
 		})
+	}
+}
+
+// holdBool holds ch and reports only whether it is held.
+func holdBool(db *storer.DB, ctx context.Context, ch swarm.Chunk, cause error) (bool, error) {
+	res, err := db.HoldUnvalidated(ctx, ch, cause)
+	return res.Held(), err
+}
+
+// TestHeldResultNewOnlyOnce checks that the holder reports an address as
+// newly held once: the same chunk again, or with another stamp, is held
+// again, not new (#583).
+func TestHeldResultNewOnlyOnce(t *testing.T) {
+	f := newHeldFixture(t, "")
+	ch, _ := f.unknownChunk(t)
+	other := swarm.NewChunk(ch.Address(), ch.Data()).WithStamp(postagetesting.MustNewBatchStamp(postagetesting.MustNewID()))
+
+	for i, tc := range []struct {
+		ch   swarm.Chunk
+		want postage.HoldResult
+	}{
+		{ch, postage.HeldNew},
+		{ch, postage.HeldAgain},
+		{other, postage.HeldAgain},
+	} {
+		res, err := f.db.HoldUnvalidated(context.Background(), tc.ch, errUnknownBatch)
+		if err != nil || res != tc.want {
+			t.Fatalf("offer %d: result %v, error %v; want %v", i, res, err, tc.want)
+		}
 	}
 }

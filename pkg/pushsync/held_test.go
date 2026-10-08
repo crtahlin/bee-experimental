@@ -29,14 +29,14 @@ type pushHolder struct {
 	held []swarm.Address
 }
 
-func (h *pushHolder) HoldUnvalidated(_ context.Context, ch swarm.Chunk, cause error) (bool, error) {
+func (h *pushHolder) HoldUnvalidated(_ context.Context, ch swarm.Chunk, cause error) (postage.HoldResult, error) {
 	if !postage.HoldsUnvalidated(cause) {
-		return false, nil
+		return postage.NotHeld, nil
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.held = append(h.held, ch.Address())
-	return true, nil
+	return postage.HeldNew, nil
 }
 
 func (h *pushHolder) count() int {

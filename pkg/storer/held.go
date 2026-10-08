@@ -156,27 +156,27 @@ func (h *heldState) warnFull() bool {
 var _ postage.ChunkHolder = (*DB)(nil)
 
 // HoldUnvalidated implements postage.ChunkHolder.
-func (db *DB) HoldUnvalidated(ctx context.Context, ch swarm.Chunk, cause error) (bool, error) {
+func (db *DB) HoldUnvalidated(ctx context.Context, ch swarm.Chunk, cause error) (postage.HoldResult, error) {
 	if !postage.HoldsUnvalidated(cause) || !db.postageStale() {
-		return false, nil
+		return postage.NotHeld, nil
 	}
 	// Only a chunk whose data matches its full content address is held:
 	// the chunk store never overwrites, so whatever is held under an
 	// address is what the node serves for it.
 	if !cac.Valid(ch) && !soc.Valid(ch) {
-		return false, nil
+		return postage.NotHeld, nil
 	}
 	stamp, ok := ch.Stamp().(*postage.Stamp)
 	if !ok || stamp == nil {
-		return false, nil
+		return postage.NotHeld, nil
 	}
 	stampHash, err := stamp.Hash()
 	if err != nil {
-		return false, nil
+		return postage.NotHeld, nil
 	}
 	stampBytes, err := stamp.MarshalBinary()
 	if err != nil {
-		return false, nil
+		return postage.NotHeld, nil
 	}
 
 	addr := ch.Address()
@@ -194,21 +194,21 @@ func (db *DB) HoldUnvalidated(ctx context.Context, ch swarm.Chunk, cause error) 
 
 	has, err := db.storage.IndexStore().Has(item)
 	if err != nil {
-		return false, fmt.Errorf("held index: %w", err)
+		return postage.NotHeld, fmt.Errorf("held index: %w", err)
 	}
 	if has {
 		// The same chunk with the same stamp, offered again before
 		// validation: already held, no second reference.
-		return true, nil
+		return postage.HeldAgain, nil
 	}
 
 	entries, err := db.heldEntries(addr, heldPerAddress)
 	if err != nil {
-		return false, fmt.Errorf("held index: %w", err)
+		return postage.NotHeld, fmt.Errorf("held index: %w", err)
 	}
 	if entries >= heldPerAddress {
 		// The chunk's data is held already; this stamp is not kept.
-		return false, nil
+		return postage.NotHeld, nil
 	}
 	claimed := false
 	if entries == 0 {
@@ -217,7 +217,7 @@ func (db *DB) HoldUnvalidated(ctx context.Context, ch swarm.Chunk, cause error) 
 				db.logger.Warning("held area for chunks of batches not seen yet is full; new ones are refused until the batch store catches up and they are validated",
 					"held_addresses", db.held.count(), "max", db.held.max)
 			}
-			return false, postage.ErrHeldAreaFull
+			return postage.NotHeld, postage.ErrHeldAreaFull
 		}
 		claimed = true
 	}
@@ -234,10 +234,13 @@ func (db *DB) HoldUnvalidated(ctx context.Context, ch swarm.Chunk, cause error) 
 		if claimed {
 			db.held.release()
 		}
-		return false, fmt.Errorf("hold chunk: %w", err)
+		return postage.NotHeld, fmt.Errorf("hold chunk: %w", err)
 	}
 	db.metrics.HeldChunks.Set(float64(db.held.count()))
-	return true, nil
+	if entries == 0 {
+		return postage.HeldNew, nil
+	}
+	return postage.HeldAgain, nil
 }
 
 // HeldFull reports whether the held area is full.

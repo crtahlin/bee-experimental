@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 
@@ -30,17 +31,23 @@ type holderMock struct {
 	held []swarm.Address
 }
 
-func (h *holderMock) HoldUnvalidated(_ context.Context, ch swarm.Chunk, cause error) (bool, error) {
+func (h *holderMock) HoldUnvalidated(_ context.Context, ch swarm.Chunk, cause error) (postage.HoldResult, error) {
 	if !postage.HoldsUnvalidated(cause) {
-		return false, nil
+		return postage.NotHeld, nil
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.err != nil {
-		return false, h.err
+		return postage.NotHeld, h.err
+	}
+	res := postage.HeldNew
+	for _, a := range h.held {
+		if a.Equal(ch.Address()) {
+			res = postage.HeldAgain
+		}
 	}
 	h.held = append(h.held, ch.Address())
-	return true, nil
+	return res, nil
 }
 
 func (h *holderMock) heldCount() int {
@@ -226,6 +233,41 @@ func TestSyncUnwrapsHeldChunk(t *testing.T) {
 			}
 		default:
 			t.Fatal("held chunk was not unwrapped")
+		}
+	})
+}
+
+// TestSyncHeldUnwrappedOnce checks that a held chunk offered again is not
+// handed to pss a second time (#583).
+func TestSyncHeldUnwrappedOnce(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ch := testingc.GenerateTestRandomChunk()
+		stampHash, err := ch.Stamp().Hash()
+		if err != nil {
+			t.Fatal(err)
+		}
+		results := []*storer.BinC{{Address: ch.Address(), BatchID: ch.Stamp().BatchID(), BinID: 1, StampHash: stampHash}}
+		ps, _ := newPullSync(t, nil, 10, mock.WithSubscribeResp(results, nil), mock.WithSubscribeResp(results, nil), mock.WithChunks(ch))
+		recorder := streamtest.New(streamtest.WithProtocols(ps.Protocol()))
+
+		var unwraps atomic.Int32
+		client := pullsync.New(recorder, mock.NewReserve(), func(swarm.Chunk) { unwraps.Add(1) }, func(*soc.SOC) {},
+			func(swarm.Chunk) (swarm.Chunk, error) { return nil, postage.ErrNotFound }, log.Noop, 0, pullsync.DefaultMaxChunksPerSecond)
+		t.Cleanup(func() { _ = client.Close() })
+		holder := &holderMock{}
+		client.SetChunkHolder(holder)
+
+		for range 2 {
+			if _, _, err := client.Sync(context.Background(), swarm.ZeroAddress, 0, 0); err != nil {
+				t.Fatalf("sync: %v", err)
+			}
+		}
+		synctest.Wait()
+		if holder.heldCount() != 2 {
+			t.Fatalf("holder offered %d times, want 2", holder.heldCount())
+		}
+		if n := unwraps.Load(); n != 1 {
+			t.Fatalf("unwrapped %d times, want 1", n)
 		}
 	})
 }

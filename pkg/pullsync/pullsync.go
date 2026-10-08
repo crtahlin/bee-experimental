@@ -366,8 +366,12 @@ func (s *Syncer) Sync(ctx context.Context, peer swarm.Address, bin uint8, start 
 			// While the batch store is stale, a genuine chunk of a batch
 			// this node has not seen yet is held instead of dropped, so the
 			// interval can advance without losing it (#583).
-			if held, hold := s.hold(ctx, newChunk.WithStamp(stamp), err); held {
-				s.unwrapHeld(newChunk.WithStamp(stamp))
+			if res, hold := s.hold(ctx, newChunk.WithStamp(stamp), err); res.Held() {
+				// Unwrap only when the chunk's data is newly held, so a
+				// chunk offered again is not delivered twice.
+				if res == postage.HeldNew {
+					s.unwrapHeld(newChunk.WithStamp(stamp))
+				}
 				continue
 			} else if hold != nil {
 				// It could have been kept but was not: do not advance
@@ -438,22 +442,22 @@ func (s *Syncer) SetChunkHolder(h postage.ChunkHolder) {
 }
 
 // hold offers a chunk whose stamp failed validation to the holder. It reports
-// whether the chunk is held, or the error that kept a chunk that qualified
-// from being held. A chunk that does not qualify returns false and nil.
-func (s *Syncer) hold(ctx context.Context, ch swarm.Chunk, cause error) (bool, error) {
+// what the holder did, or the error that kept a chunk that qualified from
+// being held. A chunk that does not qualify returns NotHeld and nil.
+func (s *Syncer) hold(ctx context.Context, ch swarm.Chunk, cause error) (postage.HoldResult, error) {
 	if s.holder == nil || !postage.HoldsUnvalidated(cause) {
-		return false, nil
+		return postage.NotHeld, nil
 	}
 	// Only a chunk whose content checks out is held: its data is genuine
 	// and only its stamp cannot be checked yet.
 	if !cac.Valid(ch) && !soc.Valid(ch) {
-		return false, nil
+		return postage.NotHeld, nil
 	}
-	held, err := s.holder.HoldUnvalidated(ctx, ch, cause)
-	if held {
+	res, err := s.holder.HoldUnvalidated(ctx, ch, cause)
+	if res.Held() {
 		s.metrics.Held.Inc()
 	}
-	return held, err
+	return res, err
 }
 
 // unwrapHeld hands a held chunk to pss or gsoc, as a stored one is. Push-sync

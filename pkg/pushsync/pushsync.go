@@ -290,8 +290,8 @@ func (ps *PushSync) handler(ctx context.Context, p p2p.Peer, stream p2p.Stream) 
 			// receipt promises storage and the chunk may be invalid. The
 			// error sends the uploader on to another storer (#583).
 			if ps.holder != nil && postage.HoldsUnvalidated(err) {
-				held, herr := ps.holder.HoldUnvalidated(ctx, chunk, err)
-				if held {
+				res, herr := ps.holder.HoldUnvalidated(ctx, chunk, err)
+				if res.Held() {
 					ps.metrics.Held.Inc()
 					return ErrChunkHeld
 				}
