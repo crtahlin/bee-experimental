@@ -240,7 +240,7 @@ func (db *DB) HoldUnvalidated(ctx context.Context, ch swarm.Chunk, cause error) 
 	return true, nil
 }
 
-// HeldFull implements postage.ChunkHolder.
+// HeldFull reports whether the held area is full.
 func (db *DB) HeldFull() bool {
 	return db.held.count() >= db.held.max
 }

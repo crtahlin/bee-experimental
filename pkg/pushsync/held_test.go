@@ -39,8 +39,6 @@ func (h *pushHolder) HoldUnvalidated(_ context.Context, ch swarm.Chunk, cause er
 	return true, nil
 }
 
-func (h *pushHolder) HeldFull() bool { return false }
-
 func (h *pushHolder) count() int {
 	h.mu.Lock()
 	defer h.mu.Unlock()

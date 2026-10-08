@@ -40,8 +40,6 @@ func (h *holderMock) HoldUnvalidated(_ context.Context, ch swarm.Chunk, cause er
 	return true, nil
 }
 
-func (h *holderMock) HeldFull() bool { return false }
-
 func (h *holderMock) heldCount() int {
 	h.mu.Lock()
 	defer h.mu.Unlock()

@@ -18,8 +18,8 @@ var radiusDecreaseHold = 15 * time.Minute
 // SetPostageSyncHealth gives the reserve worker the postage listener's sync
 // health (#583). While the batch store is stale, and for one sync-rate window
 // after, the worker does not lower the storage radius: the reserve size is not
-// reliable while chunks are held outside it, and a paused puller reports a
-// sync rate of 0. Call it before StartReserveWorker. A nil health keeps
+// reliable while chunks are held outside it, and the sync rate is not either
+// while pulled chunks are held or retried. Call it before StartReserveWorker. A nil health keeps
 // today's behaviour.
 func (db *DB) SetPostageSyncHealth(h postage.SyncHealth) {
 	if h == nil {

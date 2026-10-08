@@ -32,10 +32,6 @@ type ChunkHolder interface {
 	// The holder verifies the chunk's full content address (cac.Valid or
 	// soc.Valid) itself and holds nothing that fails it.
 	HoldUnvalidated(ctx context.Context, ch swarm.Chunk, cause error) (held bool, err error)
-
-	// HeldFull reports whether the held area is full, so pulling pauses
-	// rather than advancing past chunks it could not hold.
-	HeldFull() bool
 }
 
 // HoldsUnvalidated reports whether a stamp validation error is one a held
