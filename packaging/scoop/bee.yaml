@@ -286,3 +286,27 @@ password-file: "./password"
 # use-simd-hashing: false
 ## limit of possible connected light nodes (default: 100)
 # light-node-limit: 100
+## light-node slots that ultra-light peers (light peers without a chequebook)
+## may take; 0 means the same as light-node-limit, and a larger value is
+## reduced to it. Raising it lets clients that cannot pay take more of the
+## node's free bandwidth and handshakes; lowering it refuses such clients
+## sooner and sends them to other nodes, while paying light peers keep their
+## slots
+# ultra-light-node-limit: 0
+## open connections accepted from one IPv4 address or one IPv6 /56 subnet; 0
+## uses the default of 200. Raising it lets one address hold more of this
+## node's connections, handshakes and light slots; lowering it can refuse users
+## who share one address behind a carrier NAT, who must then use other nodes
+# p2p-max-connections-per-ip: 200
+## new connections per second accepted from one IPv4 address or one IPv6 /56
+## subnet; 0 uses the default of 10. Raising it lets one address open
+## connections faster and spend more of this node's handshakes; lowering it
+## slows the reconnects of peers that share one address behind a carrier NAT,
+## who then wait or try other nodes
+# p2p-connection-rate-per-ip: 10
+## new connections accepted at once from one IPv4 address or one IPv6 /56
+## subnet above the per-second rate; 0 uses the default of 40. Raising it lets
+## one address open more connections at once; lowering it can refuse the
+## reconnects of a restarting peer, or of users behind a shared carrier NAT,
+## who then wait or try other nodes
+# p2p-connection-burst-per-ip: 40

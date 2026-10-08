@@ -109,6 +109,25 @@ func (r *WaitNext) Connected(addr swarm.Address, now time.Time) {
 	r.entry(addr, now).connectedAt = now
 }
 
+// DisconnectedIfConnected ends the connection to addr as Disconnected does,
+// but only when the start of a connection to addr is recorded; otherwise it
+// does nothing and never creates an entry. counted reports whether a
+// connection was ended. It is for peers kademlia does not hold in its peer
+// list: a light peer never has a recorded start, while a full peer that
+// drops during its announcement does.
+func (r *WaitNext) DisconnectedIfConnected(addr swarm.Address, now time.Time, base time.Duration) (counted, shortLived bool, lasted time.Duration) {
+	r.Lock()
+	defer r.Unlock()
+
+	info, ok := r.lookup(addr, now)
+	if !ok || info.connectedAt.IsZero() {
+		return false, false, 0
+	}
+	info.expiresAt = time.Time{}
+	shortLived, lasted = r.endConnection(info, now, base)
+	return true, shortLived, lasted
+}
+
 // Disconnected records the end of a connection to addr at now and sets when
 // the peer may be dialled again. A connection that lasted at least the
 // stable-connection threshold resets both counts and the wait to now plus
@@ -126,7 +145,13 @@ func (r *WaitNext) Disconnected(addr swarm.Address, now time.Time, base time.Dur
 		info.tryAfter = later(info.tryAfter, now.Add(base))
 		return false, 0
 	}
+	return r.endConnection(info, now, base)
+}
 
+// endConnection ends the recorded connection in info at now, as
+// Disconnected describes. The caller holds the lock and has checked that
+// a start is recorded.
+func (r *WaitNext) endConnection(info *next, now time.Time, base time.Duration) (shortLived bool, lasted time.Duration) {
 	lasted = now.Sub(info.connectedAt)
 	info.connectedAt = time.Time{}
 

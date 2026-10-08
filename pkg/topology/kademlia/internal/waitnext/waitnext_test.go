@@ -52,6 +52,42 @@ func shortConnection(t *testing.T, w *waitnext.WaitNext, addr swarm.Address, at 
 	}
 }
 
+// TestDisconnectedIfConnected checks that a disconnect is counted only when
+// the start of a connection is recorded, and that it never creates an
+// entry.
+func TestDisconnectedIfConnected(t *testing.T) {
+	t.Parallel()
+
+	w := newWaitNext()
+	addr := swarm.RandAddress(t)
+
+	if counted, _, _ := w.DisconnectedIfConnected(addr, t0, base); counted {
+		t.Fatal("counted a disconnect of an unknown peer")
+	}
+	if _, ok := w.TryAfter(addr); ok {
+		t.Fatal("created an entry for an unknown peer")
+	}
+
+	w.Connected(addr, t0)
+	counted, short, lasted := w.DisconnectedIfConnected(addr, t0.Add(time.Second), base)
+	if !counted || !short || lasted != time.Second {
+		t.Fatalf("got counted %v, short-lived %v, lasted %v; want true, true, 1s", counted, short, lasted)
+	}
+	if got := w.ShortLived(addr); got != 1 {
+		t.Fatalf("got %d short-lived connections, want 1", got)
+	}
+	wantTryAfter(t, w, addr, t0.Add(time.Second+base))
+
+	if counted, _, _ := w.DisconnectedIfConnected(addr, t0.Add(2*time.Second), base); counted {
+		t.Fatal("counted the same connection twice")
+	}
+
+	w.Connected(addr, t0.Add(time.Hour))
+	if counted, short, _ := w.DisconnectedIfConnected(addr, t0.Add(time.Hour+stable), base); !counted || short {
+		t.Fatalf("stable connection: got counted %v, short-lived %v; want true, false", counted, short)
+	}
+}
+
 func TestWaitingAndAttempts(t *testing.T) {
 	t.Parallel()
 

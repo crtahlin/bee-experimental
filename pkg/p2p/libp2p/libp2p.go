@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/netip"
 	"os"
 	"runtime"
 	"slices"
@@ -57,7 +56,6 @@ import (
 	libp2pping "github.com/libp2p/go-libp2p/p2p/protocol/ping"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
 	ws "github.com/libp2p/go-libp2p/p2p/transport/websocket"
-	libp2prate "github.com/libp2p/go-libp2p/x/rate"
 	ma "github.com/multiformats/go-multiaddr"
 	manet "github.com/multiformats/go-multiaddr/net"
 	"github.com/multiformats/go-multistream"
@@ -112,6 +110,8 @@ type Service struct {
 	halt               chan struct{}
 	lightNodes         lightnodes
 	lightNodeLimit     int
+	bootnodeMode       bool
+	lightAnnounced     *lightAnnounceGate
 	protocolsmu        sync.RWMutex
 	reacher            p2p.Reacher
 	networkStatus      atomic.Int32
@@ -141,6 +141,10 @@ type lightnodes interface {
 	Count() int
 	RandomPeer(swarm.Address) (swarm.Address, error)
 	EachPeer(pf topology.EachPeerFunc) error
+	AtLimit() bool
+	TryReserve(ultraLight bool) (lightnode.Token, error)
+	Commit(lightnode.Token, swarm.Address) bool
+	Release(lightnode.Token)
 }
 
 type Options struct {
@@ -165,6 +169,25 @@ type Options struct {
 	autoTLSCertManager          autoTLSCertManager
 	ChequebookVerifier          chequebook.Verifier
 	ChequebookStorer            ChequebookStorer
+
+	// BootnodeMode keeps the accept-and-evict handling of light peers: a
+	// bootnode accepts every light peer and, over its light limit, evicts
+	// a random one, because light clients get their first announcement
+	// from bootnodes.
+	BootnodeMode bool
+
+	// UltraLightNodeLimit is the number of light slots that ultra-light
+	// peers, light peers whose signed address carries no chequebook, may
+	// take. Zero means the same as the light limit, and a larger value is
+	// reduced to it.
+	UltraLightNodeLimit int
+
+	// Per-IP connection limits, applied per IPv4 address and per IPv6
+	// /56 subnet: open connections, new connections per second, and the
+	// burst of new connections above that rate. Zero uses the default.
+	MaxConnectionsPerIP  int
+	ConnectionRatePerIP  float64
+	ConnectionBurstPerIP int
 }
 
 func New(ctx context.Context, signer beecrypto.Signer, networkID uint64, overlay swarm.Address, addr string, ab addressbook.GetPutter, storer storage.StateStorer, lightNodes *lightnode.Container, logger log.Logger, tracer *tracing.Tracer, o Options) (s *Service, returnErr error) {
@@ -244,43 +267,9 @@ func New(ctx context.Context, signer beecrypto.Signer, networkID uint64, overlay
 		return nil, err
 	}
 
-	limitPerIp := rcmgr.WithLimitPerSubnet(
-		[]rcmgr.ConnLimitPerSubnet{{PrefixLength: 32, ConnCount: 200}}, // IPv4 /32 (Single IP) -> 200 conns
-		[]rcmgr.ConnLimitPerSubnet{{PrefixLength: 56, ConnCount: 200}}, // IPv6 /56 subnet -> 200 conns
-	)
+	perIP := buildPerIPLimits(o.MaxConnectionsPerIP, o.ConnectionRatePerIP, o.ConnectionBurstPerIP)
 
-	// Custom rate limiter for connection attempts
-	// 20 peers cluster adaptation:
-	// Allow bursts of connection attempts (e.g. restart) but prevent DDOS.
-	connLimiter := &libp2prate.Limiter{
-		// Allow unlimited local connections (same as default)
-		NetworkPrefixLimits: []libp2prate.PrefixLimit{
-			{Prefix: netip.MustParsePrefix("127.0.0.0/8"), Limit: libp2prate.Limit{}},
-			{Prefix: netip.MustParsePrefix("::1/128"), Limit: libp2prate.Limit{}},
-		},
-		GlobalLimit: libp2prate.Limit{}, // Unlimited global
-		SubnetRateLimiter: libp2prate.SubnetLimiter{
-			IPv4SubnetLimits: []libp2prate.SubnetLimit{
-				{
-					PrefixLength: 32, // Apply limits per individual IPv4 address (/32)
-					// Allow 10 connection attempts per second per IP, burst up to 40
-					Limit: libp2prate.Limit{RPS: 10.0, Burst: 40},
-				},
-			},
-			IPv6SubnetLimits: []libp2prate.SubnetLimit{
-				{
-					PrefixLength: 56, // Apply limits per /56 IPv6 subnet
-					// Allow 10 connection attempts per second per IP, burst up to 40
-					// Subnet-level limiting prevents flooding from multiple addresses in the same block.
-					Limit: libp2prate.Limit{RPS: 10.0, Burst: 40},
-				},
-			},
-			// Duration to retain state for an IP or subnet after it becomes inactive.
-			GracePeriod: 10 * time.Second,
-		},
-	}
-
-	rm, err := rcmgr.NewResourceManager(limiter, rcmgr.WithTraceReporter(str), limitPerIp, rcmgr.WithConnRateLimiters(connLimiter))
+	rm, err := rcmgr.NewResourceManager(limiter, append([]rcmgr.Option{rcmgr.WithTraceReporter(str)}, perIP.options()...)...)
 	if err != nil {
 		return nil, err
 	}
@@ -491,6 +480,7 @@ func New(ctx context.Context, signer beecrypto.Signer, networkID uint64, overlay
 		ready:              make(chan struct{}),
 		halt:               make(chan struct{}),
 		lightNodes:         lightNodes,
+		lightAnnounced:     newLightAnnounceGate(lightAnnounceMaxPeers, lightAnnounceInterval),
 		HeadersRWTimeout:   o.HeadersRWTimeout,
 		autoNAT:            autoNAT,
 		autoTLSCertManager: certManager,
@@ -509,6 +499,14 @@ func New(ctx context.Context, signer beecrypto.Signer, networkID uint64, overlay
 	s.lightNodeLimit = defaultLightNodeLimit
 	if o.LightNodeLimit > 0 {
 		s.lightNodeLimit = o.LightNodeLimit
+	}
+	s.bootnodeMode = o.BootnodeMode
+	ultraLightLimit, reduced := ultraLightNodeLimit(s.lightNodeLimit, o.UltraLightNodeLimit)
+	if reduced {
+		logger.Warning("ultra-light node limit is above the light node limit and is reduced to it", "ultra_light_node_limit", o.UltraLightNodeLimit, "light_node_limit", s.lightNodeLimit)
+	}
+	if lightNodes != nil {
+		lightNodes.SetLimits(s.lightNodeLimit, ultraLightLimit)
 	}
 
 	// Construct protocols.
@@ -634,7 +632,12 @@ func (s *Service) handleIncoming(stream network.Stream) {
 	)
 	if err != nil {
 		s.logger.Debug("stream handler: handshake: handle failed", "peer_id", peerID, "error", err)
-		s.logger.Error(nil, "stream handler: handshake: handle failed", "peer_id", peerID)
+		// A picker refusal is expected under load, for light peers at the
+		// light limit and for full peers in a saturated bin, so it is not
+		// reported at error level.
+		if !errors.Is(err, handshake.ErrPicker) {
+			s.logger.Error(nil, "stream handler: handshake: handle failed", "peer_id", peerID)
+		}
 		_ = handshakeStream.Reset()
 		_ = stream.Conn().Close()
 		return
@@ -656,6 +659,32 @@ func (s *Service) handleIncoming(stream network.Stream) {
 		_ = handshakeStream.Reset()
 		_ = s.host.Network().ClosePeer(peerID)
 		return
+	}
+
+	// A light peer takes a light slot before anything else is spent on
+	// it. The deferred release covers every return path below that ends
+	// before the slot is committed, so no path can leak a reservation.
+	// Bootnodes keep accepting every light peer and evict instead.
+	var (
+		lightSlot          lightnode.Token
+		lightSlotReserved  bool
+		lightSlotCommitted bool
+	)
+	if !i.FullNode && !s.bootnodeMode {
+		lightSlot, err = s.lightNodes.TryReserve(isUltraLight(i))
+		if err != nil {
+			s.metrics.LightPeerRefusals.WithLabelValues(lightRefusalReason(err)).Inc()
+			s.logger.Debug("stream handler: light peer refused", "peer_address", overlay, "error", err)
+			_ = handshakeStream.Reset()
+			_ = stream.Conn().Close()
+			return
+		}
+		lightSlotReserved = true
+		defer func() {
+			if lightSlotReserved && !lightSlotCommitted {
+				s.lightNodes.Release(lightSlot)
+			}
+		}()
 	}
 
 	if exists := s.peers.addIfNotExists(stream.Conn(), overlay, i.FullNode); exists {
@@ -702,13 +731,28 @@ func (s *Service) handleIncoming(stream network.Stream) {
 
 	if s.notifier != nil {
 		if !i.FullNode {
-			s.lightNodes.Connected(s.ctx, peer)
-			// light node announces explicitly
-			if err := s.notifier.Announce(s.ctx, peer.Address, i.FullNode); err != nil {
+			if lightSlotReserved {
+				lightSlotCommitted = s.lightNodes.Commit(lightSlot, peer.Address)
+			} else {
+				s.lightNodes.Connected(s.ctx, peer)
+			}
+			// light node announces explicitly, but a light peer that
+			// received an announcement recently gets none, so a client
+			// that reconnects often does not get the same list each time.
+			// Only a successful announcement is recorded. A bootnode keeps
+			// announcing every time: light clients get their first list from
+			// it, and bootnode mode keeps today's behaviour.
+			if !s.bootnodeMode && s.lightAnnounced.recent(peer.Address) {
+				s.metrics.LightAnnouncementsSkipped.Inc()
+			} else if err := s.notifier.Announce(s.ctx, peer.Address, i.FullNode); err != nil {
 				s.logger.Debug("stream handler: notifier.Announce failed", "peer", peer.Address, "error", err)
+			} else {
+				s.lightAnnounced.record(peer.Address)
 			}
 
-			if s.lightNodes.Count() > s.lightNodeLimit {
+			// Only a bootnode gets here over its limit, because every
+			// other node refuses light peers at the limit instead.
+			if s.bootnodeMode && s.lightNodes.Count() > s.lightNodeLimit {
 				// kick another node to fit this one in
 				p, err := s.lightNodes.RandomPeer(peer.Address)
 				if err != nil {
@@ -859,7 +903,7 @@ func (s *Service) notifyReacherConnected(overlay swarm.Address, underlays []ma.M
 }
 
 func (s *Service) SetPickyNotifier(n p2p.PickyNotifier) {
-	s.handshakeService.SetPicker(n)
+	s.handshakeService.SetPicker(&lightLimitPicker{next: n, s: s})
 	s.notifier = n
 	s.reacher = reacher.New(s, n, nil, s.logger)
 }
@@ -1270,7 +1314,11 @@ func (s *Service) Disconnect(overlay swarm.Address, reason string) (err error) {
 	if s.notifier != nil {
 		s.notifier.Disconnected(peer)
 	}
-	if s.lightNodes != nil {
+	// A light peer that reconnected with the same overlay while this
+	// disconnect was on its way is registered again, and the container
+	// already counts it. Removing it now would leave the live connection
+	// uncounted and let the light limit be passed by one. See #593.
+	if s.lightNodes != nil && !s.peers.Exists(peer.Address) {
 		s.lightNodes.Disconnected(peer)
 	}
 	if s.reacher != nil {
@@ -1310,7 +1358,11 @@ func (s *Service) disconnected(address swarm.Address) {
 	if s.notifier != nil {
 		s.notifier.Disconnected(peer)
 	}
-	if s.lightNodes != nil {
+	// A light peer that reconnected with the same overlay while this
+	// disconnect was on its way is registered again, and the container
+	// already counts it. Removing it now would leave the live connection
+	// uncounted and let the light limit be passed by one. See #593.
+	if s.lightNodes != nil && !s.peers.Exists(peer.Address) {
 		s.lightNodes.Disconnected(peer)
 	}
 	if s.reacher != nil {

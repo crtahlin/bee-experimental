@@ -1051,6 +1051,8 @@ func binPruneCount(oversaturationAmount int, staticNode staticPeerFunc) pruneCou
 
 // recalcDepth calculates, assigns the new depth, and returns if depth has changed
 func (k *Kad) recalcDepth() {
+	k.metrics.DepthRecalculations.Inc()
+
 	k.depthMu.Lock()
 	defer k.depthMu.Unlock()
 
@@ -1391,6 +1393,26 @@ func (k *Kad) onConnected(ctx context.Context, addr swarm.Address) error {
 
 // Disconnected is called when peer disconnects.
 func (k *Kad) Disconnected(peer p2p.Peer) {
+	// Only peers in kademlia's own peer list change its depth, its
+	// neighbours or the sync peers. Light peers are never in that list,
+	// so their disconnects return here without any further work. The
+	// check is on the list and not on peer.FullNode, because the peer
+	// registry can drop the full-node flag before it reports the
+	// disconnect, so a full peer can arrive here marked as light.
+	if !k.connectedPeers.Exists(peer.Address) {
+		// A full peer kademlia dials has the start of its connection
+		// recorded before the announcement, but joins the peer list only
+		// after it. A peer that drops the connection during the
+		// announcement is still counted as a short connection here,
+		// and nothing else is done. Light peers never have a recorded
+		// start, so no entry is created for them.
+		if _, shortLived, lasted := k.waitNext.DisconnectedIfConnected(peer.Address, time.Now(), k.opt.TimeToRetry); shortLived {
+			k.metrics.ShortLivedConnections.Inc()
+			k.logger.Debug("short-lived connection", "peer_address", peer.Address, "duration", lasted)
+		}
+		return
+	}
+
 	k.logger.Debug("disconnected peer", "peer_address", peer.Address)
 
 	k.connectedPeers.Remove(peer.Address)
