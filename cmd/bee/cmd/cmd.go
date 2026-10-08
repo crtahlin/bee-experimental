@@ -84,6 +84,8 @@ const (
 	optionNameP2PMaxConnectionsPerIP       = "p2p-max-connections-per-ip"
 	optionNameP2PConnectionRatePerIP       = "p2p-connection-rate-per-ip"
 	optionNameP2PConnectionBurstPerIP      = "p2p-connection-burst-per-ip"
+	optionNameP2PInboundConnectionRate     = "p2p-inbound-connection-rate"
+	optionNameP2PInboundConnectionBurst    = "p2p-inbound-connection-burst"
 	optionNamePostageContractAddress       = "postage-stamp-address"
 	optionNamePostageContractStartBlock    = "postage-stamp-start-block"
 	optionNamePriceOracleAddress           = "price-oracle-address"
@@ -416,6 +418,8 @@ func (c *command) setAllFlags(cmd *cobra.Command) {
 	cmd.Flags().Int(optionNameP2PMaxConnectionsPerIP, 200, "open connections accepted from one IPv4 address or one IPv6 /56 subnet; 0 uses the default of 200. Raising it lets one address hold more of this node's connections, handshakes and light slots; lowering it can refuse users who share one address behind a carrier NAT, who must then use other nodes")
 	cmd.Flags().Float64(optionNameP2PConnectionRatePerIP, 10, "new connections per second accepted from one IPv4 address or one IPv6 /56 subnet; 0 uses the default of 10. Raising it lets one address open connections faster and spend more of this node's handshakes; lowering it slows the reconnects of peers that share one address behind a carrier NAT, who then wait or try other nodes")
 	cmd.Flags().Int(optionNameP2PConnectionBurstPerIP, 40, "new connections accepted at once from one IPv4 address or one IPv6 /56 subnet above the per-second rate; 0 uses the default of 40. Raising it lets one address open more connections at once; lowering it can refuse the reconnects of a restarting peer, or of users behind a shared carrier NAT, who then wait or try other nodes")
+	cmd.Flags().Float64(optionNameP2PInboundConnectionRate, 30, "new inbound connections per second the node accepts in total, checked after the per-IP limits and before the security handshake, in each of two buckets: full peers that completed a handshake with this node, and every other address; 0 uses the default of 30, -1 turns the limit off, other negative values are refused; off on a bootnode unless set. Raising it lets more connection setups through under a flood, which costs this node CPU and takes it from its reserve samples; lowering it makes new light clients wait or go to other nodes, can make new full peers drop this node from their address books after 4 refused dials, and can make other nodes, and this node itself, judge it unreachable")
+	cmd.Flags().Int(optionNameP2PInboundConnectionBurst, 200, "new inbound connections the node accepts at once above p2p-inbound-connection-rate, per bucket; 0 uses the default of 200, -1 turns the limit off, other negative values are refused. Raising it lets a larger flood through before the rate applies; lowering it can refuse the peers that reconnect at once after a restart, who then wait or go to other nodes")
 	cmd.Flags().Int(optionNameUltraLightNodeLimit, 0, "light-node slots that ultra-light peers (light peers without a chequebook) may take; 0 means the same as light-node-limit, and a larger value is reduced to it. Raising it lets clients that cannot pay take more of the node's free bandwidth and handshakes; lowering it refuses such clients sooner and sends them to other nodes, while paying light peers keep their slots")
 	cmd.Flags().String(optionNamePostageContractAddress, "", "postage stamp contract address")
 	cmd.Flags().Uint64(optionNamePostageContractStartBlock, 0, "postage stamp contract start block number")

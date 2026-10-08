@@ -27,6 +27,11 @@ type metrics struct {
 	KickedOutPeersCount        prometheus.Counter
 	LightPeerRefusals          *prometheus.CounterVec
 	LightAnnouncementsSkipped  prometheus.Counter
+	InboundAdmitted            *prometheus.CounterVec
+	InboundRefusals            *prometheus.CounterVec
+	KnownFullAddresses         prometheus.Gauge
+	ReachabilityPublic         prometheus.Gauge
+	ReachabilityToPrivate      prometheus.Counter
 	StreamHandlerErrResetCount prometheus.Counter
 	HeadersExchangeDuration    prometheus.Histogram
 }
@@ -118,6 +123,36 @@ func newMetrics() metrics {
 			Subsystem: subsystem,
 			Name:      "light_announcements_skipped",
 			Help:      "Number of announcements not sent to a light peer because it received one recently.",
+		}),
+		InboundAdmitted: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "inbound_admitted",
+			Help:      "Number of new inbound connections the total inbound rate admitted, by bucket.",
+		}, []string{"bucket"}),
+		InboundRefusals: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "inbound_refusals",
+			Help:      "Number of new inbound connections refused before the security handshake because the total inbound rate was used up, by bucket.",
+		}, []string{"bucket"}),
+		KnownFullAddresses: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "known_full_addresses",
+			Help:      "Number of addresses of full peers that completed a handshake with this node, kept for the total inbound rate.",
+		}),
+		ReachabilityPublic: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "reachability_public",
+			Help:      "1 when the node's last reachability event said it is publicly reachable, 0 otherwise.",
+		}),
+		ReachabilityToPrivate: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "reachability_private_switches",
+			Help:      "Number of times the node's reachability changed to private.",
 		}),
 		StreamHandlerErrResetCount: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: m.Namespace,

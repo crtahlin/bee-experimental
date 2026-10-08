@@ -14,6 +14,7 @@ import (
 	"github.com/ethersphere/bee/v2/pkg/swarm"
 	"github.com/libp2p/go-libp2p/core/network"
 	libp2ppeer "github.com/libp2p/go-libp2p/core/peer"
+	ma "github.com/multiformats/go-multiaddr"
 )
 
 type peerRegistry struct {
@@ -23,6 +24,10 @@ type peerRegistry struct {
 	connections     map[libp2ppeer.ID]map[network.Conn]struct{} // list of connections for safe removal on Disconnect notification
 	streams         map[libp2ppeer.ID]map[network.Stream]context.CancelFunc
 	mu              sync.RWMutex
+
+	// onFullConnClosed, when set, is called with the remote address of
+	// every closed connection of a full peer.
+	onFullConnClosed func(ma.Multiaddr)
 
 	//nolint:misspell
 	disconnecter     disconnecter // peerRegistry notifies libp2p on peer disconnection
@@ -62,6 +67,11 @@ func (r *peerRegistry) Disconnected(_ network.Network, c network.Conn) {
 	if _, ok := r.connections[peerID][c]; !ok {
 		r.mu.Unlock()
 		return
+	}
+
+	full := r.full[peerID]
+	if full && r.onFullConnClosed != nil {
+		defer r.onFullConnClosed(c.RemoteMultiaddr())
 	}
 
 	// if there are multiple libp2p connections, consider the node disconnected only when the last connection is disconnected
@@ -135,6 +145,23 @@ func (r *peerRegistry) peers() []p2p.Peer {
 		return bytes.Compare(peers[i].Address.Bytes(), peers[j].Address.Bytes()) == -1
 	})
 	return peers
+}
+
+// fullPeerConnAddrs returns the remote addresses of the connections of all
+// full peers.
+func (r *peerRegistry) fullPeerConnAddrs() []ma.Multiaddr {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var addrs []ma.Multiaddr
+	for peerID, conns := range r.connections {
+		if !r.full[peerID] {
+			continue
+		}
+		for c := range conns {
+			addrs = append(addrs, c.RemoteMultiaddr())
+		}
+	}
+	return addrs
 }
 
 func (r *peerRegistry) addIfNotExists(c network.Conn, overlay swarm.Address, full bool) (exists bool) {
