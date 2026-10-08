@@ -1406,11 +1406,9 @@ func (k *Kad) Disconnected(peer p2p.Peer) {
 		// announcement is still counted as a short connection here,
 		// and nothing else is done. Light peers never have a recorded
 		// start, so no entry is created for them.
-		if now := time.Now(); k.waitNext.InConnection(peer.Address, now) {
-			if shortLived, lasted := k.waitNext.Disconnected(peer.Address, now, k.opt.TimeToRetry); shortLived {
-				k.metrics.ShortLivedConnections.Inc()
-				k.logger.Debug("short-lived connection", "peer_address", peer.Address, "duration", lasted)
-			}
+		if _, shortLived, lasted := k.waitNext.DisconnectedIfConnected(peer.Address, time.Now(), k.opt.TimeToRetry); shortLived {
+			k.metrics.ShortLivedConnections.Inc()
+			k.logger.Debug("short-lived connection", "peer_address", peer.Address, "duration", lasted)
 		}
 		return
 	}
