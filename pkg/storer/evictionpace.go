@@ -96,13 +96,18 @@ func (p *evictionPacer) Workers() int {
 }
 
 // arrivalRate records the current arrival count and returns the chunks per
-// second added over the last arrivalWindow. It reads 0 until the samples
-// span at least a second.
+// second added since the baseline sample, the newest one at least
+// arrivalWindow old, or the oldest one when none is that old. It reads 0
+// until the samples span at least a second.
 func (p *evictionPacer) arrivalRate(now time.Time) float64 {
 	n := p.arrivals()
 	p.samples = append(p.samples, arrivalSample{at: now, n: n})
+	// Keep the newest sample at or beyond the window edge as the baseline,
+	// so a wait longer than the window does not leave nothing to compare
+	// with: rounds are sampled once each, and at a low rate a round's wait
+	// can exceed the window.
 	cut := 0
-	for cut < len(p.samples)-1 && now.Sub(p.samples[cut].at) > arrivalWindow {
+	for cut < len(p.samples)-1 && now.Sub(p.samples[cut+1].at) >= arrivalWindow {
 		cut++
 	}
 	p.samples = p.samples[cut:]
@@ -225,9 +230,30 @@ func (db *DB) evictionHooks(ctx context.Context, expired bool, expiry <-chan str
 			}
 		},
 	}
+	// Between rounds, at every rate, a shutdown or a batch expiry stops the
+	// eviction, so a long eviction of one batch is not the only work that
+	// cannot be stopped. A nil expiry channel never fires.
+	stop := func() error {
+		select {
+		case <-db.quit:
+			return ErrDBQuit
+		case <-expiry:
+			return errEvictionExpiry
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			return nil
+		}
+	}
+	h.Pay = func(int) error { return stop() }
 	if p := db.evictionPacer; p != nil {
 		h.Workers = p.Workers
-		h.Pay = func(n int) error { return p.wait(ctx, n, db.quit, expiry) }
+		h.Pay = func(n int) error {
+			if err := stop(); err != nil {
+				return err
+			}
+			return p.wait(ctx, n, db.quit, expiry)
+		}
 	}
 	return h
 }

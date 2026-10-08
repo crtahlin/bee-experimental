@@ -263,7 +263,7 @@ func newMetrics() metrics {
 				Namespace: m.Namespace,
 				Subsystem: subsystem,
 				Name:      "reserve_arrival_rate",
-				Help:      "Chunks per second added to the reserve over the last minute, as seen by a paced eviction (wasp #623).",
+				Help:      "Chunks per second added to the reserve over the last minute, as seen by a paced eviction (wasp #623). Updated only while a paced eviction runs; between evictions it keeps its last value.",
 			},
 		),
 	}

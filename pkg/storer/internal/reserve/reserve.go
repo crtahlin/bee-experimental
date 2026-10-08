@@ -346,6 +346,18 @@ const EvictionRound = 1000
 // evictionRound is EvictionRound, a variable so tests can use small rounds.
 var evictionRound = EvictionRound
 
+// EvictionYield is how long EvictBatchBin waits, with the batch lock
+// released, before the next round of the same batch. The lock (a
+// condition variable woken by Broadcast) gives no turn to waiters: an
+// eviction that unlocks and locks again at once keeps it, and a Put or
+// Get of the batch then waits for the whole eviction, as before rounds.
+// The yield gives a waiting Put or Get the lock between rounds. It costs
+// about 1 ms per round of 1,000 chunks, about 14 s for 14 million.
+const EvictionYield = time.Millisecond
+
+// evictionYield is EvictionYield, a variable so tests can change it.
+var evictionYield = EvictionYield
+
 // EvictionHooks are the per-round callbacks of EvictBatchBin (wasp #623).
 // The zero value runs every round at full speed on runtime.NumCPU()
 // goroutines.
@@ -357,8 +369,9 @@ type EvictionHooks struct {
 	// n items in the duration took.
 	After func(n int, took time.Duration)
 	// Pay is called after the batch lock is released, for a round that
-	// deleted n > 0 items. It may wait. An error ends EvictBatchBin before
-	// the next round and is returned.
+	// deleted n > 0 items. It may wait, and it is where a shutdown or a
+	// batch expiry stops the eviction between rounds. An error ends
+	// EvictBatchBin before the next round and is returned.
 	Pay func(n int) error
 }
 
@@ -392,10 +405,12 @@ func (r *Reserve) EvictBatchBin(
 				return total, err
 			}
 		}
-		if read < evictionRound {
-			// The batch's entries below bin ended inside this round.
+		if read < evictionRound || count <= 0 {
+			// The batch's entries below bin ended inside this round, or
+			// the count is reached: no round follows.
 			return total, nil
 		}
+		time.Sleep(evictionYield)
 	}
 	return total, nil
 }

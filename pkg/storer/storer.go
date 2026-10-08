@@ -871,6 +871,12 @@ func New(ctx context.Context, dirPath string, opts *Options) (*DB, error) {
 		opts.Logger = log.Noop
 	}
 
+	// Checked before anything is opened, so a refusal leaks nothing, and
+	// whether or not the node has a reserve (#623).
+	if opts.ReserveEvictionRate < 0 {
+		return nil, fmt.Errorf("reserve eviction rate %d: must be 0 or more", opts.ReserveEvictionRate)
+	}
+
 	lock := multex.New()
 	metrics := newMetrics()
 	opts.LdbStats.CompareAndSwap(nil, metrics.LevelDBStats)
@@ -977,9 +983,6 @@ func New(ctx context.Context, dirPath string, opts *Options) (*DB, error) {
 		}
 		db.reserve = rs
 
-		if opts.ReserveEvictionRate < 0 {
-			return nil, fmt.Errorf("reserve eviction rate %d: must be 0 or more", opts.ReserveEvictionRate)
-		}
 		if p := newEvictionPacer(opts.ReserveEvictionRate, rs.Arrivals); p != nil {
 			p.setWorkers = func(n int) { db.metrics.ReserveEvictionWorkers.Set(float64(n)) }
 			p.setArrivalRate = db.metrics.ReserveArrivalRate.Set
