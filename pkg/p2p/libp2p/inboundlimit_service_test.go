@@ -5,10 +5,15 @@
 package libp2p_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/ethersphere/bee/v2/pkg/log"
 
 	"github.com/ethersphere/bee/v2/pkg/p2p"
 	"github.com/ethersphere/bee/v2/pkg/p2p/libp2p"
@@ -116,6 +121,8 @@ func TestInboundLimitServiceReachabilityMetrics(t *testing.T) {
 		t.Fatalf("gauge %v when public, want 1", got)
 	}
 	s.ObserveReachability(network.ReachabilityPrivate)
+	// Two AutoNAT clients can report the same change: it counts once.
+	s.ObserveReachability(network.ReachabilityPrivate)
 	s.ObserveReachability(network.ReachabilityPublic)
 	s.ObserveReachability(network.ReachabilityPrivate)
 	if got := s.ReachabilityPublic(); got != 0 {
@@ -124,4 +131,132 @@ func TestInboundLimitServiceReachabilityMetrics(t *testing.T) {
 	if got := s.ReachabilityToPrivate(); got != 2 {
 		t.Fatalf("got %v switches to private, want 2", got)
 	}
+}
+
+// TestInboundLimitServiceWarnsWhenPrivateAfterRefusal checks that the
+// warning is logged when the node turns private shortly after a refusal,
+// and not without one.
+func TestInboundLimitServiceWarnsWhenPrivateAfterRefusal(t *testing.T) {
+	t.Parallel()
+
+	const warning = "node judged itself unreachable shortly after the total inbound connection rate refused connections"
+
+	var quiet, loud syncBuffer
+	sQuiet, _ := newService(t, 1, libp2pServiceOpts{
+		Logger:     log.NewLogger("test", log.WithSink(&quiet), log.WithSynchronousSink()),
+		libp2pOpts: libp2p.Options{FullNode: true},
+	})
+	sQuiet.ObserveReachability(network.ReachabilityPrivate)
+	if strings.Contains(quiet.String(), warning) {
+		t.Fatal("warning logged without any refusal")
+	}
+
+	sLoud, _ := newService(t, 1, libp2pServiceOpts{
+		Logger:   log.NewLogger("test", log.WithSink(&loud), log.WithSynchronousSink()),
+		notifier: mockNotifier(noopCf, noopDf, true),
+		libp2pOpts: libp2p.WithInboundLimitOnLoopback(libp2p.Options{
+			FullNode:                  true,
+			InboundConnectionRate:     0.0001,
+			InboundConnectionBurst:    1,
+			InboundConnectionLimitSet: true,
+		}),
+	})
+	for range 5 {
+		sd, _ := newService(t, 1, libp2pServiceOpts{libp2pOpts: libp2p.Options{FullNode: true}})
+		_, _ = sd.Connect(context.Background(), serviceUnderlayAddress(t, sLoud))
+		if refusals(sLoud) > 0 {
+			break
+		}
+	}
+	if refusals(sLoud) == 0 {
+		t.Fatal("no refusal")
+	}
+	sLoud.ObserveReachability(network.ReachabilityPrivate)
+	var line string
+	for _, l := range strings.Split(loud.String(), "\n") {
+		if strings.Contains(l, warning) {
+			line = l
+		}
+	}
+	if line == "" {
+		t.Fatal("warning not logged after a refusal")
+	}
+	if !strings.Contains(line, `"level"="warning"`) {
+		t.Fatalf("logged at the wrong level: %s", line)
+	}
+}
+
+// TestInboundLimitServiceHourlyPass checks that the hourly pass keeps a
+// connected full peer known past the 24-hour expiry.
+func TestInboundLimitServiceHourlyPass(t *testing.T) {
+	t.Parallel()
+
+	clock := newFakeClock()
+	s, _ := newService(t, 1, libp2pServiceOpts{
+		notifier: mockNotifier(noopCf, noopDf, true),
+		libp2pOpts: libp2p.WithClock(libp2p.WithInboundLimitOnLoopback(libp2p.Options{
+			FullNode:                  true,
+			InboundConnectionLimitSet: true,
+		}), clock.Now),
+	})
+	sd, _ := newService(t, 1, libp2pServiceOpts{libp2pOpts: libp2p.Options{FullNode: true}})
+	if _, err := sd.Connect(context.Background(), serviceUnderlayAddress(t, s)); err != nil {
+		t.Fatal(err)
+	}
+	loopback := mustAddr(t, "/ip4/127.0.0.1/tcp/1634")
+	if err := spinlock.Wait(5*time.Second, func() bool { return s.KnownFullContains(loopback) }); err != nil {
+		t.Fatal("connected full peer not recorded")
+	}
+
+	clock.Add(libp2p.KnownFullPeerTTL - time.Hour)
+	s.RefreshConnectedFullPeers()
+	clock.Add(2 * time.Hour)
+	if !s.KnownFullContains(loopback) {
+		t.Fatal("connected full peer expired despite the hourly pass")
+	}
+	clock.Add(libp2p.KnownFullPeerTTL)
+	if s.KnownFullContains(loopback) {
+		t.Fatal("full peer still known 24 hours after its last pass")
+	}
+}
+
+// TestInboundLimitServiceOffRecordsNothing checks that with the limit off
+// no known full peers are recorded.
+func TestInboundLimitServiceOffRecordsNothing(t *testing.T) {
+	t.Parallel()
+
+	s, _ := newService(t, 1, libp2pServiceOpts{
+		notifier: mockNotifier(noopCf, noopDf, true),
+		libp2pOpts: libp2p.Options{
+			FullNode:                  true,
+			InboundConnectionRate:     -1,
+			InboundConnectionLimitSet: true,
+		},
+	})
+	sd, sdOverlay := newService(t, 1, libp2pServiceOpts{libp2pOpts: libp2p.Options{FullNode: true}})
+	if _, err := sd.Connect(context.Background(), serviceUnderlayAddress(t, s)); err != nil {
+		t.Fatal(err)
+	}
+	expectPeersEventually(t, s, sdOverlay)
+	if got := s.KnownFullAddresses(); got != 0 {
+		t.Fatalf("got %v known addresses with the limit off, want 0", got)
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe for the logger's concurrent writes.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }

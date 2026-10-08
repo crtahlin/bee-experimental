@@ -62,11 +62,15 @@ func (k KnownFullPeers) Sweep()                         { k.k.sweep() }
 func (k KnownFullPeers) Len() int                       { return k.k.len() }
 
 // InboundLimiter exposes the resource-manager wrapper for tests.
-type InboundLimiter struct{ l *inboundLimiter }
+type InboundLimiter struct {
+	l *inboundLimiter
+	m metrics
+}
 
 func NewInboundLimiter(inner network.ResourceManager, r float64, burst int, known KnownFullPeers, now func() time.Time) InboundLimiter {
 	cfg := inboundLimitConfig{enabled: r > 0 && burst > 0, rate: r, burst: burst}
-	return InboundLimiter{l: newInboundLimiter(inner, cfg, known.k, newMetrics(), now)}
+	m := newMetrics()
+	return InboundLimiter{l: newInboundLimiter(inner, cfg, known.k, m, now), m: m}
 }
 
 func (l InboundLimiter) OpenConnection(dir network.Direction, usefd bool, endpoint ma.Multiaddr) (network.ConnManagementScope, error) {
@@ -74,11 +78,11 @@ func (l InboundLimiter) OpenConnection(dir network.Direction, usefd bool, endpoi
 }
 
 func (l InboundLimiter) Admitted(bucket string) float64 {
-	return counterValue(l.l.metrics.InboundAdmitted.WithLabelValues(bucket))
+	return counterValue(l.m.InboundAdmitted.WithLabelValues(bucket))
 }
 
 func (l InboundLimiter) Refused(bucket string) float64 {
-	return counterValue(l.l.metrics.InboundRefusals.WithLabelValues(bucket))
+	return counterValue(l.m.InboundRefusals.WithLabelValues(bucket))
 }
 
 func (l InboundLimiter) PrivateAfterRefusal() (time.Time, bool) { return privateAfterRefusal(l.l) }
@@ -89,6 +93,23 @@ func WithInboundLimitOnLoopback(o Options) Options {
 	o.inboundLimitLoopback = true
 	return o
 }
+
+// WithClock sets the clock of the total inbound rate and its known full
+// peers.
+func WithClock(o Options, now func() time.Time) Options {
+	o.now = now
+	return o
+}
+
+// KnownFullContains reports whether the address counts as a known full
+// peer's.
+func (s *Service) KnownFullContains(m ma.Multiaddr) bool {
+	key, ok := addressKey(m)
+	return ok && s.knownFull.contains(key)
+}
+
+// RefreshConnectedFullPeers runs one hourly pass.
+func (s *Service) RefreshConnectedFullPeers() { s.refreshConnectedFullPeers() }
 
 func (s *Service) InboundRefusals(bucket string) float64 {
 	return counterValue(s.metrics.InboundRefusals.WithLabelValues(bucket))
