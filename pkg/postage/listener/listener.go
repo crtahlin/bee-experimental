@@ -10,6 +10,7 @@ import (
 	"math/big"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
@@ -42,13 +43,21 @@ const DefaultConfirmationDepth = 4
 // MaxConfirmationDepth is the largest postage-confirmation-depth a node accepts.
 // While the listener waits for the chain to move that far past what it has
 // synced, it makes no progress, and after the postage stall timeout (10
-// minutes) the node stops. 64 blocks is 320 s at 5 s blocks and 128 s at 2 s
+// minutes) the batch store becomes stale (#583). 64 blocks is 320 s at 5 s blocks and 128 s at 2 s
 // blocks, so even raising the depth from 4 to 64 on a synced node stays under
 // it. An Ethereum reorg rolls Gnosis Chain back about 6 to 12 blocks (#545).
 const MaxConfirmationDepth = 64
 
 // for testing, set externally
 var batchFactorOverridePublic = "5"
+
+// While the batch store is stale the node stays up, and the watcher checks
+// the state, keeps the gauges current and repeats the stale Warning (#583).
+// Variables only so tests can shorten them; New copies them.
+var (
+	staleWatchInterval = time.Second
+	staleWarnRepeat    = 30 * time.Minute
+)
 
 // Deadlines of the listener's own chain calls. Without them a call that never
 // answers blocks the loop until the connection itself fails (#583). They are
@@ -59,6 +68,9 @@ var (
 )
 
 var (
+	// ErrPostageSyncingStalled is the stop cause when postage-stall-shutdown
+	// is set and the batch store stayed stale that long (#583). A stall alone
+	// no longer stops the node.
 	ErrPostageSyncingStalled = errors.New("postage syncing stalled")
 	ErrPostagePaused         = errors.New("postage contract is paused")
 	ErrParseSnapshot         = errors.New("failed to parse snapshot data")
@@ -87,6 +99,22 @@ type listener struct {
 	syncingStopped              *syncutil.Signaler
 	blockNumberTimeout          time.Duration
 	filterLogsTimeout           time.Duration
+	watchInterval               time.Duration
+	warnRepeat                  time.Duration
+	// stallShutdown, when positive, stops the node once the batch store has
+	// been stale this long (postage-stall-shutdown, #583). Zero never stops.
+	stallShutdown time.Duration
+
+	// Sync health (#583). Written by the loop and the watcher, read by
+	// Stale and the node.
+	listening    atomic.Bool
+	lastProgress atomic.Int64 // unix nanoseconds of the last applied page
+	staleLatched atomic.Bool  // stale until a caught-up page is applied
+	staleSince   atomic.Int64 // unix nanoseconds the stale state began, 0 if not stale
+	staleEndedAt atomic.Int64 // unix nanoseconds the stale state last ended, 0 if never
+	headOkAt     atomic.Int64 // unix nanoseconds of the last successful block number call
+	behind       atomic.Int64 // confirmed head minus the next block, at headOkAt
+	lastErr      atomic.Value // string: the last backend error
 
 	// Cached postage stamp contract event topics.
 	batchCreatedTopic       common.Hash
@@ -106,8 +134,9 @@ func New(
 	confirmationDepth uint64,
 	stallingTimeout time.Duration,
 	backoffTime time.Duration,
+	opts ...Option,
 ) postage.Listener {
-	return &listener{
+	l := &listener{
 		syncingStopped:              syncingStopped,
 		logger:                      logger.WithName(loggerName).Register(),
 		ev:                          ev,
@@ -121,6 +150,8 @@ func New(
 		backoffTime:                 backoffTime,
 		blockNumberTimeout:          blockNumberTimeout,
 		filterLogsTimeout:           filterLogsTimeout,
+		watchInterval:               staleWatchInterval,
+		warnRepeat:                  staleWarnRepeat,
 
 		batchCreatedTopic:       postageStampContractABI.Events["BatchCreated"].ID,
 		batchTopUpTopic:         postageStampContractABI.Events["BatchTopUp"].ID,
@@ -128,6 +159,62 @@ func New(
 		priceUpdateTopic:        postageStampContractABI.Events["PriceUpdate"].ID,
 		pausedTopic:             postageStampContractABI.Events["Paused"].ID,
 	}
+	for _, o := range opts {
+		o(l)
+	}
+	return l
+}
+
+// Option configures a listener.
+type Option func(*listener)
+
+// WithStallShutdown stops the node once the batch store has been stale for d
+// (postage-stall-shutdown). Zero, the default, never stops it (#583).
+func WithStallShutdown(d time.Duration) Option {
+	return func(l *listener) { l.stallShutdown = d }
+}
+
+// Stale reports whether the batch store is stale: no page applied for the
+// stall timeout, or not caught up since that happened. It is computed when
+// read, so a chain call that hangs cannot keep it from turning true (#583).
+func (l *listener) Stale() bool {
+	if !l.listening.Load() {
+		return false
+	}
+	if time.Since(time.Unix(0, l.lastProgress.Load())) >= l.stallingTimeout {
+		l.staleLatched.Store(true)
+		return true
+	}
+	return l.staleLatched.Load()
+}
+
+// SinceProgress returns the time since the listener last applied a page, or
+// zero before it has started.
+func (l *listener) SinceProgress() time.Duration {
+	if !l.listening.Load() {
+		return 0
+	}
+	return time.Since(time.Unix(0, l.lastProgress.Load()))
+}
+
+// StaleEndedAt returns when the stale state last ended, or the zero time if
+// it never has.
+func (l *listener) StaleEndedAt() time.Time {
+	if n := l.staleEndedAt.Load(); n != 0 {
+		return time.Unix(0, n)
+	}
+	return time.Time{}
+}
+
+func (l *listener) setLastErr(err error) {
+	l.lastErr.Store(err.Error())
+}
+
+func (l *listener) lastError() string {
+	if v, ok := l.lastErr.Load().(string); ok {
+		return v
+	}
+	return ""
 }
 
 func (l *listener) filterQuery(from, to *big.Int) ethereum.FilterQuery {
@@ -274,21 +361,33 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 
 	synced := make(chan error)
 	closeOnce := new(sync.Once)
+	// sendSynced reports to the one reader of synced, at most once. It gives
+	// up when the listener closes, so a send nobody reads cannot block
+	// shutdown.
+	sendSynced := func(err error) {
+		closeOnce.Do(func() {
+			select {
+			case synced <- err:
+			case <-l.quit:
+			}
+		})
+	}
 	paged := true
 
-	lastProgress := time.Now()
+	l.lastProgress.Store(time.Now().UnixNano())
+	l.staleLatched.Store(false)
+	l.listening.Store(true)
 	lastConfirmedBlock := uint64(0)
+
+	l.wg.Add(1)
+	go l.watch(ctx, sendSynced)
 
 	l.wg.Add(1)
 	listenf := safe.RunFunc(l.logger, "postage-listener-func", func() error {
 		defer l.wg.Done()
 		for {
-			// if for whatever reason we are stuck for too long we terminate
-			// this can happen because of rpc errors but also because of a stalled backend node
-			// this does not catch the case were a backend node is actively syncing but not caught up
-			if time.Since(lastProgress) >= l.stallingTimeout {
-				return ErrPostageSyncingStalled
-			}
+			// A stall no longer ends the loop: the watcher marks the batch
+			// store stale and the node stays up in a degraded state (#583).
 
 			select {
 			case <-ctx.Done():
@@ -332,9 +431,11 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 				}
 				l.metrics.BackendErrors.Inc()
 				l.logger.Warning("could not get block number", "error", err)
+				l.setLastErr(err)
 				lastConfirmedBlock = 0
 				continue
 			}
+			l.headOkAt.Store(time.Now().UnixNano())
 
 			if to < l.confirmationDepth {
 				// in a test blockchain there might be not be enough blocks yet
@@ -344,6 +445,11 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 			// consider to-confirmationDepth as the "latest" block we need to sync to
 			to = to - l.confirmationDepth
 			lastConfirmedBlock = to
+			if to >= from {
+				l.behind.Store(int64(to - from))
+			} else {
+				l.behind.Store(0)
+			}
 
 			// round down to the largest multiple of batchFactor
 			to = (to / batchFactor) * batchFactor
@@ -354,11 +460,13 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 			}
 
 			// do some paging (sub-optimal)
+			// A page in the non-paged branch reaches the confirmed head: once
+			// it is applied, the listener is caught up (#583).
+			caughtUpPage := true
 			if to-from >= pageSize {
 				paged = true
+				caughtUpPage = false
 				to = from + pageSize - 1
-			} else {
-				closeOnce.Do(func() { synced <- nil })
 			}
 			l.metrics.BackendCalls.Inc()
 
@@ -371,6 +479,7 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 				}
 				l.metrics.BackendErrors.Inc()
 				l.logger.Warning("could not get blockchain log", "error", err)
+				l.setLastErr(err)
 				lastConfirmedBlock = 0
 				// Wait backoffTime before retrying, as after a failed block
 				// number query; a paged pass would otherwise retry at once.
@@ -384,7 +493,13 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 			}
 
 			from = to + 1
-			lastProgress = time.Now()
+			l.lastProgress.Store(time.Now().UnixNano())
+			if caughtUpPage {
+				// Caught up: the stale state ends only here, not on any
+				// applied page, and the startup wait ends (#583).
+				l.staleLatched.Store(false)
+				sendSynced(nil)
+			}
 			totalTimeMetric(l.metrics.PageProcessDuration, start)
 			l.metrics.PagesProcessed.Inc()
 		}
@@ -398,15 +513,97 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 				l.logger.Debug("shutting down event listener")
 				return
 			}
-			l.logger.Error(err, "failed syncing event listener; shutting down node error")
+			// Only faults that waiting cannot fix end the loop: a failure to
+			// apply events, a broken snapshot, a paused contract (#583).
+			l.logger.Error(err, "postage listener stopped on an error it cannot recover from; shutting down node")
 		}
-		closeOnce.Do(func() { synced <- err })
+		sendSynced(err)
 		if l.syncingStopped != nil {
-			l.syncingStopped.Signal() // trigger shutdown in start.go
+			l.syncingStopped.SignalWithError(err) // trigger shutdown in start.go
 		}
 	}()
 
 	return synced
+}
+
+// watch follows the sync health while the listener runs (#583). It marks the
+// node stale and ends the startup wait when the batch store goes stale, keeps
+// the gauges current, repeats the stale Warning, logs the recovery, and stops
+// the node when postage-stall-shutdown is set and reached.
+func (l *listener) watch(ctx context.Context, sendSynced func(error)) {
+	defer l.wg.Done()
+
+	t := time.NewTicker(l.watchInterval)
+	defer t.Stop()
+
+	var (
+		wasStale bool
+		lastWarn time.Time
+		stopped  bool
+	)
+	for {
+		select {
+		case <-l.quit:
+			return
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+
+		now := time.Now()
+		stale := l.Stale()
+		since := l.SinceProgress()
+		l.metrics.SecondsSinceProgress.Set(since.Seconds())
+
+		switch {
+		case stale && !wasStale:
+			l.staleSince.Store(now.UnixNano())
+			l.metrics.Stale.Set(1)
+			l.warnStale(since)
+			lastWarn = now
+			// At startup the node waits for the listener; a stale batch
+			// store ends that wait, and the node comes up degraded.
+			sendSynced(nil)
+		case stale && now.Sub(lastWarn) >= l.warnRepeat:
+			l.warnStale(since)
+			lastWarn = now
+		case !stale && wasStale:
+			began := time.Unix(0, l.staleSince.Load())
+			l.staleSince.Store(0)
+			l.staleEndedAt.Store(now.UnixNano())
+			l.metrics.Stale.Set(0)
+			l.logger.Info("postage sync caught up", "stale_for", now.Sub(began).Round(time.Second))
+		}
+		wasStale = stale
+
+		l.metrics.BlocksBehind.Set(float64(l.blocksBehind()))
+
+		if stale && !stopped && l.stallShutdown > 0 && now.Sub(time.Unix(0, l.staleSince.Load())) >= l.stallShutdown {
+			stopped = true
+			l.logger.Error(ErrPostageSyncingStalled, "batch store stale for longer than postage-stall-shutdown; shutting down node", "stale_for", l.stallShutdown)
+			if l.syncingStopped != nil {
+				l.syncingStopped.SignalWithError(ErrPostageSyncingStalled)
+			}
+		}
+	}
+}
+
+// blocksBehind returns the confirmed head minus the listener's next block,
+// or -1 while stale when no block number call has succeeded since the stale
+// state began.
+func (l *listener) blocksBehind() int64 {
+	if since := l.staleSince.Load(); since != 0 && l.headOkAt.Load() < since {
+		return -1
+	}
+	return l.behind.Load()
+}
+
+func (l *listener) warnStale(since time.Duration) {
+	l.logger.Warning("postage sync stalled; the node stays up and serves content but does not play the storage lottery until the batch store catches up; chunks of batches not seen yet are held and served, and validated once caught up",
+		"since_progress", since.Round(time.Second),
+		"blocks_behind", l.blocksBehind(),
+		"last_error", l.lastError(),
+	)
 }
 
 func (l *listener) Close() error {
@@ -456,3 +653,5 @@ func totalTimeMetric(metric prometheus.Counter, start time.Time) {
 	totalTime := time.Since(start)
 	metric.Add(float64(totalTime))
 }
+
+var _ postage.SyncHealth = (*listener)(nil)

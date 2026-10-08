@@ -32,6 +32,12 @@ type statusSnapshotResponse struct {
 	LastSyncedBlock         uint64  `json:"lastSyncedBlock"`
 	CommittedDepth          uint8   `json:"committedDepth"`
 	IsWarmingUp             bool    `json:"isWarmingUp"`
+	// PostageSyncStale and PostageSecondsSinceProgress report whether this
+	// node's batch store is stale (#583). Filled for the local node only, and
+	// never part of the status protocol message: a peer's would always read
+	// false.
+	PostageSyncStale            *bool    `json:"postageSyncStale,omitempty"`
+	PostageSecondsSinceProgress *float64 `json:"postageSecondsSinceProgress,omitempty"`
 }
 
 type statusResponse struct {
@@ -77,7 +83,7 @@ func (s *Service) statusGetHandler(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 
-	jsonhttp.OK(w, statusSnapshotResponse{
+	resp := statusSnapshotResponse{
 		Proximity:               256,
 		Overlay:                 s.overlay.String(),
 		BeeMode:                 ss.BeeMode,
@@ -92,7 +98,14 @@ func (s *Service) statusGetHandler(w http.ResponseWriter, _ *http.Request) {
 		LastSyncedBlock:         ss.LastSyncedBlock,
 		CommittedDepth:          uint8(ss.CommittedDepth),
 		IsWarmingUp:             s.isWarmingUp,
-	})
+	}
+	if h := s.postageSyncHealth; h != nil {
+		stale := h.Stale()
+		since := h.SinceProgress().Seconds()
+		resp.PostageSyncStale = &stale
+		resp.PostageSecondsSinceProgress = &since
+	}
+	jsonhttp.OK(w, resp)
 }
 
 // statusGetPeersHandler returns the status of currently connected peers.

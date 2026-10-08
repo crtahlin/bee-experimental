@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/ethersphere/bee/v2/pkg/node"
+	"github.com/ethersphere/bee/v2/pkg/postage/listener"
 )
 
 // TestExitCode is wasp #490.
@@ -48,6 +49,30 @@ func TestExitCode(t *testing.T) {
 			err:  fmt.Errorf("starting node: %w", fmt.Errorf("%w: bad value", node.ErrConfig)),
 			want: exitConfig,
 			why:  "the sentinel must survive wrapping, since NewBee's callers add context",
+		},
+		{
+			name: "postage stall shutdown",
+			err:  fmt.Errorf("node stopped: %w", listener.ErrPostageSyncingStalled),
+			want: exitTempFail,
+			why:  "postage-stall-shutdown reached is a cause that may pass, so a restart is worth trying (#583)",
+		},
+		{
+			name: "postage contract paused at runtime",
+			err:  fmt.Errorf("node stopped: %w", listener.ErrPostagePaused),
+			want: exitTempFail,
+			why:  "a paused contract can be unpaused (#583)",
+		},
+		{
+			name: "postage contract paused at startup",
+			err:  fmt.Errorf("check postage contract: %w", listener.ErrPostagePaused),
+			want: exitTempFail,
+			why:  "the startup check uses the same sentinel, so both paths give one status (#583)",
+		},
+		{
+			name: "postage events could not be applied",
+			err:  fmt.Errorf("node stopped: %w", errors.New("update block number: disk full")),
+			want: 1,
+			why:  "a fault in the node or its data stays a plain failure (#583)",
 		},
 		{
 			name: "any other failure",

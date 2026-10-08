@@ -28,6 +28,11 @@ type metrics struct {
 	// processing durations
 	PageProcessDuration  prometheus.Counter
 	EventProcessDuration prometheus.Counter
+
+	// sync health (#583)
+	Stale                prometheus.Gauge
+	SecondsSinceProgress prometheus.Gauge
+	BlocksBehind         prometheus.Gauge
 }
 
 func newMetrics() metrics {
@@ -110,6 +115,24 @@ func newMetrics() metrics {
 			Subsystem: subsystem,
 			Name:      "event_duration",
 			Help:      "how long it took to process a single event",
+		}),
+		Stale: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "stale",
+			Help:      "1 while the batch store is stale: no page applied for the stall timeout and not caught up since; the node stays up and serves content but does not play the storage lottery",
+		}),
+		SecondsSinceProgress: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "seconds_since_progress",
+			Help:      "seconds since the listener last applied a page",
+		}),
+		BlocksBehind: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "blocks_behind",
+			Help:      "confirmed chain head minus the listener's next block; -1 while unknown, that is, while stale and no block number call has succeeded since",
 		}),
 	}
 }

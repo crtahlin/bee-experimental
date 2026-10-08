@@ -221,6 +221,8 @@ type Service struct {
 	pinIntegrity PinIntegrity
 
 	syncStatus func() (bool, error)
+	// postageSyncHealth reports whether the batch store is stale (#583).
+	postageSyncHealth postage.SyncHealth
 
 	swap        swap.Interface
 	transaction transaction.Service
@@ -300,8 +302,11 @@ type ExtraOptions struct {
 	// LocalIngestEnabled gates POST /wasp/ingest. See issue #326.
 	LocalIngestEnabled bool
 	SyncStatus         func() (bool, error)
-	NodeStatus         *status.Service
-	PinIntegrity       PinIntegrity
+	// PostageSyncHealth reports whether the batch store is stale, for
+	// /status (#583). Nil leaves the fields out.
+	PostageSyncHealth postage.SyncHealth
+	NodeStatus        *status.Service
+	PinIntegrity      PinIntegrity
 }
 
 func New(
@@ -405,6 +410,7 @@ func (s *Service) Configure(signer crypto.Signer, tracer *tracing.Tracer, o Opti
 	s.chainID = chainID
 	s.erc20Service = erc20
 	s.syncStatus = e.SyncStatus
+	s.postageSyncHealth = e.PostageSyncHealth
 
 	s.statusService = e.NodeStatus
 

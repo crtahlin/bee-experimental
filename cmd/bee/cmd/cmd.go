@@ -95,6 +95,7 @@ const (
 	optionNameBlockTime                    = "block-time"
 	optionNameBlockSyncInterval            = "block-sync-interval"
 	optionNamePostageConfirmationDepth     = "postage-confirmation-depth"
+	optionNamePostageStallShutdown         = "postage-stall-shutdown"
 	optionWarmUpTime                       = "warmup-time"
 	optionNameMainNet                      = "mainnet"
 	optionNameRetrievalCaching             = "cache-retrieval"
@@ -430,6 +431,7 @@ func (c *command) setAllFlags(cmd *cobra.Command) {
 	cmd.Flags().Uint64(optionNameBlockTime, 5, "chain block time in seconds; if set, used as is; if unset, the network default is used until the node has measured the chain's block time")
 	cmd.Flags().Uint64(optionNameBlockSyncInterval, 10, "block number cache sync interval in blocks")
 	cmd.Flags().Uint64(optionNamePostageConfirmationDepth, listener.DefaultConfirmationDepth, "blocks behind the chain head that postage events must be before they are applied, from 1 to 64; raising it delays seeing stamp events and pauses postage syncing once by the difference, lowering it risks applying events from blocks that are rolled back")
+	cmd.Flags().Duration(optionNamePostageStallShutdown, 0, "stop the node once its batch store has been stale this long, counted from when it became stale (10 minutes after the last postage page applied); 0 never stops: a stale node stays up, serves content, holds chunks of batches it has not seen yet and sits out storage lottery rounds until it catches up; a duration stops it with exit status 75, which takes a node off the network and adds restart load to a host that may already be overloaded")
 	cmd.Flags().Duration(optionWarmUpTime, time.Minute*5, "maximum node warmup duration; proceeds when stable or after this time")
 	cmd.Flags().Bool(optionNameMainNet, true, "triggers connect to main net bootnodes.")
 	cmd.Flags().Bool(optionNameRetrievalCaching, true, "enable forwarded content caching")
