@@ -5,6 +5,7 @@
 package reserve
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/hex"
@@ -39,6 +40,9 @@ type Reserve struct {
 	capacity int
 	size     atomic.Int64
 	radius   atomic.Uint32
+	// arrivals counts the chunks Put added to the reserve, that is the
+	// increments of size. Eviction paces itself against its rate (#623).
+	arrivals atomic.Uint64
 
 	multx *multex.Multex
 	st    transaction.Storage
@@ -294,8 +298,16 @@ func (r *Reserve) Put(ctx context.Context, chunk swarm.Chunk) error {
 	}
 	if shouldIncReserveSize {
 		r.size.Add(1)
+		r.arrivals.Add(1)
 	}
 	return nil
+}
+
+// Arrivals returns how many chunks Put has added to the reserve since the
+// reserve was opened. It counts only additions that grew the reserve size:
+// not a chunk the reserve already held, and not a stamp-index replacement.
+func (r *Reserve) Arrivals() uint64 {
+	return r.arrivals.Load()
 }
 
 func (r *Reserve) Has(addr swarm.Address, batchID []byte, stampHash []byte) (bool, error) {
@@ -326,14 +338,89 @@ func (r *Reserve) Get(ctx context.Context, addr swarm.Address, batchID []byte, s
 	return ch.WithStamp(stamp), nil
 }
 
-// EvictBatchBin evicts all chunks from bins upto the bin provided.
-// Pinned chunks are protected from eviction to maintain data integrity.
+// EvictionRound is the most items one round of EvictBatchBin reads and
+// deletes. The batch lock is held only for one round, and only one round of
+// items is in memory at a time, whatever the count asked for (wasp #623).
+const EvictionRound = 1000
+
+// evictionRound is EvictionRound, a variable so tests can use small rounds.
+var evictionRound = EvictionRound
+
+// EvictionHooks are the per-round callbacks of EvictBatchBin (wasp #623).
+// The zero value runs every round at full speed on runtime.NumCPU()
+// goroutines.
+type EvictionHooks struct {
+	// Workers returns how many goroutines delete the next round's items.
+	// Nil, or a result below 1, means runtime.NumCPU().
+	Workers func() int
+	// After is called with the batch lock held, right after a round deleted
+	// n items in the duration took.
+	After func(n int, took time.Duration)
+	// Pay is called after the batch lock is released, for a round that
+	// deleted n > 0 items. It may wait. An error ends EvictBatchBin before
+	// the next round and is returned.
+	Pay func(n int) error
+}
+
+// EvictBatchBin evicts the chunks of a batch in bins below the bin provided,
+// up to count chunks, in rounds of at most EvictionRound items. Each round
+// reads and deletes under the batch lock, calls hooks.After, releases the
+// lock, and then calls hooks.Pay. Pinned chunks are protected from eviction
+// to maintain data integrity.
 func (r *Reserve) EvictBatchBin(
 	ctx context.Context,
 	batchID []byte,
 	count int,
 	bin uint8,
+	hooks EvictionHooks,
 ) (int, error) {
+	total := 0
+	var resume string // ID of the last item the previous round read
+	for count > 0 {
+		read, evicted, last, err := r.evictRound(ctx, batchID, min(count, evictionRound), bin, resume, hooks)
+		total += evicted
+		if err != nil {
+			return total, err
+		}
+		if read == 0 {
+			return total, nil
+		}
+		count -= read
+		resume = last
+		if evicted > 0 && hooks.Pay != nil {
+			if err := hooks.Pay(evicted); err != nil {
+				return total, err
+			}
+		}
+		if read < evictionRound {
+			// The batch's entries below bin ended inside this round.
+			return total, nil
+		}
+	}
+	return total, nil
+}
+
+// evictRound reads at most limit items of the batch below bin, starting at
+// the key resume (the first item when resume is empty), and deletes them,
+// all under the batch lock. It returns how many items it read, how many it
+// evicted, and the ID of the last item read.
+//
+// A later round resumes with PrefixAtStart at that ID, so it never walks
+// again over the deletion markers of earlier rounds. Not SkipFirst: the
+// resume key was deleted, so skipping the first result would skip a live
+// item. With PrefixAtStart the store bounds the iteration only by the
+// namespace, so the callback stops when an item belongs to another batch.
+// Reading and deleting stay under one lock: a Put between them could
+// replace an item at the same stamp index, and the delete would then remove
+// the new chunk's data.
+func (r *Reserve) evictRound(
+	ctx context.Context,
+	batchID []byte,
+	limit int,
+	bin uint8,
+	resume string,
+	hooks EvictionHooks,
+) (read, evictedN int, last string, err error) {
 	r.multx.Lock(string(batchID))
 	defer r.multx.Unlock(string(batchID))
 
@@ -342,23 +429,28 @@ func (r *Reserve) EvictBatchBin(
 		pinnedEvictedItems []*BatchRadiusItem
 	)
 
-	if count <= 0 {
-		return 0, nil
-	}
-
 	pinUuids, err := pinstore.GetCollectionUUIDs(r.st.IndexStore())
 	if err != nil {
-		return 0, err
+		return 0, 0, "", err
 	}
 
-	err = r.st.IndexStore().Iterate(storage.Query{
+	q := storage.Query{
 		Factory: func() storage.Item { return &BatchRadiusItem{} },
 		Prefix:  string(batchID),
-	}, func(res storage.Result) (bool, error) {
+	}
+	if resume != "" {
+		q.Prefix = resume
+		q.PrefixAtStart = true
+	}
+
+	count := limit
+	err = r.st.IndexStore().Iterate(q, func(res storage.Result) (bool, error) {
 		batchRadius := res.Entry.(*BatchRadiusItem)
-		if batchRadius.Bin >= bin {
+		if !bytes.Equal(batchRadius.BatchID, batchID) || batchRadius.Bin >= bin {
 			return true, nil
 		}
+		read++
+		last = batchRadius.ID()
 
 		// Check if the chunk is pinned in any collection
 		pinned := false
@@ -384,11 +476,22 @@ func (r *Reserve) EvictBatchBin(
 		return false, nil
 	})
 	if err != nil {
-		return 0, err
+		return 0, 0, "", err
+	}
+	if read == 0 {
+		return 0, 0, "", nil
 	}
 
+	workers := runtime.NumCPU()
+	if hooks.Workers != nil {
+		if w := hooks.Workers(); w >= 1 {
+			workers = w
+		}
+	}
+
+	start := time.Now()
 	eg, ctx := errgroup.WithContext(ctx)
-	eg.SetLimit(runtime.NumCPU())
+	eg.SetLimit(workers)
 
 	var evicted atomic.Int64
 
@@ -424,9 +527,13 @@ func (r *Reserve) EvictBatchBin(
 
 	err = eg.Wait()
 
-	r.size.Add(-evicted.Load())
+	n := evicted.Load()
+	r.size.Add(-n)
+	if hooks.After != nil {
+		hooks.After(int(n), time.Since(start))
+	}
 
-	return int(evicted.Load()), err
+	return read, int(n), last, err
 }
 
 func (r *Reserve) removeChunk(

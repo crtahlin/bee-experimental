@@ -12,3 +12,11 @@ var (
 	ErrMarshalInvalidAddress = errMarshalInvalidAddress
 	ErrUnmarshalInvalidSize  = errUnmarshalInvalidSize
 )
+
+// SetEvictionRound sets the round size of EvictBatchBin for a test and
+// returns a function that restores it.
+func SetEvictionRound(n int) func() {
+	old := evictionRound
+	evictionRound = n
+	return func() { evictionRound = old }
+}

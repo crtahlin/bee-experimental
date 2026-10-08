@@ -311,6 +311,13 @@ func (db *DB) evictExpiredBatches(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if len(batches) > 0 {
+		rate, workers := db.evictionRateAndWorkers()
+		db.logger.Info("evict expired batches start", "batches", len(batches), "rate", rate, "workers", workers)
+	}
+	// Expired batches use the same rounds and limiter as unreserve (#623).
+	// A batch expiry does not interrupt this eviction, as before.
+	hooks := db.evictionHooks(ctx, true, nil)
 
 	for _, batchID := range batches {
 		// wasp #407: stop between batches on shutdown. Close waits five
@@ -324,7 +331,7 @@ func (db *DB) evictExpiredBatches(ctx context.Context) error {
 		default:
 		}
 
-		evicted, err := db.evictBatch(ctx, batchID, math.MaxInt, swarm.MaxBins)
+		evicted, err := db.evictBatch(ctx, batchID, math.MaxInt, swarm.MaxBins, hooks)
 		if err != nil {
 			return err
 		}
@@ -362,6 +369,7 @@ func (db *DB) evictBatch(
 	batchID []byte,
 	evictCount int,
 	upToBin uint8,
+	hooks reserve.EvictionHooks,
 ) (evicted int, err error) {
 	dur := captureDuration(time.Now())
 	defer func() {
@@ -372,11 +380,8 @@ func (db *DB) evictBatch(
 		} else {
 			db.metrics.MethodCalls.WithLabelValues("reserve", "EvictBatch", "failure").Inc()
 		}
-		if upToBin == swarm.MaxBins {
-			db.metrics.ExpiredChunkCount.Add(float64(evicted))
-		} else {
-			db.metrics.EvictedChunkCount.Add(float64(evicted))
-		}
+		// The evicted and expired counters are updated after each round,
+		// in hooks.After (#623).
 		db.logger.Debug(
 			"reserve eviction",
 			"uptoBin", upToBin,
@@ -386,7 +391,7 @@ func (db *DB) evictBatch(
 		)
 	}()
 
-	return db.reserve.EvictBatchBin(ctx, batchID, evictCount, upToBin)
+	return db.reserve.EvictBatchBin(ctx, batchID, evictCount, upToBin, hooks)
 }
 
 // EvictBatch evicts all chunks belonging to a batch from the reserve.
@@ -499,10 +504,13 @@ func (db *DB) unreserve(ctx context.Context) (err error) {
 		return nil
 	}
 
-	db.logger.Info("unreserve start", "target", target, "radius", radius)
+	rate, workers := db.evictionRateAndWorkers()
+	db.logger.Info("unreserve start", "target", target, "radius", radius, "rate", rate, "workers", workers)
 
 	batchExpiry, unsub := db.events.Subscribe(batchExpiry)
 	defer unsub()
+
+	hooks := db.evictionHooks(ctx, false, batchExpiry)
 
 	totalEvicted := 0
 
@@ -535,10 +543,17 @@ func (db *DB) unreserve(ctx context.Context) (err error) {
 				// evict at least a min count
 				int(db.reserveOptions.minEvictCount))
 
-			binEvicted, err := db.evictBatch(ctx, b, evict, radius)
+			binEvicted, err := db.evictBatch(ctx, b, evict, radius, hooks)
 			// eviction happens in batches, so we need to keep track of the total
 			// number of chunks evicted even if there was an error
 			totalEvicted += binEvicted
+
+			// A paced wait ends early on shutdown or a batch expiry, with
+			// the same outcome as the checks between batches above (#623).
+			if errors.Is(err, errEvictionExpiry) {
+				db.logger.Debug("stopping unreserve, received batch expiration signal")
+				return nil
+			}
 
 			// we can only get error here for critical cases, for eg. batch commit
 			// error, which is not recoverable

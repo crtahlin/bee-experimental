@@ -563,7 +563,7 @@ func TestEvict(t *testing.T) {
 
 		totalEvicted := 0
 		for i := range 3 {
-			evicted, err := r.EvictBatchBin(context.Background(), evictBatch.ID, math.MaxInt, uint8(i))
+			evicted, err := r.EvictBatchBin(context.Background(), evictBatch.ID, math.MaxInt, uint8(i), reserve.EvictionHooks{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -645,7 +645,7 @@ func TestEvictSOC(t *testing.T) {
 		checkChunk(t, ts, ch, false)
 	}
 
-	_, err = r.EvictBatchBin(context.Background(), batch.ID, 1, swarm.MaxBins)
+	_, err = r.EvictBatchBin(context.Background(), batch.ID, 1, swarm.MaxBins, reserve.EvictionHooks{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -653,7 +653,7 @@ func TestEvictSOC(t *testing.T) {
 		t.Fatal("same address chunk should still persist, eg refCnt > 0")
 	}
 
-	evicted, err := r.EvictBatchBin(context.Background(), batch.ID, 10, swarm.MaxBins)
+	evicted, err := r.EvictBatchBin(context.Background(), batch.ID, 10, swarm.MaxBins, reserve.EvictionHooks{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -704,7 +704,7 @@ func TestEvictMaxCount(t *testing.T) {
 		}
 	}
 
-	evicted, err := r.EvictBatchBin(context.Background(), batch.ID, 10, 1)
+	evicted, err := r.EvictBatchBin(context.Background(), batch.ID, 10, 1, reserve.EvictionHooks{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1031,7 +1031,7 @@ func TestEvictRemovesPinnedContent(t *testing.T) {
 	}
 
 	// evict all chunks from this batch - this should NOT remove pinned chunks
-	evicted, err := r.EvictBatchBin(ctx, batch.ID, numChunks, swarm.MaxBins)
+	evicted, err := r.EvictBatchBin(ctx, batch.ID, numChunks, swarm.MaxBins, reserve.EvictionHooks{})
 	if err != nil {
 		t.Fatal(err)
 	}

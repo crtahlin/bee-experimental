@@ -674,7 +674,12 @@ type Options struct {
 	SamplerSortWindow int
 	// ReserveHasConcurrency bounds how many ReserveHas lookups may run at
 	// once. Zero leaves them unbounded, which is the previous behaviour.
-	ReserveHasConcurrency   int
+	ReserveHasConcurrency int
+	// ReserveEvictionRate is the most chunks per second reserve eviction
+	// deletes, raised to the rate at which chunks arrive when that is
+	// higher. Zero means no limit and runtime.NumCPU() goroutines, the
+	// previous behaviour apart from eviction working in rounds (#623).
+	ReserveEvictionRate     int
 	ReserveMinEvictCount    uint64
 	ReserveCapacityDoubling int
 
@@ -764,6 +769,9 @@ type DB struct {
 	// reserveHasLimiter bounds concurrent ReserveHas lookups. Nil when
 	// unbounded, which is the default.
 	reserveHasLimiter chan struct{}
+	// evictionPacer paces reserve eviction. Nil when reserve-eviction-rate
+	// is 0, which is the default (#623).
+	evictionPacer *evictionPacer
 
 	// samplingInProgress is set while ReserveSample runs, so the puller can
 	// pause pulling and leave the store quiet for the sample. See issue #23.
@@ -968,6 +976,16 @@ func New(ctx context.Context, dirPath string, opts *Options) (*DB, error) {
 			return nil, err
 		}
 		db.reserve = rs
+
+		if opts.ReserveEvictionRate < 0 {
+			return nil, fmt.Errorf("reserve eviction rate %d: must be 0 or more", opts.ReserveEvictionRate)
+		}
+		if p := newEvictionPacer(opts.ReserveEvictionRate, rs.Arrivals); p != nil {
+			p.setWorkers = func(n int) { db.metrics.ReserveEvictionWorkers.Set(float64(n)) }
+			p.setArrivalRate = db.metrics.ReserveArrivalRate.Set
+			db.metrics.ReserveEvictionWorkers.Set(float64(p.Workers()))
+			db.evictionPacer = p
+		}
 
 		db.metrics.StorageRadius.Set(float64(rs.Radius()))
 		db.metrics.ReserveSize.Set(float64(rs.Size()))
