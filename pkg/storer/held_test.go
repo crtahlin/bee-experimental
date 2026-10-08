@@ -28,9 +28,22 @@ import (
 type knownBatches struct {
 	mu    sync.Mutex
 	known map[string]bool
+	// transient makes the next n answers for a batch a read error, or
+	// every answer when n is negative.
+	transient map[string]int
 }
 
-func newKnownBatches() *knownBatches { return &knownBatches{known: map[string]bool{}} }
+var errBatchRead = errors.New("batchstore: read error")
+
+func newKnownBatches() *knownBatches {
+	return &knownBatches{known: map[string]bool{}, transient: map[string]int{}}
+}
+
+func (k *knownBatches) failReads(id []byte, n int) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.transient[string(id)] = n
+}
 
 func (k *knownBatches) add(id []byte) {
 	k.mu.Lock()
@@ -41,7 +54,14 @@ func (k *knownBatches) add(id []byte) {
 func (k *knownBatches) validate(ch swarm.Chunk) (swarm.Chunk, error) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	if !k.known[string(ch.Stamp().BatchID())] {
+	id := string(ch.Stamp().BatchID())
+	if n := k.transient[id]; n != 0 {
+		if n > 0 {
+			k.transient[id] = n - 1
+		}
+		return nil, errBatchRead
+	}
+	if !k.known[id] {
 		return nil, fmt.Errorf("batchstore get: %w, %w", storage.ErrNotFound, postage.ErrNotFound)
 	}
 	return ch, nil
@@ -149,7 +169,7 @@ func TestHeldRoomPerAddress(t *testing.T) {
 	f.hold(t, ch)
 
 	var wg sync.WaitGroup
-	for range 8 {
+	for range 7 { // with the first, the 8 entries one address may have
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -166,7 +186,7 @@ func TestHeldRoomPerAddress(t *testing.T) {
 }
 
 // TestHeldAreaFull checks that a full held area refuses new addresses with
-// ErrHeldAreaFull, keeps what it holds, and reports full so pulling pauses.
+// ErrHeldAreaFull, keeps what it holds, and reports full.
 func TestHeldAreaFull(t *testing.T) {
 	defer storer.SetHeldLimits(2, time.Hour, 1000, time.Millisecond)()
 
@@ -449,5 +469,83 @@ func TestHeldRequiresContentAddress(t *testing.T) {
 	}
 	if _, err := f.db.Lookup().Get(context.Background(), genuine.Address()); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("chunk store has data for the address: %v", err)
+	}
+}
+
+// TestHeldErrorDoesNotBlockValidation checks that an entry whose validation
+// keeps failing does not stop later entries from being validated, and is
+// dropped after a bounded number of passes (#583).
+func TestHeldErrorDoesNotBlockValidation(t *testing.T) {
+	defer storer.SetHeldLimits(100, 10*time.Millisecond, 1, time.Millisecond)()
+
+	f := newHeldFixture(t, "")
+	stuck, stuckBatch := f.unknownChunk(t)
+	good, goodBatch := f.unknownChunk(t)
+	f.hold(t, stuck)
+	f.hold(t, good)
+
+	f.batches.add(stuckBatch)
+	f.batches.failReads(stuckBatch, -1)
+	f.batches.add(goodBatch)
+	f.catchUp()
+
+	goodHash, _ := good.Stamp().Hash()
+	if err := spinlock.Wait(5*time.Second, func() bool {
+		has, _ := f.db.ReserveHas(good.Address(), goodBatch, goodHash)
+		return has
+	}); err != nil {
+		t.Fatal("entry after a failing one was not promoted")
+	}
+	if err := spinlock.Wait(5*time.Second, func() bool { return f.db.HeldCount() == 0 }); err != nil {
+		t.Fatalf("held count %d, want 0: the failing entry was not dropped", f.db.HeldCount())
+	}
+	stuckHash, _ := stuck.Stamp().Hash()
+	if has, _ := f.db.ReserveHas(stuck.Address(), stuckBatch, stuckHash); has {
+		t.Fatal("entry whose batch could not be read was promoted")
+	}
+}
+
+// TestHeldTransientErrorRetried checks that a batch-store read error leaves
+// the entry for a later pass instead of dropping it, so it is promoted once
+// the batch store answers (#583).
+func TestHeldTransientErrorRetried(t *testing.T) {
+	defer storer.SetHeldLimits(100, 10*time.Millisecond, 1000, time.Millisecond)()
+
+	f := newHeldFixture(t, "")
+	ch, batch := f.unknownChunk(t)
+	f.hold(t, ch)
+
+	f.batches.add(batch)
+	f.batches.failReads(batch, 2)
+	f.catchUp()
+
+	if err := spinlock.Wait(5*time.Second, func() bool { return f.db.HeldCount() == 0 }); err != nil {
+		t.Fatalf("held count %d after catch-up, want 0", f.db.HeldCount())
+	}
+	hash, _ := ch.Stamp().Hash()
+	if has, err := f.db.ReserveHas(ch.Address(), batch, hash); err != nil || !has {
+		t.Fatalf("chunk not promoted after transient errors: has %v, error %v", has, err)
+	}
+}
+
+// TestHeldPerAddressCap checks that one address keeps at most 8 held
+// entries; a further stamp for it is not held (#583).
+func TestHeldPerAddressCap(t *testing.T) {
+	defer storer.SetHeldLimits(100, time.Hour, 1000, time.Millisecond)()
+
+	f := newHeldFixture(t, "")
+	base := chunk.GenerateValidRandomChunkAt(t, f.base, 0)
+	stamped := func() swarm.Chunk {
+		return swarm.NewChunk(base.Address(), base.Data()).WithStamp(postagetesting.MustNewBatchStamp(postagetesting.MustNewID()))
+	}
+	for range 8 {
+		f.hold(t, stamped())
+	}
+	held, err := f.db.HoldUnvalidated(context.Background(), stamped(), errUnknownBatch)
+	if err != nil || held {
+		t.Fatalf("ninth stamp: held %v, error %v; want not held, nil", held, err)
+	}
+	if n := f.db.HeldCount(); n != 1 {
+		t.Fatalf("held count %d, want 1", n)
 	}
 }

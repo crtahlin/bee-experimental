@@ -43,6 +43,7 @@ type metrics struct {
 	HeldPromoted                  prometheus.Counter
 	HeldDropped                   prometheus.Counter
 	HeldValidationSeconds         prometheus.Gauge
+	HeldValidationErrors          prometheus.Counter
 }
 
 // newMetrics is a convenient constructor for creating new metrics.
@@ -149,6 +150,14 @@ func newMetrics() metrics {
 				Subsystem: "postage",
 				Name:      "held_validation_seconds",
 				Help:      "Duration of the last validation pass that emptied the held area (#583).",
+			},
+		),
+		HeldValidationErrors: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Namespace: m.Namespace,
+				Subsystem: "postage",
+				Name:      "held_validation_errors",
+				Help:      "Held chunks whose validation hit an error and was left for a later pass (#583).",
 			},
 		),
 		CacheSize: prometheus.NewGauge(

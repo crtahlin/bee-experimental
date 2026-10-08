@@ -51,6 +51,21 @@ var (
 	heldRoundPause = 100 * time.Millisecond
 )
 
+const (
+	// heldPerAddress bounds the held entries for one address, one per
+	// stamp, so many fake stamps for one chunk cannot fill the index.
+	heldPerAddress = 8
+	// heldMaxFailures is how many validation passes may end in an error
+	// for one held entry before it is dropped, so a persistent error does
+	// not keep the held area occupied and the lottery off for ever.
+	heldMaxFailures = 3
+)
+
+// errHeldChunkRead marks a held chunk whose data the chunk store could not
+// read. Such an entry is dropped at once: retrying a damaged read does not
+// help.
+var errHeldChunkRead = errors.New("storer: read held chunk")
+
 // heldState is the held area's accounting. The count of distinct addresses
 // lives in memory and is rebuilt at startup from the index.
 type heldState struct {
@@ -69,11 +84,15 @@ type heldState struct {
 	mu         sync.Mutex
 	addrs      uint64
 	warnedFull bool
+	// failures counts, per held entry ID, the validation passes that ended
+	// in an error for it.
+	failures map[string]int
 }
 
 func newHeldState() *heldState {
 	return &heldState{
 		addrLock:   multex.New(),
+		failures:   make(map[string]int),
 		max:        heldChunksMax,
 		check:      heldCheckInterval,
 		round:      heldRound,
@@ -105,6 +124,21 @@ func (h *heldState) count() uint64 {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.addrs
+}
+
+// failed records a validation error for the entry and returns how many
+// passes have now failed for it.
+func (h *heldState) failed(id string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.failures[id]++
+	return h.failures[id]
+}
+
+func (h *heldState) forget(id string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.failures, id)
 }
 
 // warnFull reports whether the full-area Warning is due: once until room is
@@ -168,15 +202,19 @@ func (db *DB) HoldUnvalidated(ctx context.Context, ch swarm.Chunk, cause error) 
 		return true, nil
 	}
 
-	addrHeld, err := db.addressHeld(addr)
+	entries, err := db.heldEntries(addr, heldPerAddress)
 	if err != nil {
 		return false, fmt.Errorf("held index: %w", err)
 	}
+	if entries >= heldPerAddress {
+		// The chunk's data is held already; this stamp is not kept.
+		return false, nil
+	}
 	claimed := false
-	if !addrHeld {
+	if entries == 0 {
 		if !db.held.claim() {
 			if db.held.warnFull() {
-				db.logger.Warning("held area for chunks of batches not seen yet is full; new ones are refused and pulling pauses until the batch store catches up",
+				db.logger.Warning("held area for chunks of batches not seen yet is full; new ones are refused until the batch store catches up and they are validated",
 					"held_addresses", db.held.count(), "max", db.held.max)
 			}
 			return false, postage.ErrHeldAreaFull
@@ -225,17 +263,23 @@ func (db *DB) postageCaughtUp() bool {
 
 // addressHeld reports whether any held entry exists for addr.
 func (db *DB) addressHeld(addr swarm.Address) (bool, error) {
-	found := false
+	n, err := db.heldEntries(addr, 1)
+	return n > 0, err
+}
+
+// heldEntries counts the held entries for addr, stopping at limit.
+func (db *DB) heldEntries(addr swarm.Address, limit int) (int, error) {
+	n := 0
 	err := db.storage.IndexStore().Iterate(storage.Query{
 		Factory:       func() storage.Item { return new(heldItem) },
 		Prefix:        addr.ByteString(),
 		ItemProperty:  storage.QueryItemID,
 		PrefixAtStart: false,
 	}, func(storage.Result) (bool, error) {
-		found = true
-		return true, nil
+		n++
+		return n >= limit, nil
 	})
-	return found, err
+	return n, err
 }
 
 // rebuildHeldCount counts the distinct held addresses at startup.
@@ -303,17 +347,26 @@ func (db *DB) heldValidator(ctx context.Context) {
 	}
 }
 
-// validateHeld processes the held index in rounds, with a pause between them,
-// for as long as the batch store stays caught up.
+// validateHeld makes one pass over the held index in rounds, with a pause
+// between them, for as long as the batch store stays caught up. An entry
+// whose validation fails is counted and left for a later pass, and the pass
+// goes on past it; after heldMaxFailures passes, or at once when its chunk
+// cannot be read, the entry is dropped.
 func (db *DB) validateHeld(ctx context.Context) error {
+	after := ""
 	for {
 		if !db.postageCaughtUp() {
 			return nil
 		}
 		batch := make([]*heldItem, 0, db.held.round)
 		err := db.storage.IndexStore().Iterate(storage.Query{
-			Factory: func() storage.Item { return new(heldItem) },
+			Factory:       func() storage.Item { return new(heldItem) },
+			Prefix:        after,
+			PrefixAtStart: after != "",
 		}, func(r storage.Result) (bool, error) {
+			if after != "" && r.ID <= after {
+				return false, nil
+			}
 			batch = append(batch, r.Entry.(*heldItem).Clone().(*heldItem))
 			return len(batch) >= db.held.round, nil
 		})
@@ -324,10 +377,19 @@ func (db *DB) validateHeld(ctx context.Context) error {
 			return nil
 		}
 		for _, item := range batch {
-			if err := db.validateHeldItem(ctx, item); err != nil {
+			err := db.validateHeldItem(ctx, item)
+			if err == nil {
+				continue
+			}
+			if errors.Is(err, context.Canceled) || errors.Is(err, ErrDBQuit) {
 				return err
 			}
+			db.heldItemFailed(ctx, item, err)
 		}
+		if len(batch) < db.held.round {
+			return nil
+		}
+		after = batch[len(batch)-1].ID()
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -355,13 +417,19 @@ func (db *DB) validateHeldItem(ctx context.Context, item *heldItem) error {
 		return db.dropHeld(ctx, item, false)
 	}
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %w", errHeldChunkRead, err)
 	}
 
 	stamp := new(postage.Stamp)
 	promote := false
 	if stamp.UnmarshalBinary(item.Stamp) == nil {
 		valid, verr := db.validStamp(swarm.NewChunk(ch.Address(), ch.Data()).WithStamp(stamp))
+		if verr != nil && !stampRejected(verr) {
+			// The batch store could not answer, for example on a read
+			// error: try again in a later pass rather than drop a chunk
+			// that may be valid.
+			return fmt.Errorf("validate held stamp: %w", verr)
+		}
 		if verr == nil && db.IsWithinStorageRadius(item.Addr) {
 			if perr := db.ReservePutter().Put(ctx, valid); perr == nil {
 				promote = true
@@ -381,6 +449,42 @@ func (db *DB) validateHeldItem(ctx context.Context, item *heldItem) error {
 	return nil
 }
 
+// stampRejected reports whether a stamp validation error is a verdict on the
+// stamp, as opposed to the batch store failing to answer.
+func stampRejected(err error) bool {
+	for _, e := range []error{
+		postage.ErrNotFound, postage.ErrOwnerMismatch, postage.ErrInvalidIndex,
+		postage.ErrBucketMismatch, postage.ErrStampInvalid, postage.ErrInvalidBatchID,
+		postage.ErrInvalidBatchIndex, postage.ErrInvalidBatchTimestamp, postage.ErrInvalidBatchSignature,
+	} {
+		if errors.Is(err, e) {
+			return true
+		}
+	}
+	return false
+}
+
+// heldItemFailed counts a failed validation of item, and drops the entry
+// once it has failed heldMaxFailures passes, or at once when its chunk could
+// not be read.
+func (db *DB) heldItemFailed(ctx context.Context, item *heldItem, cause error) {
+	db.metrics.HeldValidationErrors.Inc()
+	n := db.held.failed(item.ID())
+	if n < heldMaxFailures && !errors.Is(cause, errHeldChunkRead) {
+		db.logger.Debug("held chunk: validation left for a later pass", "chunk_address", item.Addr, "passes", n, "error", cause)
+		return
+	}
+	key := item.Addr.ByteString()
+	db.held.addrLock.Lock(key)
+	defer db.held.addrLock.Unlock(key)
+	if err := db.dropHeld(ctx, item, true); err != nil {
+		db.logger.Warning("held chunk: drop after repeated validation errors", "chunk_address", item.Addr, "error", err)
+		return
+	}
+	db.metrics.HeldDropped.Inc()
+	db.logger.Warning("held chunk dropped after validation errors", "chunk_address", item.Addr, "passes", n, "error", cause)
+}
+
 // dropHeld deletes a held entry, and its chunk-store reference when it still
 // has one, in one transaction, and releases the address's room when this was
 // its last entry. Called with the address lock held.
@@ -397,6 +501,7 @@ func (db *DB) dropHeld(ctx context.Context, item *heldItem, hasRef bool) error {
 	if err != nil {
 		return fmt.Errorf("drop held chunk: %w", err)
 	}
+	db.held.forget(item.ID())
 	still, err := db.addressHeld(item.Addr)
 	if err != nil {
 		return err
