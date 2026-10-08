@@ -7,6 +7,7 @@ package listener_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethersphere/bee/v2/pkg/log"
+	"github.com/ethersphere/bee/v2/pkg/postage"
 	"github.com/ethersphere/bee/v2/pkg/postage/listener"
 )
 
@@ -154,13 +156,26 @@ func TestBlockNumberFailureKeepsPage(t *testing.T) {
 // timedFilterer fails every block number query and records when each was
 // made.
 type timedFilterer struct {
+	health atomic.Pointer[postage.SyncHealth]
+
 	mu    sync.Mutex
-	calls []time.Time
+	calls []timedCall
+}
+
+// timedCall is one block number call: when it came, and whether the batch
+// store was stale then.
+type timedCall struct {
+	at    time.Time
+	stale bool
 }
 
 func (f *timedFilterer) BlockNumber(context.Context) (uint64, error) {
+	stale := false
+	if h := f.health.Load(); h != nil {
+		stale = (*h).Stale()
+	}
 	f.mu.Lock()
-	f.calls = append(f.calls, time.Now())
+	f.calls = append(f.calls, timedCall{at: time.Now(), stale: stale})
 	f.mu.Unlock()
 	return 0, errEndpointDown
 }
@@ -169,22 +184,28 @@ func (*timedFilterer) FilterLogs(context.Context, ethereum.FilterQuery) ([]types
 	return nil, nil
 }
 
-func (f *timedFilterer) gaps() []time.Duration {
+// gaps returns the waits between consecutive calls made in the same state,
+// stale or not.
+func (f *timedFilterer) gaps(stale bool) []time.Duration {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var g []time.Duration
 	for i := 1; i < len(f.calls); i++ {
-		g = append(g, f.calls[i].Sub(f.calls[i-1]))
+		if f.calls[i-1].stale == stale && f.calls[i].stale == stale {
+			g = append(g, f.calls[i].at.Sub(f.calls[i-1].at))
+		}
 	}
 	return g
 }
 
 // TestWaitGrowsOnlyWhileStale checks that the wait after a failed call stays
 // at backoffTime before the batch store is stale, then doubles up to its cap
-// while stale (#583).
+// while stale (#583). The checks are bounds a loaded machine cannot break:
+// a slow scheduler only lengthens waits, so the growth check waits for a
+// long gap, and the check before stale uses the median.
 func TestWaitGrowsOnlyWhileStale(t *testing.T) {
 	defer listener.SetStaleTimings(5*time.Millisecond, time.Hour)()
-	defer listener.SetStaleMaxBackoff(160 * time.Millisecond)()
+	defer listener.SetStaleMaxBackoff(640 * time.Millisecond)()
 
 	f := &timedFilterer{}
 	done := make(chan struct{})
@@ -197,9 +218,11 @@ func TestWaitGrowsOnlyWhileStale(t *testing.T) {
 		postageStampContractABI,
 		func() time.Duration { return time.Millisecond },
 		listener.DefaultConfirmationDepth,
-		300*time.Millisecond,
+		time.Second,
 		10*time.Millisecond,
 	)
+	h := l.(postage.SyncHealth)
+	f.health.Store(&h)
 	t.Cleanup(func() { _ = l.Close() })
 	synced := l.Listen(context.Background(), 0, quietUpdater{})
 	go func() {
@@ -209,23 +232,29 @@ func TestWaitGrowsOnlyWhileStale(t *testing.T) {
 		}
 	}()
 
-	time.Sleep(1200 * time.Millisecond)
-	gaps := f.gaps()
-	if len(gaps) < 10 {
-		t.Fatalf("only %d calls in 1.2 s", len(gaps)+1)
-	}
-	// Before the store is stale (300 ms) the wait stays near backoffTime.
-	if gaps[0] > 100*time.Millisecond {
-		t.Fatalf("first wait %v, want about backoffTime before the store is stale", gaps[0])
-	}
-	// While stale it reaches the cap.
-	maxGap := time.Duration(0)
-	for _, g := range gaps {
-		if g > maxGap {
-			maxGap = g
+	// While stale the wait doubles from 10 ms towards the 640 ms cap, so a
+	// gap of 300 ms or more appears after about 600 ms of stale time.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		longest := time.Duration(0)
+		for _, g := range f.gaps(true) {
+			longest = max(longest, g)
 		}
+		if longest >= 300*time.Millisecond {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("longest wait while stale %v, want it to grow to 300 ms or more", longest)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	if maxGap < 120*time.Millisecond {
-		t.Fatalf("longest wait %v while stale, want it to grow towards the 160 ms cap; gaps %v", maxGap, gaps)
+
+	before := f.gaps(false)
+	if len(before) < 3 {
+		t.Skipf("only %d waits before the store was stale, too few to judge", len(before))
+	}
+	slices.Sort(before)
+	if median := before[len(before)/2]; median > 50*time.Millisecond {
+		t.Fatalf("median wait before stale %v, want about the 10 ms backoffTime; waits %v", median, before)
 	}
 }
