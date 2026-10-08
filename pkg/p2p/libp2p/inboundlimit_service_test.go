@@ -199,23 +199,27 @@ func TestInboundLimitServiceHourlyPass(t *testing.T) {
 			InboundConnectionLimitSet: true,
 		}), clock.Now),
 	})
-	sd, _ := newService(t, 1, libp2pServiceOpts{libp2pOpts: libp2p.Options{FullNode: true}})
-	if _, err := sd.Connect(context.Background(), serviceUnderlayAddress(t, s)); err != nil {
+	// An outbound connect records the full peer before it returns. The
+	// checks count the known addresses rather than naming one, because
+	// the connection can use IPv4 or IPv6 loopback, which have different
+	// keys: the test once named 127.0.0.1 and failed on runners that
+	// dialled ::1.
+	target, _ := newService(t, 1, libp2pServiceOpts{libp2pOpts: libp2p.Options{FullNode: true}})
+	if _, err := s.Connect(context.Background(), serviceUnderlayAddress(t, target)); err != nil {
 		t.Fatal(err)
 	}
-	loopback := mustAddr(t, "/ip4/127.0.0.1/tcp/1634")
-	if err := spinlock.Wait(5*time.Second, func() bool { return s.KnownFullContains(loopback) }); err != nil {
-		t.Fatal("connected full peer not recorded")
+	if got := s.KnownFullLive(); got != 1 {
+		t.Fatalf("got %d known full peers after connecting one, want 1", got)
 	}
 
 	clock.Add(libp2p.KnownFullPeerTTL - time.Hour)
 	s.RefreshConnectedFullPeers()
 	clock.Add(2 * time.Hour)
-	if !s.KnownFullContains(loopback) {
+	if got := s.KnownFullLive(); got != 1 {
 		t.Fatal("connected full peer expired despite the hourly pass")
 	}
 	clock.Add(libp2p.KnownFullPeerTTL)
-	if s.KnownFullContains(loopback) {
+	if got := s.KnownFullLive(); got != 0 {
 		t.Fatal("full peer still known 24 hours after its last pass")
 	}
 }

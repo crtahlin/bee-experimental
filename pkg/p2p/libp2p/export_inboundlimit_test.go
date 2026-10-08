@@ -101,11 +101,16 @@ func WithClock(o Options, now func() time.Time) Options {
 	return o
 }
 
-// KnownFullContains reports whether the address counts as a known full
-// peer's.
-func (s *Service) KnownFullContains(m ma.Multiaddr) bool {
-	key, ok := addressKey(m)
-	return ok && s.knownFull.contains(key)
+// KnownFullLive returns how many known full peer addresses are still
+// within the expiry, whatever their address family.
+func (s *Service) KnownFullLive() int {
+	n := 0
+	for _, key := range s.knownFull.cache.Keys() {
+		if s.knownFull.contains(key) {
+			n++
+		}
+	}
+	return n
 }
 
 // RefreshConnectedFullPeers runs one hourly pass.
