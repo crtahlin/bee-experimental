@@ -1253,6 +1253,12 @@ components:
         isWarmingUp:
           type: boolean
           description: Whether the node is still warming up and not yet fully operational.
+        postageSyncStale:
+          type: boolean
+          description: Whether this node's batch store is stale, because the postage listener has applied no page for the stall timeout or has not caught up since. Only in the local node's snapshot.
+        postageSecondsSinceProgress:
+          type: number
+          description: Seconds since the postage listener last applied a page. Only in the local node's snapshot.
 
     StatusPeersResponse:
       type: object

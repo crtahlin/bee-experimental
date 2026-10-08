@@ -13,6 +13,14 @@
 // serving (#583). Losing every endpoint still leaves it degraded until one
 // answers again.
 //
+// Each attempt gets the caller's remaining time divided by the connected
+// endpoints still to try, at least 10 s, and a call does not move on once
+// the caller's own deadline has passed. So a caller whose deadline is under
+// about 20 s, such as a 5 s cheque emission, gives its whole deadline to the
+// active endpoint and does not fail over from one that hangs; it fails over
+// only from one whose connection fails. The postage listener's calls
+// and the storage-incentives agent's are long enough to move on (#583).
+//
 // Per-call routing is enough because every chain call bee makes is
 // request/response: transaction.Backend embeds backend.Geth, which is sixteen
 // methods with no subscriptions — FilterLogs polls. There is no streaming state
