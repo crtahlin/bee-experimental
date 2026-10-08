@@ -181,6 +181,48 @@ func TestEvictRoundsResume(t *testing.T) {
 	}
 }
 
+// TestEvictRoundsBatchBoundary checks, on every index engine, that a round
+// stops at the end of the batch when nothing at or above the bin follows
+// it: the next batch's entries, which sort right after, must not be read.
+// This is the case of an expired batch (bin swarm.MaxBins), or of a batch
+// with chunks only below the bin.
+func TestEvictRoundsBatchBoundary(t *testing.T) {
+	defer reserve.SetEvictionRound(3)()
+
+	for name, newStorage := range engines(t) {
+		t.Run(name, func(t *testing.T) {
+			baseAddr := swarm.RandAddress(t)
+			st := newStorage(t)
+			r, err := reserve.New(baseAddr, st, 0, kademlia.NewTopologyDriver(), log.Noop)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, target, after := batchIDs()
+			for _, id := range [][]byte{target, after} {
+				for b := range 3 {
+					for range 4 {
+						ch := chunk.GenerateTestRandomChunkAt(t, baseAddr, b).WithStamp(postagetesting.MustNewBatchStamp(id))
+						if err := r.Put(context.Background(), ch); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+			}
+
+			evicted, err := r.EvictBatchBin(context.Background(), target, math.MaxInt, swarm.MaxBins, reserve.EvictionHooks{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if evicted != 12 {
+				t.Fatalf("evicted %d, want the target batch's 12", evicted)
+			}
+			if got := countRadiusItems(t, st); got != 12 {
+				t.Fatalf("%d items left, want the next batch's 12", got)
+			}
+		})
+	}
+}
+
 // TestEvictRoundsCount checks that a count smaller than the batch's
 // entries is honoured across rounds.
 func TestEvictRoundsCount(t *testing.T) {

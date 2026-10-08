@@ -87,13 +87,16 @@ func TestEvictionPacerWaitEndsEarly(t *testing.T) {
 				time.Sleep(50 * time.Millisecond)
 				tc.fire(quit, expiry, cancel)
 			}()
-			start := time.Now()
-			err := p.wait(ctx, 100, quit, expiry)
-			if !errors.Is(err, tc.want) {
-				t.Fatalf("got %v, want %v", err, tc.want)
-			}
-			if d := time.Since(start); d > 5*time.Second {
-				t.Fatalf("wait took %v, want it to end on the signal", d)
+			done := make(chan error, 1)
+			go func() { done <- p.wait(ctx, 100, quit, expiry) }()
+			select {
+			case err := <-done:
+				if !errors.Is(err, tc.want) {
+					t.Fatalf("got %v, want %v", err, tc.want)
+				}
+			case <-time.After(5 * time.Second):
+				// The wait would last 100 s at 1 per second.
+				t.Fatal("the wait did not end on the signal")
 			}
 		})
 	}
