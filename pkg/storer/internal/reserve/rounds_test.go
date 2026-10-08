@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"slices"
 	"testing"
 	"time"
 
@@ -223,6 +224,97 @@ func TestEvictRoundsBatchBoundary(t *testing.T) {
 	}
 }
 
+// recordingIndexStore records the queries of BatchRadiusItem iterations
+// and how many results each one handed to its callback.
+type recordingIndexStore struct {
+	storage.IndexStore
+	queries   []storage.Query
+	callbacks []int
+}
+
+func (s *recordingIndexStore) Iterate(q storage.Query, fn storage.IterateFn) error {
+	if _, ok := q.Factory().(*reserve.BatchRadiusItem); !ok {
+		return s.IndexStore.Iterate(q, fn)
+	}
+	s.queries = append(s.queries, q)
+	s.callbacks = append(s.callbacks, 0)
+	i := len(s.callbacks) - 1
+	return s.IndexStore.Iterate(q, func(r storage.Result) (bool, error) {
+		s.callbacks[i]++
+		return fn(r)
+	})
+}
+
+// TestEvictRoundsResumeQueries checks, on every index engine, that each
+// round after the first resumes at the last item the previous round read
+// (PrefixAtStart from that item's ID), so it does not walk again over the
+// entries earlier rounds deleted, and that no round reads more than one
+// round of items plus the one that ends it.
+func TestEvictRoundsResumeQueries(t *testing.T) {
+	defer reserve.SetEvictionRound(3)()
+	defer reserve.SetEvictionYield(0)()
+
+	for name, newStorage := range engines(t) {
+		t.Run(name, func(t *testing.T) {
+			baseAddr := swarm.RandAddress(t)
+			plain := newStorage(t).(*indexStorage)
+			rec := &recordingIndexStore{IndexStore: plain.idx}
+			st := &indexStorage{idx: rec, cs: plain.cs}
+			r, err := reserve.New(baseAddr, st, 0, kademlia.NewTopologyDriver(), log.Noop)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, target, after := batchIDs()
+			ids := make([]string, 0, 12)
+			for _, id := range [][]byte{target, after} {
+				for range 12 {
+					ch := chunk.GenerateTestRandomChunkAt(t, baseAddr, 0).WithStamp(postagetesting.MustNewBatchStamp(id))
+					if err := r.Put(context.Background(), ch); err != nil {
+						t.Fatal(err)
+					}
+					if bytes.Equal(id, target) {
+						stampHash, err := ch.Stamp().Hash()
+						if err != nil {
+							t.Fatal(err)
+						}
+						item := &reserve.BatchRadiusItem{Bin: 0, BatchID: id, Address: ch.Address(), StampHash: stampHash}
+						ids = append(ids, item.ID())
+					}
+				}
+			}
+			slices.Sort(ids)
+			rec.queries, rec.callbacks = nil, nil
+
+			evicted, err := r.EvictBatchBin(context.Background(), target, math.MaxInt, 1, reserve.EvictionHooks{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if evicted != 12 {
+				t.Fatalf("evicted %d, want 12", evicted)
+			}
+			// 4 full rounds of 3, then one that finds nothing left.
+			if len(rec.queries) != 5 {
+				t.Fatalf("got %d queries, want 5", len(rec.queries))
+			}
+			for k, q := range rec.queries {
+				if k == 0 {
+					if q.PrefixAtStart || q.Prefix != string(target) {
+						t.Fatalf("query 1: %+v, want Prefix the batch ID without PrefixAtStart", q)
+					}
+				} else {
+					want := ids[3*k-1]
+					if !q.PrefixAtStart || q.Prefix != want || q.SkipFirst {
+						t.Fatalf("query %d: PrefixAtStart %v SkipFirst %v, prefix the ID of item %d: %v", k+1, q.PrefixAtStart, q.SkipFirst, 3*k, q.Prefix == want)
+					}
+				}
+				if rec.callbacks[k] > 3+1 {
+					t.Fatalf("query %d handed %d results to the callback, more than a round plus one", k+1, rec.callbacks[k])
+				}
+			}
+		})
+	}
+}
+
 // TestEvictRoundsCount checks that a count smaller than the batch's
 // entries is honoured across rounds.
 func TestEvictRoundsCount(t *testing.T) {
@@ -406,6 +498,136 @@ func TestEvictRoundsPayAbort(t *testing.T) {
 	}
 	if r.Size() != 4 || countRadiusItems(t, st) != 4 {
 		t.Fatalf("size %d, items %d, want 4 and 4", r.Size(), countRadiusItems(t, st))
+	}
+}
+
+// TestEvictionKeepsServing checks that a node keeps accepting and serving
+// chunks while it evicts in rounds, unpaced and paced: new chunks are
+// stored into the batch being evicted and into other batches, the batch's
+// chunks that are not evicted are served while the eviction runs, and a
+// retrieval waits at most about one round, not the whole eviction.
+func TestEvictionKeepsServing(t *testing.T) {
+	defer reserve.SetEvictionRound(20)()
+
+	for _, tc := range []struct {
+		name   string
+		pause  time.Duration // what Pay waits per round; 0 is rate 0
+		doomed int
+	}{
+		// At rate 0 the in-memory eviction is fast, so it gets more chunks
+		// to run long enough to serve during it. Pay is nil, as in the
+		// node at rate 0 apart from its stop check; the yield between
+		// rounds is EvictBatchBin's own.
+		{"rate 0", 0, 8000},
+		{"paced", 20 * time.Millisecond, 400},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			baseAddr := swarm.RandAddress(t)
+			st := &indexStorage{idx: inmemstore.New(), cs: inmemchunkstore.New()}
+			r, err := reserve.New(baseAddr, st, 0, kademlia.NewTopologyDriver(), log.Noop)
+			if err != nil {
+				t.Fatal(err)
+			}
+			target, other := postagetesting.MustNewBatch(), postagetesting.MustNewBatch()
+			put := func(id []byte, bin int) swarm.Chunk {
+				t.Helper()
+				ch := chunk.GenerateTestRandomChunkAt(t, baseAddr, bin).WithStamp(postagetesting.MustNewBatchStamp(id))
+				if err := r.Put(context.Background(), ch); err != nil {
+					t.Fatal(err)
+				}
+				return ch
+			}
+			get := func(ch swarm.Chunk) error {
+				stampHash, err := ch.Stamp().Hash()
+				if err != nil {
+					return err
+				}
+				_, err = r.Get(context.Background(), ch.Address(), ch.Stamp().BatchID(), stampHash)
+				return err
+			}
+
+			const evictBelow = 1
+			doomed := make([]swarm.Chunk, 0, tc.doomed)
+			kept := make([]swarm.Chunk, 0, 40)
+			for range tc.doomed {
+				doomed = append(doomed, put(target.ID, 0))
+			}
+			for range 20 {
+				kept = append(kept, put(target.ID, 5), put(other.ID, 0))
+			}
+
+			var maxHold time.Duration
+			hooks := reserve.EvictionHooks{
+				After: func(_ int, took time.Duration) { maxHold = max(maxHold, took) },
+			}
+			if tc.pause > 0 {
+				hooks.Pay = func(int) error { time.Sleep(tc.pause); return nil }
+			}
+			done := make(chan error, 1)
+			start := time.Now()
+			go func() {
+				_, err := r.EvictBatchBin(context.Background(), target.ID, math.MaxInt, evictBelow, hooks)
+				done <- err
+			}()
+
+			var (
+				added   []swarm.Chunk
+				maxGet  time.Duration
+				gets    int
+				evicted bool
+			)
+			// maxGet is the longest wait of a Put plus a Get of the batch.
+			for !evicted {
+				select {
+				case err := <-done:
+					if err != nil {
+						t.Fatal(err)
+					}
+					evicted = true
+					continue
+				default:
+				}
+				// New chunks into the batch being evicted, at and below the
+				// bin it evicts, and into another batch.
+				t0 := time.Now()
+				added = append(added, put(target.ID, 6), put(other.ID, 0))
+				ch := kept[gets%len(kept)]
+				if err := get(ch); err != nil {
+					t.Fatalf("serving a kept chunk during the eviction: %v", err)
+				}
+				maxGet = max(maxGet, time.Since(t0))
+				gets++
+			}
+			total := time.Since(start)
+
+			for _, ch := range append(kept, added...) {
+				if err := get(ch); err != nil {
+					t.Fatalf("chunk stored or kept during the eviction: %v, want it served", err)
+				}
+			}
+			for _, ch := range doomed {
+				if err := get(ch); !errors.Is(err, storage.ErrNotFound) {
+					t.Fatalf("doomed chunk: %v, want not found", err)
+				}
+			}
+			if got, want := r.Size(), countRadiusItems(t, st); got != want {
+				t.Fatalf("reserve size %d, stored items %d", got, want)
+			}
+
+			// A retrieval and a store wait about one round, not the whole
+			// eviction. Without the yield between rounds, a Get waited
+			// nearly the whole eviction at rate 0 (155 to 231 ms of 233 to
+			// 239 ms under -race); with it the longest wait is usually under
+			// 2 ms, with rare outliers of tens of ms under -race. Half the
+			// eviction separates the two without flaking.
+			t.Logf("gets %d, max get %v, max round hold %v, eviction %v", gets, maxGet, maxHold, total)
+			if gets < 20 {
+				t.Fatalf("only %d retrievals during an eviction of %v", gets, total)
+			}
+			if maxGet > total/2 {
+				t.Fatalf("a retrieval waited %v of an eviction of %v: the batch lock was held across rounds", maxGet, total)
+			}
+		})
 	}
 }
 

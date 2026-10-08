@@ -123,6 +123,28 @@ func TestEvictionPacerArrivalFloor(t *testing.T) {
 	}
 }
 
+// TestEvictionPacerArrivalFloorLowRate checks the floor when a round's wait
+// is longer than the arrival window: at 10 per second a round of 1,000
+// waits 100 s, so each sample is older than the window by the next one. The
+// floor must still see 1,000 arrivals per second.
+func TestEvictionPacerArrivalFloorLowRate(t *testing.T) {
+	t.Parallel()
+	var arrived atomic.Uint64
+	p, clock := newTestPacer(10, arrived.Load)
+
+	_ = p.effective(clock.now())
+	for i := range 5 {
+		clock.advance(100 * time.Second)
+		arrived.Add(100_000)
+		if got := float64(p.effective(clock.now())); got < 900 || got > 1_100 {
+			t.Fatalf("round %d: effective %v, want about 1,000 (the arrival rate)", i+1, got)
+		}
+	}
+	if len(p.samples) > 3 {
+		t.Fatalf("%d samples kept, want the baseline and the newest", len(p.samples))
+	}
+}
+
 func TestEvictionPacerWorkerScaling(t *testing.T) {
 	t.Parallel()
 	p, clock := newTestPacer(1_000, func() uint64 { return 0 })
