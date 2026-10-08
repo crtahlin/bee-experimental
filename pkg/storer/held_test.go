@@ -15,6 +15,7 @@ import (
 	"github.com/ethersphere/bee/v2/pkg/postage"
 	postagetesting "github.com/ethersphere/bee/v2/pkg/postage/testing"
 	pullerMock "github.com/ethersphere/bee/v2/pkg/puller/mock"
+	soctesting "github.com/ethersphere/bee/v2/pkg/soc/testing"
 	"github.com/ethersphere/bee/v2/pkg/spinlock"
 	storage "github.com/ethersphere/bee/v2/pkg/storage"
 	chunk "github.com/ethersphere/bee/v2/pkg/storage/testing"
@@ -84,7 +85,7 @@ func (f *heldFixture) open(t *testing.T, path string) {
 func (f *heldFixture) unknownChunk(t *testing.T) (swarm.Chunk, []byte) {
 	t.Helper()
 	batch := postagetesting.MustNewID()
-	return chunk.GenerateTestRandomChunkAt(t, f.base, 0).WithStamp(postagetesting.MustNewBatchStamp(batch)), batch
+	return chunk.GenerateValidRandomChunkAt(t, f.base, 0).WithStamp(postagetesting.MustNewBatchStamp(batch)), batch
 }
 
 var errUnknownBatch = fmt.Errorf("batchstore get: %w, %w", storage.ErrNotFound, postage.ErrNotFound)
@@ -342,11 +343,11 @@ func TestHeldOutsideRadiusDropped(t *testing.T) {
 	defer storer.SetHeldLimits(100, 10*time.Millisecond, 1000, time.Millisecond)()
 
 	f := newHeldFixture(t, "")
-	if err := f.db.Reserve().SetRadius(2); err != nil {
+	if err := f.db.Reserve().SetRadius(20); err != nil {
 		t.Fatal(err)
 	}
 	batch := postagetesting.MustNewID()
-	ch := chunk.GenerateTestRandomChunkAt(t, f.base, 0).WithStamp(postagetesting.MustNewBatchStamp(batch))
+	ch := chunk.GenerateValidRandomChunkAt(t, f.base, 0).WithStamp(postagetesting.MustNewBatchStamp(batch))
 	f.hold(t, ch)
 
 	f.batches.add(batch)
@@ -403,7 +404,7 @@ func TestHeldConcurrentClaimOnce(t *testing.T) {
 	defer storer.SetHeldLimits(100, time.Hour, 1000, time.Millisecond)()
 
 	f := newHeldFixture(t, "")
-	base := chunk.GenerateTestRandomChunkAt(t, f.base, 0)
+	base := chunk.GenerateValidRandomChunkAt(t, f.base, 0)
 
 	var wg sync.WaitGroup
 	errs := make(chan error, 8)
@@ -427,5 +428,26 @@ func TestHeldConcurrentClaimOnce(t *testing.T) {
 
 	if n := f.db.HeldCount(); n != 1 {
 		t.Fatalf("held count %d for one address held 8 times, want 1", n)
+	}
+}
+
+// TestHeldRequiresContentAddress checks that a chunk whose data does not
+// match its full content address is not held and nothing is written to the
+// chunk store for it (#583).
+func TestHeldRequiresContentAddress(t *testing.T) {
+	f := newHeldFixture(t, "")
+	genuine, batch := f.unknownChunk(t)
+	socData := soctesting.GenerateMockSOC(t, []byte("payload")).Chunk().Data()
+	foreign := swarm.NewChunk(genuine.Address(), socData).WithStamp(postagetesting.MustNewBatchStamp(batch))
+
+	held, err := f.db.HoldUnvalidated(context.Background(), foreign, errUnknownBatch)
+	if err != nil || held {
+		t.Fatalf("hold: held %v, error %v; want not held, nil", held, err)
+	}
+	if n := f.db.HeldCount(); n != 0 {
+		t.Fatalf("held count %d, want 0", n)
+	}
+	if _, err := f.db.Lookup().Get(context.Background(), genuine.Address()); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("chunk store has data for the address: %v", err)
 	}
 }

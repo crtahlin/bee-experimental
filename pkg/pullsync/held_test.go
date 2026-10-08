@@ -13,6 +13,7 @@ import (
 
 	"github.com/ethersphere/bee/v2/pkg/p2p/streamtest"
 	"github.com/ethersphere/bee/v2/pkg/postage"
+	soctesting "github.com/ethersphere/bee/v2/pkg/soc/testing"
 	testingc "github.com/ethersphere/bee/v2/pkg/storage/testing"
 	"github.com/ethersphere/bee/v2/pkg/storer"
 	mock "github.com/ethersphere/bee/v2/pkg/storer/mock"
@@ -152,6 +153,40 @@ func TestSyncWithoutHolderUnchanged(t *testing.T) {
 		}
 		if topmost != 2 {
 			t.Fatalf("got topmost %d, want 2", topmost)
+		}
+	})
+}
+
+// TestSyncHoldRequiresContentAddress checks that a delivered chunk whose
+// data does not match its full content address never reaches the holder,
+// and the interval still advances past it (#583).
+func TestSyncHoldRequiresContentAddress(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		genuine := testingc.GenerateTestRandomChunk()
+		socData := soctesting.GenerateMockSOC(t, []byte("payload")).Chunk().Data()
+		foreign := swarm.NewChunk(genuine.Address(), socData).WithStamp(genuine.Stamp())
+		stampHash, err := foreign.Stamp().Hash()
+		if err != nil {
+			t.Fatal(err)
+		}
+		results := []*storer.BinC{{Address: foreign.Address(), BatchID: foreign.Stamp().BatchID(), BinID: 1, StampHash: stampHash}}
+		validStamp := func(swarm.Chunk) (swarm.Chunk, error) { return nil, postage.ErrNotFound }
+
+		ps, _ := newPullSync(t, nil, 10, mock.WithSubscribeResp(results, nil), mock.WithChunks(foreign))
+		recorder := streamtest.New(streamtest.WithProtocols(ps.Protocol()))
+		client, _ := newPullSyncWithStamperValidator(t, recorder, 0, validStamp)
+		holder := &holderMock{}
+		client.SetChunkHolder(holder)
+
+		topmost, _, err := client.Sync(context.Background(), swarm.ZeroAddress, 0, 0)
+		if !errors.Is(err, postage.ErrNotFound) {
+			t.Fatalf("got error %v, want %v", err, postage.ErrNotFound)
+		}
+		if topmost != 1 {
+			t.Fatalf("got topmost %d, want 1", topmost)
+		}
+		if n := holder.heldCount(); n != 0 {
+			t.Fatalf("holder got %d chunks, want 0", n)
 		}
 	})
 }

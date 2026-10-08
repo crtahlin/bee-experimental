@@ -445,7 +445,7 @@ func (s *Syncer) hold(ctx context.Context, ch swarm.Chunk, cause error) (bool, e
 	}
 	// Only a chunk whose content checks out is held: its data is genuine
 	// and only its stamp cannot be checked yet.
-	if !cac.Valid(ch) && !validSOC(ch) {
+	if !cac.Valid(ch) && !soc.Valid(ch) {
 		return false, nil
 	}
 	held, err := s.holder.HoldUnvalidated(ctx, ch, cause)
@@ -453,11 +453,6 @@ func (s *Syncer) hold(ctx context.Context, ch swarm.Chunk, cause error) (bool, e
 		s.metrics.Held.Inc()
 	}
 	return held, err
-}
-
-func validSOC(ch swarm.Chunk) bool {
-	_, err := soc.FromChunk(ch)
-	return err == nil
 }
 
 // makeOffer tries to assemble an offer for a given requested interval.

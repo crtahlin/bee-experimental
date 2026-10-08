@@ -12,7 +12,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ethersphere/bee/v2/pkg/cac"
 	"github.com/ethersphere/bee/v2/pkg/postage"
+	"github.com/ethersphere/bee/v2/pkg/soc"
 	storage "github.com/ethersphere/bee/v2/pkg/storage"
 	"github.com/ethersphere/bee/v2/pkg/storage/storageutil"
 	"github.com/ethersphere/bee/v2/pkg/storer/internal/transaction"
@@ -122,6 +124,12 @@ var _ postage.ChunkHolder = (*DB)(nil)
 // HoldUnvalidated implements postage.ChunkHolder.
 func (db *DB) HoldUnvalidated(ctx context.Context, ch swarm.Chunk, cause error) (bool, error) {
 	if !postage.HoldsUnvalidated(cause) || !db.postageStale() {
+		return false, nil
+	}
+	// Only a chunk whose data matches its full content address is held:
+	// the chunk store never overwrites, so whatever is held under an
+	// address is what the node serves for it.
+	if !cac.Valid(ch) && !soc.Valid(ch) {
 		return false, nil
 	}
 	stamp, ok := ch.Stamp().(*postage.Stamp)
