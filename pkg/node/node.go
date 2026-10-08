@@ -238,6 +238,7 @@ type Options struct {
 	SamplerReadConcurrency          int
 	SamplerSortWindow               int
 	ReserveHasConcurrency           int
+	ReserveEvictionRate             int
 	KademliaSaturationPeers         int
 	KademliaOverSaturationPeers     int
 	PullSyncMaxChunksPerSecond      int
@@ -1136,6 +1137,7 @@ func NewBee(
 		SamplerReadConcurrency:    o.SamplerReadConcurrency,
 		SamplerSortWindow:         o.SamplerSortWindow,
 		ReserveHasConcurrency:     o.ReserveHasConcurrency,
+		ReserveEvictionRate:       o.ReserveEvictionRate,
 		LocalIngestLimit:          o.LocalIngestLimit,
 	}
 	if o.LocalIngestEnable && o.LocalIngestLimit == 0 {

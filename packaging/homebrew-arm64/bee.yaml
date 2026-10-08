@@ -57,6 +57,19 @@
 ##
 ## The sample itself does not change with this setting, whatever it is set to.
 # sampler-sort-window: 0
+## most chunks per second reserve eviction deletes.
+##
+## After a radius increase a node evicts about half its reserve. Unpaced, many
+## large nodes evicting at once can make their host unreachable. With a rate,
+## eviction deletes on 2 goroutines and waits after each round of 1,000 chunks;
+## it follows the arrival rate when chunks arrive faster, so the excess over
+## capacity does not grow.
+##
+## 0 means no limit, the previous behaviour. Raising it finishes an eviction
+## sooner with more load; lowering it keeps the node responsive but lets the
+## shard files grow about 4 KB per chunk arriving meanwhile, and, for expired
+## batches, peers fetch and reject their chunks for longer.
+# reserve-eviction-rate: 0
 ## reserve lookups pullsync may have in flight at once.
 ##
 ## pullsync asks the reserve whether it already holds a chunk once per offered
