@@ -5,11 +5,13 @@
 // Package failover routes chain calls across an ordered list of RPC endpoints,
 // so that losing one does not take the node down.
 //
-// A single endpoint is what bee has today, and when it fails the node does not
-// degrade — it stops. Writes to the chain fail, the postage listener stalls,
-// and ten minutes later the stall timeout shuts the node down; if the endpoint
-// is still unreachable it will not start again. See issue #109 and
-// docs/experiments/rpc-endpoint-failover/spec.md.
+// A single endpoint is what bee has, and when it fails the node does not
+// degrade, it stops: writes to the chain fail, the postage listener stalls,
+// and ten minutes later the stall timeout shuts the node down. See issue #109
+// and docs/experiments/rpc-endpoint-failover/spec.md. In wasp a stall no
+// longer stops the node: its batch store is marked stale and it keeps
+// serving (#583). Losing every endpoint still leaves it degraded until one
+// answers again.
 //
 // Per-call routing is enough because every chain call bee makes is
 // request/response: transaction.Backend embeds backend.Geth, which is sixteen

@@ -85,8 +85,10 @@ func InitChain(
 		}
 
 		// Dial every configured endpoint. One unreachable endpoint is no longer
-		// fatal when others answer, which is the point of #109 — a provider
+		// fatal when others answer, which is the point of #109: a provider
 		// outage used to take the node down ten minutes later and keep it down.
+		// Since #583 a stall marks the batch store stale instead of stopping
+		// the node, so an outage of every endpoint degrades it.
 		//
 		// An endpoint that does not answer now keeps its place in the list with
 		// no connection, rather than being dropped. Dropping it meant a
