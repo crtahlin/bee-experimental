@@ -294,6 +294,15 @@ func (db *DB) reserveWorker(ctx context.Context, ready chan<- struct{}) {
 				continue
 			}
 
+			// While the batch store is stale, and for one sync-rate window
+			// after, the radius does not drop: the reserve size is not
+			// reliable while chunks are held, and a paused puller reports a
+			// rate of 0 (#583). A radius increase stays possible.
+			if db.radiusDecreaseBlocked() {
+				db.logger.Debug("reserve radius decrease skipped while the batch store is stale or just recovered", "radius", radius)
+				continue
+			}
+
 			if count < threshold(db.reserve.Capacity()) && db.syncer.SyncRate() == 0 && radius > db.reserveOptions.minimumRadius {
 				radius--
 				if err := db.reserve.SetRadius(radius); err != nil {

@@ -727,6 +727,10 @@ type DB struct {
 	logger log.Logger
 	tracer *tracing.Tracer
 
+	// postageSyncHealth holds the postage listener's sync health, which
+	// blocks the radius decrease while the batch store is stale (#583).
+	postageSyncHealth atomic.Pointer[postage.SyncHealth]
+
 	metrics             metrics
 	storage             transaction.Storage
 	multex              *multex.Multex

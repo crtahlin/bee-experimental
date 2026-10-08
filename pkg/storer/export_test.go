@@ -196,3 +196,11 @@ func CacheLimiterCancelled(db *DB) bool {
 		return false
 	}
 }
+
+// SetRadiusDecreaseHold replaces how long after the stale state the radius
+// decrease stays blocked, for a test, and returns a function that restores it.
+func SetRadiusDecreaseHold(d time.Duration) func() {
+	old := radiusDecreaseHold
+	radiusDecreaseHold = d
+	return func() { radiusDecreaseHold = old }
+}

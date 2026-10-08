@@ -329,6 +329,17 @@ func validatePostageConfirmationDepth(depth uint64) error {
 	return nil
 }
 
+// postageReadyForLottery reports whether the postage state allows playing the
+// storage lottery: the batch store is not stale (#583). A sample taken on a
+// stale batch store can disagree with the neighbourhood and freeze a staked
+// node, so the agent skips the round instead.
+func postageReadyForLottery(l postage.Listener) bool {
+	if h, ok := l.(postage.SyncHealth); ok && h.Stale() {
+		return false
+	}
+	return true
+}
+
 // validatePostageStallShutdown refuses a negative postage-stall-shutdown (#583).
 // Zero means never stop; a positive duration stops the node once its batch
 // store has been stale that long.
@@ -1622,6 +1633,11 @@ func NewBee(
 		})
 		b.pullerCloser = pullerService
 
+		// While the batch store is stale the reserve worker does not lower the
+		// storage radius (#583).
+		if h, ok := eventListener.(postage.SyncHealth); ok {
+			localStore.SetPostageSyncHealth(h)
+		}
 		// we pass an empty channel since startup synchronization is not needed for production code, only tests.
 		localStore.StartReserveWorker(ctx, pullerService, waitNetworkRFunc, nil)
 		nodeStatus.SetSync(pullerService)
@@ -1672,7 +1688,8 @@ func NewBee(
 			isFullySynced := func() bool {
 				reserveThreshold := reserveCapacity * 5 / 10
 				logger.Debug("Sync status check evaluated", "stabilized", detector.IsStabilized())
-				return localStore.ReserveSize() >= reserveThreshold && syncedWithinThreshold(pullerService.SyncRate(), o.RedistributionSyncRateThreshold, o.ReserveCapacityDoubling) && detector.IsStabilized()
+				return localStore.ReserveSize() >= reserveThreshold && syncedWithinThreshold(pullerService.SyncRate(), o.RedistributionSyncRateThreshold, o.ReserveCapacityDoubling) && detector.IsStabilized() &&
+					postageReadyForLottery(eventListener)
 			}
 
 			agent, err = storageincentives.New(
