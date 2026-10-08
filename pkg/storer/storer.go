@@ -730,6 +730,9 @@ type DB struct {
 	// postageSyncHealth holds the postage listener's sync health, which
 	// blocks the radius decrease while the batch store is stale (#583).
 	postageSyncHealth atomic.Pointer[postage.SyncHealth]
+	// radiusHold is radiusDecreaseHold, copied when the store opens so a
+	// test that changes it does not race a running reserve worker.
+	radiusHold time.Duration
 	// held accounts for chunks held while the batch store is stale (#583).
 	held *heldState
 
@@ -916,12 +919,13 @@ func New(ctx context.Context, dirPath string, opts *Options) (*DB, error) {
 
 	clCtx, clCancel := context.WithCancel(ctx)
 	db := &DB{
-		held:     newHeldState(),
-		metrics:  metrics,
-		storage:  st,
-		logger:   logger,
-		tracer:   opts.Tracer,
-		baseAddr: opts.Address,
+		held:       newHeldState(),
+		radiusHold: radiusDecreaseHold,
+		metrics:    metrics,
+		storage:    st,
+		logger:     logger,
+		tracer:     opts.Tracer,
+		baseAddr:   opts.Address,
 		shutdownTimeout: func() time.Duration {
 			if opts.ShutdownTimeout > 0 {
 				return opts.ShutdownTimeout

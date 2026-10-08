@@ -40,5 +40,5 @@ func (db *DB) radiusDecreaseBlocked() bool {
 		return true
 	}
 	ended := h.StaleEndedAt()
-	return !ended.IsZero() && time.Since(ended) < radiusDecreaseHold
+	return !ended.IsZero() && time.Since(ended) < db.radiusHold
 }
