@@ -310,3 +310,20 @@ password-file: "./password"
 ## reconnects of a restarting peer, or of users behind a shared carrier NAT,
 ## who then wait or try other nodes
 # p2p-connection-burst-per-ip: 40
+## new inbound connections per second the node accepts in total, checked after
+## the per-IP limits and before the security handshake, in each of two buckets:
+## full peers that completed a handshake with this node, and every other
+## address; 0 uses the default of 30, -1 turns the limit off, other negative
+## values are refused; off on a bootnode unless set. Raising it lets more
+## connection setups through under a flood, which costs this node CPU and takes
+## it from its reserve samples; lowering it makes new light clients wait or go
+## to other nodes, can make new full peers drop this node from their address
+## books after 4 refused dials, and can make other nodes, and this node itself,
+## judge it unreachable
+# p2p-inbound-connection-rate: 30
+## new inbound connections the node accepts at once above
+## p2p-inbound-connection-rate, per bucket; 0 uses the default of 200, -1 turns
+## the limit off, other negative values are refused. Raising it lets a larger
+## flood through before the rate applies; lowering it can refuse the peers that
+## reconnect at once after a restart, who then wait or go to other nodes
+# p2p-inbound-connection-burst: 200

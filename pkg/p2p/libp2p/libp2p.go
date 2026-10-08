@@ -112,6 +112,11 @@ type Service struct {
 	lightNodeLimit     int
 	bootnodeMode       bool
 	lightAnnounced     *lightAnnounceGate
+	inbound            *inboundLimiter
+	knownFull          *knownFullPeers
+	knownFullQuit      chan struct{}
+	lastReachability   atomic.Int32
+	closeOnce          sync.Once
 	protocolsmu        sync.RWMutex
 	reacher            p2p.Reacher
 	networkStatus      atomic.Int32
@@ -188,6 +193,22 @@ type Options struct {
 	MaxConnectionsPerIP  int
 	ConnectionRatePerIP  float64
 	ConnectionBurstPerIP int
+
+	// Total rate of new inbound connections, in new connections per
+	// second and burst, per bucket: one bucket for full peers that
+	// completed a handshake with this node, one for every other address.
+	// Zero uses the default and -1 turns the limit off; any other negative
+	// value is an error. InboundConnectionLimitSet tells whether the
+	// operator set either value, which a bootnode needs to apply the limit.
+	InboundConnectionRate     float64
+	InboundConnectionBurst    int
+	InboundConnectionLimitSet bool
+
+	// now replaces time.Now in tests.
+	now func() time.Time
+	// inboundLimitLoopback applies the total inbound rate to loopback
+	// addresses, for tests.
+	inboundLimitLoopback bool
 }
 
 func New(ctx context.Context, signer beecrypto.Signer, networkID uint64, overlay swarm.Address, addr string, ab addressbook.GetPutter, storer storage.StateStorer, lightNodes *lightnode.Container, logger log.Logger, tracer *tracing.Tracer, o Options) (s *Service, returnErr error) {
@@ -274,6 +295,19 @@ func New(ctx context.Context, signer beecrypto.Signer, networkID uint64, overlay
 		return nil, err
 	}
 
+	inboundCfg, err := buildInboundLimit(o.InboundConnectionRate, o.InboundConnectionBurst, o.BootnodeMode, o.InboundConnectionLimitSet)
+	if err != nil {
+		return nil, err
+	}
+	now := o.now
+	if now == nil {
+		now = time.Now
+	}
+	svcMetrics := newMetrics()
+	knownFull := newKnownFullPeers(knownFullPeersMax, knownFullPeerTTL, now)
+	inbound := newInboundLimiter(rm, inboundCfg, knownFull, svcMetrics, now)
+	inbound.limitLoopback = o.inboundLimitLoopback
+
 	var natManager basichost.NATManager
 
 	var certManager autoTLSCertManager
@@ -321,7 +355,7 @@ func New(ctx context.Context, signer beecrypto.Signer, networkID uint64, overlay
 		// Use dedicated peerstore instead the global DefaultPeerstore
 		libp2p.Peerstore(libp2pPeerstore),
 		libp2p.UserAgent(userAgent()),
-		libp2p.ResourceManager(rm),
+		libp2p.ResourceManager(inbound),
 	}
 
 	if o.NATAddr == "" && o.NATWSSAddr == "" {
@@ -469,7 +503,7 @@ func New(ctx context.Context, signer beecrypto.Signer, networkID uint64, overlay
 		pingDialer:         pingDialer,
 		handshakeService:   handshakeService,
 		libp2pPeerstore:    libp2pPeerstore,
-		metrics:            newMetrics(),
+		metrics:            svcMetrics,
 		networkID:          networkID,
 		peers:              peerRegistry,
 		addressbook:        ab,
@@ -481,6 +515,9 @@ func New(ctx context.Context, signer beecrypto.Signer, networkID uint64, overlay
 		halt:               make(chan struct{}),
 		lightNodes:         lightNodes,
 		lightAnnounced:     newLightAnnounceGate(lightAnnounceMaxPeers, lightAnnounceInterval),
+		inbound:            inbound,
+		knownFull:          knownFull,
+		knownFullQuit:      make(chan struct{}),
 		HeadersRWTimeout:   o.HeadersRWTimeout,
 		autoNAT:            autoNAT,
 		autoTLSCertManager: certManager,
@@ -495,6 +532,7 @@ func New(ctx context.Context, signer beecrypto.Signer, networkID uint64, overlay
 	}
 
 	peerRegistry.setDisconnecter(s)
+	peerRegistry.onFullConnClosed = s.refreshKnownFull
 
 	s.lightNodeLimit = defaultLightNodeLimit
 	if o.LightNodeLimit > 0 {
@@ -517,6 +555,10 @@ func New(ctx context.Context, signer beecrypto.Signer, networkID uint64, overlay
 	}
 
 	s.host.SetStreamHandlerMatch(id, matcher, s.handleIncoming)
+
+	if inboundCfg.enabled {
+		go s.knownFullWorker()
+	}
 
 	connMetricNotify := newConnMetricNotify(s.metrics)
 	h.Network().Notify(peerRegistry) // update peer registry on network events
@@ -570,6 +612,7 @@ func (s *Service) reachabilityWorker() error {
 				return
 			case e := <-sub.Out():
 				if r, ok := e.(event.EvtLocalReachabilityChanged); ok {
+					s.observeReachability(r.Reachability)
 					select {
 					case <-s.ready:
 					case <-s.halt:
@@ -781,6 +824,9 @@ func (s *Service) handleIncoming(stream network.Stream) {
 				_ = s.Disconnect(overlay, "unable to signal connection notifier")
 				return
 			}
+			// Kademlia accepted the full peer, so the address it
+			// connected from counts as a known full peer's.
+			s.recordKnownFull(stream.Conn().RemoteMultiaddr())
 			// when a full node connects, we gossip about it to the
 			// light nodes so that they can also have a chance at building
 			// a solid topology.
@@ -1279,6 +1325,12 @@ func (s *Service) Connect(ctx context.Context, addrs []ma.Multiaddr) (address *b
 
 	s.metrics.CreatedConnectionCount.Inc()
 
+	// Kademlia dialled this full peer itself, so the address of the
+	// connection counts as a known full peer's.
+	if i.FullNode {
+		s.recordKnownFull(stream.Conn().RemoteMultiaddr())
+	}
+
 	if len(peerAddrs) > 0 {
 		s.notifyReacherConnected(overlay, peerAddrs)
 	}
@@ -1296,6 +1348,13 @@ func (s *Service) Disconnect(overlay swarm.Address, reason string) (err error) {
 
 	// found is checked at the bottom of the function
 	found, full, peerID := s.peers.remove(overlay)
+
+	// A full peer counts as seen when it disconnects, too.
+	if full {
+		for _, c := range s.host.Network().ConnsToPeer(peerID) {
+			s.refreshKnownFull(c.RemoteMultiaddr())
+		}
+	}
 
 	_ = s.host.Network().ClosePeer(peerID)
 
@@ -1457,6 +1516,7 @@ func (s *Service) newStreamForPeerID(ctx context.Context, peerID libp2ppeer.ID, 
 }
 
 func (s *Service) Close() error {
+	s.closeOnce.Do(func() { close(s.knownFullQuit) })
 	if s.autoTLSCertManager != nil {
 		s.autoTLSCertManager.Stop()
 	}

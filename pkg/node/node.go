@@ -185,6 +185,9 @@ type Options struct {
 	P2PMaxConnectionsPerIP          int
 	P2PConnectionRatePerIP          float64
 	P2PConnectionBurstPerIP         int
+	P2PInboundConnectionRate        float64
+	P2PInboundConnectionBurst       int
+	P2PInboundConnectionLimitSet    bool
 	GasLimitFallback                uint64
 	Logger                          log.Logger
 	MinimumGasTipCap                uint64
@@ -984,6 +987,9 @@ func NewBee(
 		MaxConnectionsPerIP:         o.P2PMaxConnectionsPerIP,
 		ConnectionRatePerIP:         o.P2PConnectionRatePerIP,
 		ConnectionBurstPerIP:        o.P2PConnectionBurstPerIP,
+		InboundConnectionRate:       o.P2PInboundConnectionRate,
+		InboundConnectionBurst:      o.P2PInboundConnectionBurst,
+		InboundConnectionLimitSet:   o.P2PInboundConnectionLimitSet,
 		Nonce:                       nonce,
 		AllowPrivateCIDRs:           o.AllowPrivateCIDRs,
 		Registry:                    registry,
