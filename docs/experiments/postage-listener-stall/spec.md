@@ -7,10 +7,10 @@ Issue: [#583](https://github.com/crtahlin/wasp/issues/583)
 - **Postage listener:** the loop in `pkg/postage/listener/listener.go` that reads postage contract events (`BatchCreated`, `BatchTopUp`, `BatchDepthIncrease`, `PriceUpdate`, `Paused`) from the chain through the RPC endpoint and applies them to the batch store.
 - **Batch store:** the node's local copy of every postage batch and the chain state (block, total amount, current price) that those events produce.
 - **Page:** one `eth_getLogs` query over a block range: 5,000 blocks with the RPC backend, 50,000 with the snapshot backend (`blockPage`, `blockPageSnapshot`, `listener.go:32-33`).
-- **Caught up:** the listener's last pass took the non-paged branch, that is, the remaining range was smaller than one page (`to-from < pageSize`, `listener.go:343-348`).
+- **Caught up:** the listener has applied a page in the non-paged branch, that is, a page whose range reached the confirmed head because the remaining range was smaller than one page (`to-from < pageSize`, `listener.go:343-348`). Taking the branch is not enough; the page must also be applied.
 - **Last progress:** the time the listener last applied a page (`lastProgress`, `listener.go:267`, `:371`).
 - **Stale:** no applied page for `stallingTimeout`, 10 minutes (`postageSyncingStallingTimeout`, `pkg/node/node.go:256`), **or** not caught up since the node last became stale. Stale ends only when the listener is caught up again (section 2).
-- **Degraded:** the node's state while stale: it stays on the network and serves content, does not play the storage lottery, does not pull historical chunks, and keeps working to recover.
+- **Degraded:** the node's state while stale: it stays on the network and serves content, does not play the storage lottery, does not pull chunks (neither live nor historical pull-sync), does not lower its storage radius, and keeps working to recover.
 
 ## Problem
 
@@ -48,7 +48,7 @@ The `getting block number ... context deadline exceeded` lines in the same log c
 
 ## Hypothesis
 
-A stale batch store is a reason to stop **playing the storage lottery** and **pulling historical chunks**, not a reason to stop **the node**. If the node instead stays on the network in a degraded state, keeps actively working to recover (per-call deadlines, a wait that grows while the stall lasts, a smaller page when the log query fails), alerts the operator, and leaves the degraded state only when caught up, then:
+A stale batch store is a reason to stop **playing the storage lottery** and **pulling chunks**, not a reason to stop **the node**. If the node instead stays on the network in a degraded state, keeps actively working to recover (per-call deadlines, a wait that grows while the stall lasts, a smaller page when the log query fails), alerts the operator, and leaves the degraded state only when caught up, then:
 
 - the overloaded-host case ends by itself when the host recovers, without the node ever leaving the network;
 - the always-failing-page case makes progress at a smaller page instead of looping through restarts;
@@ -59,27 +59,31 @@ A stale batch store is a reason to stop **playing the storage lottery** and **pu
 
 | Function | Effect of a stale batch store | Handled by |
 |---|---|---|
-| Pull-sync of chunks of batches created during the stall | The peer transfers the chunk first (`pullsync.go:299-311` checks only `ReserveHas`); `ValidStamp` then returns not found (`pkg/postage/stamp.go:193-196`), the chunk is dropped (`pullsync.go:358-362`), and the puller still records the interval as synced (`puller.go:518-525`), so the chunk is **never pulled again**. A reserve that lacks those chunks gives a sample that can disagree with the neighbourhood after recovery | **The puller pauses historical pulling while stale** (section 3): no interval advances, nothing is lost, and the pull resumes from the same point after recovery |
+| Pull-sync of chunks of batches created during the stall | The peer transfers the chunk first (`pullsync.go:299-311` checks only `ReserveHas`); `ValidStamp` then returns not found (`pkg/postage/stamp.go:193-196`), the chunk is dropped (`pullsync.go:358-362`), and the puller still records the interval as synced (`puller.go:518-525`), so the chunk is **never pulled again**. A reserve that lacks those chunks gives a sample that can disagree with the neighbourhood after recovery | **The puller pauses all pulling, live and historical, while stale** (section 3): no interval advances, nothing is lost, and the pull resumes from the same point after recovery. Live pulling must pause too: it is what carries the chunks of batches created during the stall |
 | Push-sync of chunks of new batches | Refused on the same stamp check; the pusher retries elsewhere | Nothing needed: refused, not stored wrongly (cost to peers, below) |
 | Expiring batches | `cleanup` runs from new chain state (`batchstore/store.go:296-325`), so expired batches stay valid locally while stale | Not playing the lottery while stale. After recovery the catch-up expires many batches at once, an eviction burst like #621 (see Not in scope) |
 | Storage lottery sample | `minBatchBalance` uses the stale chain state (`agent.go:549-555`), and the reserve may hold expired or lack new chunks | **Must not play while stale** (section 4). A disagreeing reveal freezes a staked node |
-| Radius changes | The reserve worker can still raise the radius and evict valid chunks while holding chunks of expired batches | Accepted while stale: the lottery gate keeps any wrong reserve out of a sample, and the reserve is corrected after catch-up |
+| Radius changes | A paused puller reports a sync rate of 0 (`puller.go:512`), and the reserve worker lowers the radius when the reserve is below its threshold and the sync rate is 0 (`pkg/storer/reserve.go:297`), every 15 minutes (`node.go:266`), down to the minimum radius. After recovery the node would pull a much larger area, overfill, raise the radius and evict: the #621 load. A stopped node today does not change its radius | **The radius decrease is skipped while stale** (section 3). A radius increase stays possible: it only evicts, and the lottery gate keeps any wrong reserve out of a sample until catch-up |
 | Retrieval of stored chunks | Does not read the batch store | Keeps working |
-| `POST /stamps` | Still sends the purchase transaction; the new batch is unknown locally, so uploads with it return 422 `batch not usable yet or does not exist` (`api/bzz.go:122`) until caught up | Documented; `/status` and readiness report the degraded state (section 5) |
+| `POST /stamps` | Still sends the purchase transaction; the new batch is unknown locally, so uploads with it return 422 `batch not usable yet or does not exist` (`api/bzz.go:122`) until caught up | Documented; `/status` reports the degraded state (section 5) |
 | `/chainstate` | Reports the stale block, total amount and price | Documented; the new gauges report how far behind |
 
 ## Design
 
 ### 1. Per-call deadlines on the listener's chain calls
 
-`BlockNumber` gets a deadline of 30 s and `FilterLogs` a deadline of 60 s, each from a context derived for that call only (compiled in; see Configuration). A call that runs out its deadline returns `context.DeadlineExceeded`, is counted as a backend error and goes through the existing error branches (`listener.go:312-323`, `:352-364`). The failover backend sees a deadline error as a transport failure and may move to the next endpoint, which is the behaviour wanted for an endpoint that hangs. The comments that describe the failover outcome (`failover.go:8-11`, `chain.go:86-88`) are updated, since a stall no longer stops the node.
+`BlockNumber` gets a deadline of 30 s and `FilterLogs` a deadline of 60 s, each from a context derived for that call only (compiled in; see Configuration). A call that runs out its deadline returns `context.DeadlineExceeded`, is counted as a backend error and goes through the existing error branches (`listener.go:312-323`, `:352-364`).
+
+**The failover gives each attempt its own deadline.** Today `isTransportFailure` treats `context.DeadlineExceeded` as a transport failure (`pkg/transaction/failover/classify.go:51`), and `call` tries the next endpoint with the same context (`failover.go:154-171`). With a per-call deadline that context has already expired, so every following endpoint fails at once and the shared active endpoint (used by transactions and the storage-incentives agent too) jumps to the last one without any of the others being asked; `Recover` moves it back only after a probe, at 30 s or more (`failover.go:325-327`). On an overloaded host that would switch endpoints for every caller for nothing.
+
+So `call` gives each endpoint attempt its own deadline (the caller's remaining time divided by the endpoints still to try, with a floor of 10 s), derived from the caller's context, and **does not advance** when the caller's own context has ended (`ctx.Err() != nil`), returning that error instead. This was chosen over only stopping on `ctx.Err() != nil`: that alternative lets the first endpoint's hang use the whole deadline, so a second, healthy endpoint would never be tried within the call. With per-attempt deadlines a hanging endpoint costs one share and the healthy one is still reached in the same call. Callers without a deadline (the transaction service today) keep today's behaviour, since there is no remaining time to divide. The comments that describe the failover outcome (`failover.go:8-11`, `chain.go:86-88`) are updated, since a stall no longer stops the node.
 
 ### 2. A stall marks the node stale instead of stopping it
 
 The listener stores `lastProgress` and the caught-up state in atomics, and computes `Stale()` when it is read, not inside the loop:
 
 - **stale begins** when `time.Since(lastProgress) >= stallingTimeout`;
-- **stale ends** only when the loop next takes the non-paged branch (`to-from < pageSize`), that is, when the listener is caught up again. One applied page while thousands of blocks behind does not end it, and an endpoint that lets one page through every 9 minutes cannot keep the node out of the stale state.
+- **stale ends** only when a page in the non-paged branch (`to-from < pageSize`) has been applied, that is, when the listener is caught up again. One applied page while thousands of blocks behind does not end it, and an endpoint that lets one page through every 9 minutes cannot keep the node out of the stale state.
 
 Because `Stale()` is computed on read, a call that hangs (until its deadline in section 1) cannot keep the flag from being set. The stall check that returns `ErrPostageSyncingStalled` is removed from the loop.
 
@@ -87,9 +91,13 @@ Because `Stale()` is computed on read, a call that hangs (until its deadline in 
 
 The same rule applies to the light-node background path (`node.go:1276-1283`) and the snapshot backend (`node.go:1196`): a stall marks stale and does not signal `syncingStopped`.
 
-### 3. The puller pauses historical pulling while stale
+### 3. The puller pauses all pulling while stale, and the radius does not drop
 
-The puller already pauses historical pulling while a reserve sample runs, through `waitWhileSampling` (`puller.go:472`). That wait is extended to also wait while the postage listener is stale. While paused, no interval is advanced, so no chunk of a batch the node has not yet seen is dropped and marked synced; after recovery, pulling resumes from the same intervals and fetches those chunks with their batches known. The reserve therefore does not grow while stale, which is stated in `/status` (section 5). Push-sync and retrieval are separate protocols and keep working.
+The puller already pauses while a reserve sample runs, through `waitWhileSampling` (`puller.go:472`). That call sits in the sync loop shared by live and historical workers, with no `isHistorical` check, so it pauses **both**. The wait is extended to also wait while the postage listener is stale, and it must keep pausing both kinds: live pull-sync is what carries the chunks of batches created during the stall, so an `isHistorical` check here would bring the loss back (`puller.go:518-525`). The comment at `puller.go:468-471`, which says only historical pulling pauses, is corrected in the implementation.
+
+While paused, no interval is advanced, so no chunk of a batch the node has not yet seen is dropped and marked synced; after recovery, pulling resumes from the same intervals and fetches those chunks with their batches known. The reserve therefore does not grow while stale. Push-sync and retrieval are separate protocols and keep working.
+
+A paused puller reports a sync rate of 0, which the reserve worker reads as "nothing left to pull" and answers by lowering the radius (`reserve.go:297`). **While the listener is stale, the reserve worker skips the radius decrease.** It resumes its normal check once the node is caught up and the puller has run again. A radius increase is not blocked: it only evicts.
 
 ### 4. The storage lottery does not play while stale
 
@@ -98,9 +106,10 @@ The `isFullySynced` function given to the storage incentives agent (`node.go:165
 ### 5. The operator is told, for as long as it lasts
 
 - Gauges: `bee_postage_listener_stale` (0 or 1), `bee_postage_listener_seconds_since_progress`, `bee_postage_listener_blocks_behind` (the last known head minus the confirmation depth, minus the listener's next block; reported as unknown, -1, while no `BlockNumber` call has succeeded since the node became stale), and `bee_postage_listener_page_blocks` (the current page).
-- A Warning when the node becomes stale: `postage sync stalled; the node stays up and serves content but does not play the storage lottery or pull historical chunks until the batch store catches up`, with the time since last progress, the blocks behind (if known) and the last error. **The Warning repeats every 30 minutes while stale**, so a node whose RPC endpoint is permanently wrong does not stay degraded with a single line in its log.
+- A Warning when the node becomes stale: `postage sync stalled; the node stays up and serves content but does not play the storage lottery or pull historical chunks until the batch store catches up`, with the time since last progress, the blocks behind (if known) and the last error. **The Warning repeats every 30 minutes while stale**, so a node whose RPC endpoint is permanently wrong does not stay degraded with a single line in its log. Each entry into the stale state logs its own Warning: near the head, an endpoint that answers just over every 10 minutes makes the node go stale and recover in a cycle, and each cycle is logged.
 - An Info line when stale ends: `postage sync caught up`, with how long the node was stale.
-- `/status` reports the degraded state (a field such as `postageSyncStale` with the seconds since progress), and `/readiness` reports the node as not ready while stale, so a load balancer or monitor stops counting it as healthy without the process stopping.
+- `/status` reports the degraded state: a field such as `postageSyncStale` with the seconds since progress. `/status` is built from the status protocol's message type (`api/status.go:72`), which `/status/peers` shares, so the field is added **to the API response only, never to the status protocol message** (that would change the wire surface), and is filled only for the local node.
+- **`/readiness` is unchanged (decided, see below).** It keeps answering on the startup probe and connected peers (`api/readiness.go:40-62`). A load balancer that saw not-ready would stop sending requests to a node that can still serve content, the opposite of the goal. The stale state is reported in `/status` and the metrics only.
 
 ### 6. The node keeps working to recover
 
@@ -111,19 +120,20 @@ The `isFullySynced` function given to the storage incentives agent (`node.go:165
 
 At startup a full node still waits for the listener before it builds the rest of the node (`batchSvc.Start`), but no longer forever and no longer by failing:
 
-- the wait for `synced` ends either when the listener is caught up, or when the listener becomes stale;
-- if the listener becomes stale at startup, the node logs the stale Warning and **continues building in the degraded state**: it joins the network and serves what it holds, the puller starts paused (section 3), and the lottery gate is closed (section 4). The listener keeps running and ends the stale state when it catches up.
+- the wait for `synced` ends either when the listener is caught up, or when the listener becomes stale. The startup wait reads an unbuffered `synced` channel (`batchservice.go:343-345`) whose only senders are the loop (`listener.go:347`, `:387`). A loop blocked in a call cannot send, so a separate watcher goroutine, started with the loop, sends on `synced` under the same `closeOnce` when the listener becomes stale;
+- if the listener becomes stale at startup, the node logs the stale Warning and **continues building in the degraded state**: it joins the network and serves what it holds, the puller starts paused and the radius decrease is skipped (section 3), and the lottery gate is closed (section 4). The listener keeps running and ends the stale state when it catches up.
+- `syncStatus.Store(true)` (`node.go:1269`) still runs after the wait, so the `/stamps` endpoints, which `postageSyncStatusCheckHandler` keeps closed until then (`api/postage.go:42-44`), open on stale data. That is documented: buying or topping up a batch still works, and its effect appears once the listener catches up.
 
 So the original #583 scenario, a full node whose catch-up page always fails at startup, no longer loops through restarts off the network: the node comes up degraded and keeps retrying with a smaller page.
 
 ### 8. Exit status: non-zero, and only for faults that cannot be recovered
 
-The node no longer stops for a stall. It stops for the unrecoverable listener errors in section 2, and when an operator sets `postage-stall-shutdown` (Configuration). `syncingStopped` carries no error today, so the listener records the cause before signalling, and `start` returns an error wrapping it instead of `nil`. `main` maps:
+The node no longer stops for a stall. It stops for the unrecoverable listener errors in section 2, and when an operator sets `postage-stall-shutdown` (Configuration). `syncingStopped` carries no error today. The cause is stored in an atomic error on `Bee`, set before the signal; `start.go` reads it after `stop` has run and returns an error wrapping it instead of `nil`, as it already does for a stored build error (`start.go:185-187`). `main` maps:
 
 | Cause | Status | Reason |
 |---|---|---|
 | `postage-stall-shutdown` reached | **75** (`EX_TEMPFAIL` from `sysexits.h`) | Temporary: a restart may succeed |
-| `ErrPostagePaused` | **75** | Temporary: the contract can be unpaused; the node restarts and checks again |
+| A paused postage contract, seen at runtime (`ErrPostagePaused`) or at startup (`node.go:1217-1223`, today a plain `errors.New("postage contract is paused")` that exits 1) | **75** in both cases | Temporary: the contract can be unpaused; the node restarts and checks again. The startup check returns the same sentinel, so both paths map to one status |
 | `processEvents` failure, `ErrParseSnapshot` | **1** | A fault in the node or its data, like any other failure |
 | Configuration error (#490) | 78, unchanged | `RestartPreventExitStatus=78` keeps a bad configuration from looping |
 
@@ -142,7 +152,7 @@ The node no longer stops for a stall. It stops for the unrecoverable listener er
 This is the sw-1 case.
 
 1. A listener call that hangs ends at its deadline (30 s or 60 s) instead of blocking for an hour and a half. The error is counted and retried after `backoffTime`, as today, and a failed log query halves the next page.
-2. After 10 minutes without an applied page the node becomes stale. It stays on the network and keeps serving retrieval. It pauses historical pulling, skips any lottery round it is selected for, reports itself not ready, and warns every 30 minutes. Retries slow down to one per minute, which removes most of the listener's own share of the load.
+2. After 10 minutes without an applied page the node becomes stale. It stays on the network and keeps serving retrieval. It pauses pulling, keeps its storage radius, skips any lottery round it is selected for, reports the stale state in `/status`, and warns every 30 minutes. Retries slow down to one per minute, which removes most of the listener's own share of the load.
 3. When the host recovers, the next attempt succeeds. The node catches up in pages, leaves the stale state when caught up, logs that it recovered, and resumes pulling and playing.
 
 What it does not do: it does not reduce the load that caused the overload. On sw-1 that load was the reserve eviction (#621, #623). This change only stops the listener from turning a temporary overload into a node that stays down.
@@ -152,7 +162,7 @@ What it does not do: it does not reduce the load that caused the overload. On sw
 None. Nothing under `pkg/p2p`, `pkg/swarm` or `pkg/config` changes, and no message, protocol ID or wire constant changes. A stale node refuses push-synced chunks of batches it does not know with the same refusal a stock node gives for an unknown batch.
 
 **Cost to other nodes:**
-- **Pull-sync:** while stale, the node does not pull historical chunks, so it asks its neighbours for nothing during that time and catches up afterwards, which costs them the same transfer later. Without the pause (today, during the 10 minutes before a stop) a peer transfers a chunk of an unknown batch that the node then drops; the pause removes that waste.
+- **Pull-sync:** while stale, the node does not pull chunks, so it asks its neighbours for nothing during that time and catches up afterwards, which costs them the same transfer later. Without the pause (today, during the 10 minutes before a stop) a peer transfers a chunk of an unknown batch that the node then drops; the pause removes that waste.
 - **Push-sync:** chunks of batches created during the stall are refused, so the pusher retries them elsewhere. Today the peers would instead find the node gone after 10 minutes and spend dial attempts on it until they drop it.
 - **Expired batches:** a stale node may keep chunks of batches that expired during the stall. It does not offer them in pull-sync more than today, since pull-sync serves from the reserve as before; peers that are up to date reject them on stamp validation if they pull them. The amount is bounded by what expired during the stall.
 
@@ -193,20 +203,21 @@ Each condition runs three times on today's build (`main` before this change) and
 - whether the node answers on its API, on `/readiness`, and to the libp2p greeting on its p2p port, every minute;
 - the four listener gauges and the listener's backend call and error counters, every 15 s;
 - RPC calls per minute seen by the proxy, and the duration of each call;
-- the puller's historical sync counter (to confirm the pause);
+- the puller's synced counter for both workers, labelled `live` and `historical` (`puller.go:507-512`), to confirm that both pause;
+- the storage radius, to confirm it does not drop while stale;
 - time from the proxy returning to pass until the listener is caught up;
 - `isFullySynced` from `/redistributionstate`.
 
 ### Acceptance
 
 The new build is accepted when, in all three runs of each condition:
-1. **S1, C1, C2:** the node never exits; it answers its API and the libp2p greeting throughout; it reports not ready, `isFullySynced` false and historical pulling paused while stale; and it is caught up within 10 minutes of the proxy returning to pass.
+1. **S1, C1, C2:** the node never exits; it answers its API and the libp2p greeting throughout; it keeps reporting ready on `/readiness`, reports the stale state in `/status`, reports `isFullySynced` false, both puller counters stay flat and the storage radius does not drop while stale; and it is caught up within 10 minutes of the proxy returning to pass.
 2. **C2:** no listener call lasts longer than its deadline (30 s or 60 s) as seen by the proxy, and the node becomes stale 10 minutes after the switch, where today's build is expected to hang in the call without becoming stale or stopping.
 3. **S1, C1, C2:** RPC calls from the listener while stale are at most about 2 per minute after the wait reaches its 60 s cap, against about 24 per minute today before the stop.
 4. **S2:** the node joins the network in the degraded state and reaches the chain head within the 60 minutes, with the page settling at or below 1,250 blocks, where today's build fails to build and restarts in every run.
 5. **C3:** time to catch up is within 10 % of today's build, so a short outage is not slowed down.
 
-Unit tests cover what the bench cannot show: the agent skips a round while the listener is stale; the puller does not advance an interval while stale; a stall marks stale and does not signal `syncingStopped`; stale ends only on the non-paged branch, not on one applied page while behind; `Stale()` becomes true while a call is still in progress; the listener's calls carry deadlines; processing, parse and pause errors still stop the node with the statuses in section 7; the page halves only when `BlockNumber` succeeded and `FilterLogs` failed, never below 100, and doubles back after 3 applied pages; the wait doubles to 60 s only while stale and resets on progress; the Warning repeats every 30 minutes while stale; startup continues in the degraded state when the listener becomes stale; `exitCode` maps the new causes to 75 and 1 and leaves 78 unchanged.
+Unit tests cover what the bench cannot show: the agent skips a round while the listener is stale; the puller does not advance an interval while stale, for **live** pulling as well as historical (a chunk of an unknown batch offered by live pull-sync is not dropped and marked synced); the reserve worker does not lower the radius while stale; a stall marks stale and does not signal `syncingStopped`; stale ends only on the non-paged branch, not on one applied page while behind; `Stale()` becomes true while a call is still in progress; the listener's calls carry deadlines; processing, parse and pause errors still stop the node with the statuses in section 7; the page halves only when `BlockNumber` succeeded and `FilterLogs` failed, never below 100, and doubles back after 3 applied pages; the wait doubles to 60 s only while stale and resets on progress; the Warning repeats every 30 minutes while stale and is logged again on each new entry; the failover gives each attempt its own deadline and does not advance on an expired caller context; startup continues in the degraded state when the listener becomes stale; `exitCode` maps the new causes to 75 and 1 and leaves 78 unchanged.
 
 **A negative result** is any of: the new build exits or stops answering in S1, C1 or C2; a listener call outlives its deadline; it does not catch up after the proxy returns (for example because the wait cap or the smaller page leaves it permanently behind); it makes no progress in S2; or C3 recovers more slowly. Any of these is recorded in `results.md` and the change is not shipped as is.
 
@@ -217,9 +228,9 @@ The sw-1 radius scenarios (#621) are the natural repeat of the observed case. If
 ## Rollout and rollback
 
 - **Rollout:** on by default in the release that carries it.
-- **Rollback:** `postage-stall-shutdown: 10m` brings back a stop 10 minutes after the node becomes stale (with exit status 75 instead of 0); the per-call deadlines, the puller pause while stale and the lottery gate stay, since they only prevent harm. A full rollback is the previous release.
+- **Rollback:** `postage-stall-shutdown: 10m` brings back a stop 10 minutes after the node becomes stale, that is, 20 minutes after the last applied page (with exit status 75 instead of 0). Today's timing, a stop 10 minutes after the last applied page, cannot be reproduced exactly, since the setting counts from becoming stale; the per-call deadlines, the puller pause while stale and the lottery gate stay, since they only prevent harm. A full rollback is the previous release.
 - No data format changes: the batch store and the listener's stored block number are unchanged, so the node can move between versions freely.
-- The implementation pull request updates `docs/DIFFERENCES.md` (rule 13): the stall behaviour, the degraded state, the exit statuses, the setting, the `/status` and `/readiness` changes and the new metrics.
+- The implementation pull request updates `docs/DIFFERENCES.md` (rule 13): the stall behaviour, the degraded state, the exit statuses, the setting, the `/status` field and the new metrics.
 
 ## Upstream portability
 
@@ -230,13 +241,13 @@ Verified on `upstream/v2.8.2` (the tag in `.upstream-base`) and `upstream/master
 - `postageSyncingStallingTimeout` is 10 minutes (v2.8.2 `node.go:215`, master `node.go:216`);
 - the packaged unit uses `Restart=always` in both refs.
 
-So the stop of a running node on a stall, and its exit status 0, are unmodified upstream behaviour. At startup, upstream also fails the build on a stall, but upstream's `start` does not keep a build error (the #490 change is wasp's), so it exits 0 there too. wasp's changes to these files (#490, #540, #545, #578) do not touch the stall path itself. The design ports as: the per-call deadlines, the stale flag, the growing wait and the page reduction in `listener.go`; the puller wait in `puller.go`; one condition in the `isFullySynced` function and the startup wait in `node.go`; the `/status` and readiness fields; and the exit status in `start.go` and `main.go`. The exit status part does not depend on wasp's `exitCode` function from #490: upstream would map the causes in its own `main`.
+So the stop of a running node on a stall, and its exit status 0, are unmodified upstream behaviour. At startup, upstream also fails the build on a stall, but upstream's `start` does not keep a build error (the #490 change is wasp's), so it exits 0 there too. wasp's changes to these files (#490, #540, #545, #578) do not touch the stall path itself. The design ports as: the per-call deadlines, the stale flag, the growing wait and the page reduction in `listener.go`; the puller wait in `puller.go` and the skipped radius decrease in `pkg/storer/reserve.go`; the per-attempt deadline in the failover; one condition in the `isFullySynced` function and the startup wait in `node.go`; the `/status` field; and the exit status in `start.go` and `main.go`. The exit status part does not depend on wasp's `exitCode` function from #490: upstream would map the causes in its own `main`.
 
 ## Configuration
 
 **`postage-stall-shutdown`** (duration). A behaviour switch, not a tuning value: whether the node stops, and if so how long after it **became stale** (the reference point is the moment the stale state begins, that is, 10 minutes after the last applied page).
 - **Default: `0`, never stop. Decided by the operator (2026-10-08):** the node should never get truly stuck; while degraded it keeps serving content, does not play the lottery, keeps working to recover, and alerts the operator; it exits non-zero only for faults that cannot be recovered. This departs from rule 8's default of today's behaviour (a stop 10 minutes after the last applied page) by the operator's decision.
-- **Raising it, or leaving it at 0,** keeps a node with a stale batch store on the network longer. It serves retrieval, refuses chunks of new batches (peers push them elsewhere), pauses historical pulling (its neighbours transfer those chunks later instead of now) and skips lottery rounds.
+- **Raising it, or leaving it at 0,** keeps a node with a stale batch store on the network longer. It serves retrieval, refuses chunks of new batches (peers push them elsewhere), pauses pulling (its neighbours transfer those chunks later instead of now) and skips lottery rounds.
 - **Lowering it** to a duration brings back a stop. A short value turns a temporary overload or endpoint outage into a node that leaves the network, and the restart adds load to a host that may already be overloaded. A negative value is refused at start as a configuration error (`node.ErrConfig`, exit 78).
 
 **Not settings (compiled in):** the per-call deadlines (30 s for `BlockNumber`, 60 s for `FilterLogs`), the 60 s wait cap, the 30-minute repeat of the Warning, the 100-block minimum page and the 3-page growth step. None has a measurement showing it matters yet (rule 8: measure first, expose second). The measurement above records call durations, the RPC call rate and catch-up time that would justify exposing them.
@@ -245,8 +256,9 @@ So the stop of a running node on a stall, and its exit status 0, are unmodified 
 
 ## Decided by the operator (2026-10-08)
 
-1. **The node never stops for a recoverable stall:** `postage-stall-shutdown` defaults to `0`. While degraded it serves content, does not play the lottery, keeps working to recover (deadlines, backoff, smaller pages) and alerts the operator (gauges, a Warning that repeats while stale, an Info line on recovery, `/status` and readiness). A non-zero exit is reserved for faults that cannot be recovered.
-2. **Service units restart by default** (`Restart=always`, enabled at boot) as an operator extra on top of the node's own behaviour; wasp's packaged unit already does.
+1. **The node never stops for a recoverable stall:** `postage-stall-shutdown` defaults to `0`. While degraded it serves content, does not play the lottery, keeps working to recover (deadlines, backoff, smaller pages) and alerts the operator (gauges, a Warning that repeats while stale, an Info line on recovery, `/status`). A non-zero exit is reserved for faults that cannot be recovered.
+2. **`/readiness` stays unchanged.** A load balancer must keep sending traffic to a node that can still serve content, so the stale state is reported in `/status` and the metrics only.
+3. **Service units restart by default** (`Restart=always`, enabled at boot) as an operator extra on top of the node's own behaviour; wasp's packaged unit already does.
 
 ## Not in scope
 
