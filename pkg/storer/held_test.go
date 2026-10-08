@@ -72,6 +72,9 @@ type heldFixture struct {
 	health  *healthMock
 	batches *knownBatches
 	base    swarm.Address
+	// engine is the index-store engine for an on-disk fixture; empty
+	// keeps the default.
+	engine string
 }
 
 func newHeldFixture(t *testing.T, path string) *heldFixture {
@@ -84,6 +87,9 @@ func newHeldFixture(t *testing.T, path string) *heldFixture {
 func (f *heldFixture) options() *storer.Options {
 	opts := dbTestOps(f.base, 1000, nil, nil, time.Hour)
 	opts.ValidStamp = f.batches.validate
+	if f.engine != "" {
+		opts.StorageEngine = f.engine
+	}
 	return opts
 }
 
@@ -547,5 +553,40 @@ func TestHeldPerAddressCap(t *testing.T) {
 	}
 	if n := f.db.HeldCount(); n != 1 {
 		t.Fatalf("held count %d, want 1", n)
+	}
+}
+
+// TestHeldPassReachesEveryEntry checks that one validation pass whose round
+// is smaller than the number of held entries reaches all of them, on both
+// index-store engines: the pass walks the index with a cursor (#583).
+func TestHeldPassReachesEveryEntry(t *testing.T) {
+	for _, engine := range []string{storer.EngineLevelDB, storer.EnginePebble} {
+		t.Run(engine, func(t *testing.T) {
+			// A long interval: the worker never ticks, the test runs the
+			// one pass itself.
+			defer storer.SetHeldLimits(100, time.Hour, 2, time.Millisecond)()
+
+			f := &heldFixture{health: &healthMock{stale: true}, batches: newKnownBatches(), base: swarm.RandAddress(t), engine: engine}
+			f.open(t, t.TempDir())
+			t.Cleanup(func() { _ = f.db.Close() })
+
+			const n = 7
+			for range n {
+				ch, batch := f.unknownChunk(t)
+				f.hold(t, ch)
+				f.batches.add(batch)
+			}
+			if got := f.db.HeldCount(); got != n {
+				t.Fatalf("held count %d, want %d", got, n)
+			}
+			f.catchUp()
+
+			if err := f.db.ValidateHeldPass(context.Background()); err != nil {
+				t.Fatalf("validation pass: %v", err)
+			}
+			if got := f.db.HeldCount(); got != 0 {
+				t.Fatalf("held count %d after one pass with a round of 2, want 0", got)
+			}
+		})
 	}
 }

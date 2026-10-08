@@ -215,6 +215,10 @@ func SetHeldLimits(maxAddrs uint64, check time.Duration, round int, pause time.D
 	return func() { heldChunksMax, heldCheckInterval, heldRound, heldRoundPause = oldM, oldC, oldR, oldP }
 }
 
+// ValidateHeldPass runs one validation pass over the held index, as one tick
+// of the validation worker does.
+func (db *DB) ValidateHeldPass(ctx context.Context) error { return db.validateHeld(ctx) }
+
 // HeldCount returns the number of distinct held addresses.
 func (db *DB) HeldCount() uint64 { return db.held.count() }
 

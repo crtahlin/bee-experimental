@@ -364,10 +364,14 @@ func (db *DB) validateHeld(ctx context.Context) error {
 			Prefix:        after,
 			PrefixAtStart: after != "",
 		}, func(r storage.Result) (bool, error) {
-			if after != "" && r.ID <= after {
+			item := r.Entry.(*heldItem)
+			// Compare the item's own ID: the result ID of a PrefixAtStart
+			// query carries the key separator, so it never equals the
+			// cursor and orders differently from it.
+			if after != "" && item.ID() <= after {
 				return false, nil
 			}
-			batch = append(batch, r.Entry.(*heldItem).Clone().(*heldItem))
+			batch = append(batch, item.Clone().(*heldItem))
 			return len(batch) >= db.held.round, nil
 		})
 		if err != nil {
