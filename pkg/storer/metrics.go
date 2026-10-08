@@ -39,6 +39,10 @@ type metrics struct {
 	ReserveHasWaitDuration        prometheus.Histogram
 	ReserveScanDuration           *prometheus.HistogramVec
 	LocalIngestChunks             prometheus.Gauge
+	HeldChunks                    prometheus.Gauge
+	HeldPromoted                  prometheus.Counter
+	HeldDropped                   prometheus.Counter
+	HeldValidationSeconds         prometheus.Gauge
 }
 
 // newMetrics is a convenient constructor for creating new metrics.
@@ -112,6 +116,39 @@ func newMetrics() metrics {
 				Help: "Distinct chunks held from local ingests (issue #326). " +
 					"An upper bound on disk rather than a measurement of it: a chunk " +
 					"this node already held cost no new disk and is still counted.",
+			},
+		),
+		HeldChunks: prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Namespace: m.Namespace,
+				Subsystem: "postage",
+				Name:      "held_chunks",
+				Help: "Distinct chunks held while the batch store is stale because their stamp names a batch not seen yet (#583). " +
+					"They are served, and validated once caught up. Downgrade only when this reads 0.",
+			},
+		),
+		HeldPromoted: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Namespace: m.Namespace,
+				Subsystem: "postage",
+				Name:      "held_promoted",
+				Help:      "Held chunks found valid and inside the radius after catch-up and put into the reserve (#583).",
+			},
+		),
+		HeldDropped: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Namespace: m.Namespace,
+				Subsystem: "postage",
+				Name:      "held_dropped",
+				Help:      "Held chunks dropped after catch-up: invalid stamp, outside the radius, or gone from the chunk store (#583).",
+			},
+		),
+		HeldValidationSeconds: prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Namespace: m.Namespace,
+				Subsystem: "postage",
+				Name:      "held_validation_seconds",
+				Help:      "Duration of the last validation pass that emptied the held area (#583).",
 			},
 		),
 		CacheSize: prometheus.NewGauge(

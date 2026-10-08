@@ -1521,6 +1521,14 @@ func NewBee(
 	pullSyncProtocol := pullsync.New(p2ps, localStore, pssService.TryUnwrap, gsocService.Handle, validStamp, logger, pullsync.DefaultMaxPage, o.PullSyncMaxChunksPerSecond)
 	b.pullSyncCloser = pullSyncProtocol
 
+	// A full node keeps chunks of batches it has not seen yet while its batch
+	// store is stale, so it keeps accepting and serving them (#583). Set
+	// before the protocols are added, so no stream sees the field change.
+	if o.FullNodeMode && !o.BootnodeMode {
+		pushSyncProtocol.SetChunkHolder(localStore)
+		pullSyncProtocol.SetChunkHolder(localStore)
+	}
+
 	retrieveProtocolSpec := retrieval.Protocol()
 	pushSyncProtocolSpec := pushSyncProtocol.Protocol()
 	pullSyncProtocolSpec := pullSyncProtocol.Protocol()
@@ -1688,8 +1696,10 @@ func NewBee(
 			isFullySynced := func() bool {
 				reserveThreshold := reserveCapacity * 5 / 10
 				logger.Debug("Sync status check evaluated", "stabilized", detector.IsStabilized())
+				// Held chunks are not in the reserve yet, so a sample taken
+				// before they are validated would miss them (#583).
 				return localStore.ReserveSize() >= reserveThreshold && syncedWithinThreshold(pullerService.SyncRate(), o.RedistributionSyncRateThreshold, o.ReserveCapacityDoubling) && detector.IsStabilized() &&
-					postageReadyForLottery(eventListener)
+					postageReadyForLottery(eventListener) && !localStore.HeldPending()
 			}
 
 			agent, err = storageincentives.New(

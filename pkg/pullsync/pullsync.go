@@ -67,14 +67,17 @@ type Interface interface {
 }
 
 type Syncer struct {
-	streamer       p2p.Streamer
-	metrics        metrics
-	logger         log.Logger
-	store          storer.Reserve
-	quit           chan struct{}
-	unwrap         func(swarm.Chunk)
-	gsocHandler    func(*soc.SOC)
-	validStamp     postage.ValidStampFn
+	streamer    p2p.Streamer
+	metrics     metrics
+	logger      log.Logger
+	store       storer.Reserve
+	quit        chan struct{}
+	unwrap      func(swarm.Chunk)
+	gsocHandler func(*soc.SOC)
+	validStamp  postage.ValidStampFn
+	// holder keeps chunks of batches not seen yet while the batch store is
+	// stale (#583). Nil drops them as before.
+	holder         postage.ChunkHolder
 	intervalsSF    singleflight.Group[string, *collectAddrsResult]
 	syncInProgress atomic.Int32
 
@@ -319,7 +322,10 @@ func (s *Syncer) Sync(ctx context.Context, peer swarm.Address, bin uint8, start 
 
 	chunksToPut := make([]swarm.Chunk, 0, ctr)
 
-	var chunkErr error
+	var (
+		chunkErr error
+		notHeld  bool
+	)
 	for ; ctr > 0; ctr-- {
 		var delivery pb.Delivery
 		if err = r.ReadMsgWithContext(ctx, &delivery); err != nil {
@@ -357,6 +363,18 @@ func (s *Syncer) Sync(ctx context.Context, peer swarm.Address, bin uint8, start 
 
 		chunk, err := s.validStamp(newChunk.WithStamp(stamp))
 		if err != nil {
+			// While the batch store is stale, a genuine chunk of a batch
+			// this node has not seen yet is held instead of dropped, so the
+			// interval can advance without losing it (#583).
+			if held, hold := s.hold(ctx, newChunk.WithStamp(stamp), err); held {
+				continue
+			} else if hold != nil {
+				// It could have been kept but was not: do not advance
+				// past it.
+				notHeld = true
+				chunkErr = errors.Join(chunkErr, hold)
+				continue
+			}
 			s.logger.Debug("unverified stamp", "error", err, "peer_address", peer, "chunk_address", newChunk)
 			chunkErr = errors.Join(chunkErr, err)
 			continue
@@ -402,7 +420,44 @@ func (s *Syncer) Sync(ctx context.Context, peer swarm.Address, bin uint8, start 
 		}
 	}
 
+	// A wanted chunk that could become valid once caught up but could not be
+	// held: report no progress for the page, so the puller records nothing
+	// and retries it later instead of advancing past the chunk (#583).
+	if notHeld {
+		return 0, chunksPut, chunkErr
+	}
+
 	return topmost, chunksPut, chunkErr
+}
+
+// SetChunkHolder lets the syncer hold chunks of batches the node has not seen
+// yet while its batch store is stale (#583).
+func (s *Syncer) SetChunkHolder(h postage.ChunkHolder) {
+	s.holder = h
+}
+
+// hold offers a chunk whose stamp failed validation to the holder. It reports
+// whether the chunk is held, or the error that kept a chunk that qualified
+// from being held. A chunk that does not qualify returns false and nil.
+func (s *Syncer) hold(ctx context.Context, ch swarm.Chunk, cause error) (bool, error) {
+	if s.holder == nil || !postage.HoldsUnvalidated(cause) {
+		return false, nil
+	}
+	// Only a chunk whose content checks out is held: its data is genuine
+	// and only its stamp cannot be checked yet.
+	if !cac.Valid(ch) && !validSOC(ch) {
+		return false, nil
+	}
+	held, err := s.holder.HoldUnvalidated(ctx, ch, cause)
+	if held {
+		s.metrics.Held.Inc()
+	}
+	return held, err
+}
+
+func validSOC(ch swarm.Chunk) bool {
+	_, err := soc.FromChunk(ch)
+	return err == nil
 }
 
 // makeOffer tries to assemble an offer for a given requested interval.

@@ -23,4 +23,8 @@ type SyncHealth interface {
 	// StaleEndedAt returns when the stale state last ended, or the zero
 	// time if it never has.
 	StaleEndedAt() time.Time
+	// CaughtUp reports whether the listener has applied a page that
+	// reached the confirmed head since it started, and is not stale now.
+	// Held chunks are validated only then, against a current batch store.
+	CaughtUp() bool
 }

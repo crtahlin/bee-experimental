@@ -23,6 +23,7 @@ func (listenerHealth) Listen(context.Context, uint64, postage.EventUpdater) <-ch
 func (l listenerHealth) Stale() bool                { return l.stale }
 func (listenerHealth) SinceProgress() time.Duration { return 0 }
 func (listenerHealth) StaleEndedAt() time.Time      { return time.Time{} }
+func (l listenerHealth) CaughtUp() bool             { return !l.stale }
 
 // plainListener reports no sync health.
 type plainListener struct{}

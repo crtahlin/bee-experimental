@@ -58,6 +58,11 @@ func (db *DB) startReserveWorkers(
 	db.inFlight.Add(1)
 	go db.reserveWorker(ctx, ready)
 
+	// Held chunks are validated only with the reserve worker running and
+	// after storer recovery, which New has finished by now (#583).
+	db.inFlight.Add(1)
+	go db.heldValidator(ctx)
+
 	sub, unsubscribe := db.reserveOptions.startupStabilizer.Subscribe()
 	defer unsubscribe()
 

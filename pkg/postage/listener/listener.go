@@ -121,6 +121,7 @@ type listener struct {
 	listening    atomic.Bool
 	lastProgress atomic.Int64 // unix nanoseconds of the last applied page
 	staleLatched atomic.Bool  // stale until a caught-up page is applied
+	caughtUpOnce atomic.Bool  // a caught-up page was applied since Listen
 	staleSince   atomic.Int64 // unix nanoseconds the stale state began, 0 if not stale
 	staleEndedAt atomic.Int64 // unix nanoseconds the stale state last ended, 0 if never
 	headOkAt     atomic.Int64 // unix nanoseconds of the last successful block number call
@@ -198,6 +199,12 @@ func (l *listener) Stale() bool {
 		return true
 	}
 	return l.staleLatched.Load()
+}
+
+// CaughtUp reports whether a page that reached the confirmed head has been
+// applied since the listener started, and the batch store is not stale now.
+func (l *listener) CaughtUp() bool {
+	return l.listening.Load() && l.caughtUpOnce.Load() && !l.Stale()
 }
 
 // SinceProgress returns the time since the listener last applied a page, or
@@ -409,6 +416,7 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 
 	l.lastProgress.Store(time.Now().UnixNano())
 	l.staleLatched.Store(false)
+	l.caughtUpOnce.Store(false)
 	l.listening.Store(true)
 	lastConfirmedBlock := uint64(0)
 
@@ -556,6 +564,7 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 				// Caught up: the stale state ends only here, not on any
 				// applied page, and the startup wait ends (#583).
 				l.staleLatched.Store(false)
+				l.caughtUpOnce.Store(true)
 				sendSynced(nil)
 			}
 			totalTimeMetric(l.metrics.PageProcessDuration, start)

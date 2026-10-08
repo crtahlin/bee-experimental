@@ -156,6 +156,7 @@ type staleHealthMock struct{}
 func (staleHealthMock) Stale() bool                  { return true }
 func (staleHealthMock) SinceProgress() time.Duration { return 90 * time.Second }
 func (staleHealthMock) StaleEndedAt() time.Time      { return time.Time{} }
+func (staleHealthMock) CaughtUp() bool               { return false }
 
 // TestGetStatusPostageSyncStale checks that /status reports a stale batch
 // store for the local node, and leaves the fields out when nothing reports

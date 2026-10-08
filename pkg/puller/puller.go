@@ -416,8 +416,12 @@ const samplingPauseCheckInterval = 250 * time.Millisecond
 // pulling does not contend with the sample. It returns the context error if the
 // worker is cancelled while waiting, and nil once sampling has finished. See
 // issue #23.
+//
+// It also blocks while the held area is full: the batch store is stale and
+// chunks of batches not seen yet can no longer be kept, so pulling would only
+// skip them. The worker resumes once validation frees room (#583).
 func (p *Puller) waitWhileSampling(ctx context.Context) error {
-	for p.radius.IsSampling() {
+	for p.radius.IsSampling() || p.heldFull() {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -425,6 +429,13 @@ func (p *Puller) waitWhileSampling(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// heldFull reports whether the store's held area is full, for a store that
+// holds chunks pending validation (#583).
+func (p *Puller) heldFull() bool {
+	h, ok := p.radius.(interface{ HeldFull() bool })
+	return ok && h.HeldFull()
 }
 
 func (p *Puller) syncPeerBin(parentCtx context.Context, peer *syncPeer, bin uint8, cursor uint64) {

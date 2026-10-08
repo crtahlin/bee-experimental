@@ -25,6 +25,7 @@ type healthMock struct {
 	stale    bool
 	endedAt  time.Time
 	progress time.Duration
+	caughtUp bool
 }
 
 func (h *healthMock) Stale() bool {
@@ -43,6 +44,12 @@ func (h *healthMock) StaleEndedAt() time.Time {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.endedAt
+}
+
+func (h *healthMock) CaughtUp() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return !h.stale && h.caughtUp
 }
 
 func (h *healthMock) set(stale bool, endedAt time.Time) {

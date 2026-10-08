@@ -22,6 +22,7 @@ type metrics struct {
 	StampValidationTime     *prometheus.HistogramVec
 	Forwarder               prometheus.Counter
 	Storer                  prometheus.Counter
+	Held                    prometheus.Counter
 	TotalHandlerTime        *prometheus.HistogramVec
 	PushToPeerTime          *prometheus.HistogramVec
 
@@ -100,6 +101,12 @@ func newMetrics() metrics {
 			Subsystem: subsystem,
 			Name:      "forwarder",
 			Help:      "No of times the peer is a forwarder node.",
+		}),
+		Held: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "chunks_held",
+			Help:      "Pushed chunks held without a receipt because their stamp names a batch not seen yet while the batch store is stale (#583).",
 		}),
 		Storer: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: m.Namespace,
