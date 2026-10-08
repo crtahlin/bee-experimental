@@ -207,8 +207,10 @@ func (db *DB) HoldUnvalidated(ctx context.Context, ch swarm.Chunk, cause error) 
 		return postage.NotHeld, fmt.Errorf("held index: %w", err)
 	}
 	if entries >= heldPerAddress {
-		// The chunk's data is held already; this stamp is not kept.
-		return postage.NotHeld, nil
+		// The chunk's data is held already, but this stamp is not kept.
+		// The error makes pull-sync retry the page rather than advance
+		// past a stamp that may be the valid one.
+		return postage.NotHeld, postage.ErrHeldAddressFull
 	}
 	claimed := false
 	if entries == 0 {

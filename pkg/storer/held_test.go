@@ -535,7 +535,8 @@ func TestHeldTransientErrorRetried(t *testing.T) {
 }
 
 // TestHeldPerAddressCap checks that one address keeps at most 8 held
-// entries; a further stamp for it is not held (#583).
+// entries; a further stamp for it is not held and answers
+// ErrHeldAddressFull, so pull-sync retries the page (#583).
 func TestHeldPerAddressCap(t *testing.T) {
 	defer storer.SetHeldLimits(100, time.Hour, 1000, time.Millisecond)()
 
@@ -548,8 +549,8 @@ func TestHeldPerAddressCap(t *testing.T) {
 		f.hold(t, stamped())
 	}
 	held, err := holdBool(f.db, context.Background(), stamped(), errUnknownBatch)
-	if err != nil || held {
-		t.Fatalf("ninth stamp: held %v, error %v; want not held, nil", held, err)
+	if held || !errors.Is(err, postage.ErrHeldAddressFull) {
+		t.Fatalf("ninth stamp: held %v, error %v; want not held, %v", held, err, postage.ErrHeldAddressFull)
 	}
 	if n := f.db.HeldCount(); n != 1 {
 		t.Fatalf("held count %d, want 1", n)

@@ -15,6 +15,10 @@ import (
 // area is full (#583).
 var ErrHeldAreaFull = errors.New("postage: held area full")
 
+// ErrHeldAddressFull is returned when a chunk qualifies to be held but its
+// address already has the most held entries one address may have (#583).
+var ErrHeldAddressFull = errors.New("postage: held entries for address full")
+
 // HoldResult says what HoldUnvalidated did with a chunk.
 type HoldResult int
 
@@ -43,8 +47,10 @@ type ChunkHolder interface {
 	// is not known yet (ErrNotFound or ErrInvalidIndex). It reports whether
 	// the chunk is held, and whether its address is newly held, so a caller
 	// acts on the chunk's content once. A chunk that qualifies but finds the
-	// held area full returns ErrHeldAreaFull. Otherwise it returns NotHeld
-	// and nil, and the caller handles the stamp error as before.
+	// held area full returns ErrHeldAreaFull, and one whose address has the
+	// most entries it may have returns ErrHeldAddressFull. Otherwise it
+	// returns NotHeld and nil, and the caller handles the stamp error as
+	// before.
 	//
 	// The holder verifies the chunk's full content address (cac.Valid or
 	// soc.Valid) itself and holds nothing that fails it.

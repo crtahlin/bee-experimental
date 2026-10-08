@@ -271,3 +271,21 @@ func TestSyncHeldUnwrappedOnce(t *testing.T) {
 		}
 	})
 }
+
+// TestSyncNoProgressAtAddressCap checks that a chunk refused because its
+// address has the most held entries makes the page report no progress
+// (#583).
+func TestSyncNoProgressAtAddressCap(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		holder := &holderMock{err: postage.ErrHeldAddressFull}
+		_, _, sync, _ := heldSetup(t, holder)
+
+		topmost, _, err := sync()
+		if !errors.Is(err, postage.ErrHeldAddressFull) {
+			t.Fatalf("got error %v, want %v", err, postage.ErrHeldAddressFull)
+		}
+		if topmost != 0 {
+			t.Fatalf("got topmost %d, want 0 (no progress)", topmost)
+		}
+	})
+}
