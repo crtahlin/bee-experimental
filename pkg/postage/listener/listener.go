@@ -199,8 +199,11 @@ func (l *listener) Stale() bool {
 	if !l.listening.Load() {
 		return false
 	}
+	// The clock is read first: progress loaded after it can only be newer,
+	// so a delay between the two cannot make fresh progress look stale.
+	now := time.Now()
 	last := l.lastProgress.Load()
-	if time.Since(time.Unix(0, last)) >= l.stallingTimeout {
+	if now.Sub(time.Unix(0, last)) >= l.stallingTimeout {
 		l.markStale(last)
 		return true
 	}
