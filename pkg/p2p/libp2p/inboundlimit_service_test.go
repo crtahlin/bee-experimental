@@ -233,11 +233,12 @@ func TestInboundLimitServiceOffRecordsNothing(t *testing.T) {
 			InboundConnectionLimitSet: true,
 		},
 	})
-	sd, sdOverlay := newService(t, 1, libp2pServiceOpts{libp2pOpts: libp2p.Options{FullNode: true}})
-	if _, err := sd.Connect(context.Background(), serviceUnderlayAddress(t, s)); err != nil {
+	// An outbound connect records the full peer before it returns, so
+	// the check right after it is deterministic.
+	target, _ := newService(t, 1, libp2pServiceOpts{libp2pOpts: libp2p.Options{FullNode: true}})
+	if _, err := s.Connect(context.Background(), serviceUnderlayAddress(t, target)); err != nil {
 		t.Fatal(err)
 	}
-	expectPeersEventually(t, s, sdOverlay)
 	if got := s.KnownFullAddresses(); got != 0 {
 		t.Fatalf("got %v known addresses with the limit off, want 0", got)
 	}
