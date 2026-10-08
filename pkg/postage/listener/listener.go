@@ -395,7 +395,8 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 
 	// Type assertion to detect if backend is SnapshotLogFilterer
 	pageSize := uint64(blockPage)
-	if _, isSnapshot := l.ev.(interface{ GetBatchSnapshot() []byte }); isSnapshot {
+	_, isSnapshot := l.ev.(interface{ GetBatchSnapshot() []byte })
+	if isSnapshot {
 		pageSize = blockPageSnapshot
 		l.logger.Debug("using snapshot page size", "page_size", pageSize)
 	} else {
@@ -445,8 +446,16 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 	l.listening.Store(true)
 	lastConfirmedBlock := uint64(0)
 
+	// The snapshot listener's caller waits for the snapshot to be applied
+	// and treats the synced signal as success, so a stale snapshot load
+	// must not end that wait; only the chain listener's startup wait ends
+	// when it becomes stale.
+	watchSynced := sendSynced
+	if isSnapshot {
+		watchSynced = func(error) {}
+	}
 	l.wg.Add(1)
-	go l.watch(ctx, sendSynced)
+	go l.watch(ctx, watchSynced)
 
 	l.wg.Add(1)
 	listenf := safe.RunFunc(l.logger, "postage-listener-func", func() error {

@@ -234,3 +234,71 @@ func TestStaleWarningRepeatsAndRecovers(t *testing.T) {
 	waitFor(t, "the stale state to end", func() bool { return !l.(postage.SyncHealth).Stale() })
 	waitFor(t, "the recovery to be logged", func() bool { return buf.count("postage sync caught up") == 1 })
 }
+
+// snapshotSwitch is a switchFilterer that also looks like the snapshot
+// filterer, so the listener treats it as the snapshot listener.
+type snapshotSwitch struct{ *switchFilterer }
+
+func (snapshotSwitch) GetBatchSnapshot() []byte { return nil }
+
+// TestStaleEndsStartupWaitOnlyForChain checks that a stale batch store ends
+// the chain listener's startup wait, so the node comes up degraded, but not
+// the snapshot listener's, whose caller would take it as a loaded snapshot
+// (#583).
+func TestStaleEndsStartupWaitOnlyForChain(t *testing.T) {
+	defer listener.SetStaleTimings(5*time.Millisecond, time.Hour)()
+
+	for _, tc := range []struct {
+		name     string
+		snapshot bool
+	}{
+		{"chain listener", false},
+		{"snapshot listener", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sw := &switchFilterer{}
+			sw.down.Store(true)
+			var f listener.BlockHeightContractFilterer = sw
+			if tc.snapshot {
+				f = snapshotSwitch{sw}
+			}
+			l := listener.New(syncutil.NewSignaler(), log.Noop, f, postageStampContractAddress, postageStampContractABI,
+				func() time.Duration { return time.Millisecond }, listener.DefaultConfirmationDepth, 50*time.Millisecond, time.Millisecond)
+			testutil.CleanupCloser(t, l)
+			synced := l.Listen(context.Background(), 0, quietUpdater{})
+
+			waitFor(t, "the batch store to go stale", l.(postage.SyncHealth).Stale)
+			select {
+			case <-synced:
+				if tc.snapshot {
+					t.Fatal("a stale snapshot load ended the wait")
+				}
+			case <-time.After(300 * time.Millisecond):
+				if !tc.snapshot {
+					t.Fatal("a stale batch store did not end the startup wait")
+				}
+			}
+		})
+	}
+}
+
+// TestBlocksBehindGauge checks the blocks_behind gauge: -1 while stale with
+// no block number answered since, and the distance to the head once the
+// endpoint answers (#583).
+func TestBlocksBehindGauge(t *testing.T) {
+	defer listener.SetStaleTimings(5*time.Millisecond, time.Hour)()
+
+	f := &switchFilterer{}
+	f.down.Store(true)
+	l, _ := startStale(t, f, log.Noop)
+
+	waitFor(t, "the gauge to read -1 while stale and the head unknown", func() bool {
+		return listener.BlocksBehindGauge(l) == -1
+	})
+
+	f.head.Store(1_000_000_000)
+	f.down.Store(false)
+	waitFor(t, "the gauge to show the distance to the head", func() bool {
+		return listener.BlocksBehindGauge(l) > 1_000_000
+	})
+}

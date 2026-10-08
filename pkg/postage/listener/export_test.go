@@ -4,7 +4,21 @@
 
 package listener
 
-import "time"
+import (
+	"time"
+
+	"github.com/ethersphere/bee/v2/pkg/postage"
+	dto "github.com/prometheus/client_model/go"
+)
+
+// BlocksBehindGauge reads the blocks_behind gauge of a listener.
+func BlocksBehindGauge(l postage.Listener) float64 {
+	var m dto.Metric
+	if err := l.(*listener).metrics.BlocksBehind.Write(&m); err != nil {
+		return -2
+	}
+	return m.GetGauge().GetValue()
+}
 
 var (
 	TailSize          = DefaultConfirmationDepth
