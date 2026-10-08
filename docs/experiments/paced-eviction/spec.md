@@ -1,135 +1,149 @@
 # Paced eviction: a radius increase that does not take the node offline
 
-Issue: [#623](https://github.com/crtahlin/wasp/issues/623), part of the epic [#621](https://github.com/crtahlin/wasp/issues/621). Measurement: [#622](https://github.com/crtahlin/wasp/issues/622).
+Issue: [#623](https://github.com/crtahlin/wasp/issues/623), part of the epic [#621](https://github.com/crtahlin/wasp/issues/621). Related: [#622](https://github.com/crtahlin/wasp/issues/622) (measurement), [#628](https://github.com/crtahlin/wasp/issues/628) (memory), [#625](https://github.com/crtahlin/wasp/issues/625) (sampling), [#627](https://github.com/crtahlin/wasp/issues/627) (compaction).
 
 ## Terms
 
-- **Eviction:** deleting chunks from the reserve because it is over capacity. After a radius increase this is the chunks below the new storage radius, about half the reserve.
-- **Round:** one step of eviction: read up to a fixed number of chunks to evict, delete them, release the locks.
-- **Urgent eviction:** eviction while the disk under the data directory is nearly full, when freeing space matters more than staying gentle.
+- **Eviction:** deleting chunks from the reserve because it is over capacity (`unreserve`), or because their batch expired (`evictExpiredBatches`). After a radius increase, eviction deletes the chunks below the new storage radius, about half the reserve.
+- **Round:** one step of eviction: read up to a fixed number of a batch's chunks to evict, delete them, update the counters, release the batch lock.
+- **Arrival rate:** how many chunks per second the node adds to its reserve, measured inside the node from its own puts.
 
 ## Problem
 
-**Measured (sw-1, 2026-10-08, radius-change scenario A):** ten nodes with reserve doubling 3 on one machine (8 threads, 32 GB, two SATA SSDs, no swap) were restarted with doubling 2. Each had to evict about 14 million chunks. The load average rose to about 95 with about 31 % of CPU time waiting on disk, and from about 2 hours after the restart the machine stopped answering SSH, and the nodes stopped answering the libp2p greeting, for at least 4.5 hours. The operator reports outages of a day or longer from real evictions on other machines.
+**Measured (sw-1, 2026-10-08, radius-change scenario A):** ten nodes with reserve doubling 3 on one machine (8 threads, 32 GB, two SATA SSDs, no swap) were restarted with doubling 2. Each had to evict about 14 million chunks. The load average rose to about 95 with about 31 % of CPU time waiting on disk, and from about 2 hours after the restart the machine stopped answering SSH, and the nodes stopped answering the libp2p greeting, for at least 4.5 hours. The operator reports outages of a day or longer from real evictions on other machines. The machine's logs are not yet readable, so the cause (eviction load, memory, or both) is not confirmed; see "Assumptions to revise".
 
-**From the code (`origin/main`; the eviction code is unchanged from upstream v2.8.2):**
+**From the code (`origin/main`).** `pkg/storer/internal/reserve/reserve.go` is unchanged from upstream v2.8.2. `pkg/storer/reserve.go` is not: wasp added, among other things, the shutdown checks of #407 in `evictExpiredBatches` (lines 316 to 325) and `unreserve` (lines 522 to 527), which the new loop must keep.
 
-1. `unreserve` (`pkg/storer/reserve.go` 483 to 563) asks for the whole excess at once: `target` is reserve size minus capacity, and each batch is asked for `max(target-totalEvicted, minEvictCount)` chunks.
-2. `EvictBatchBin` (`pkg/storer/internal/reserve/reserve.go` 331 to 430) collects every chunk to evict into memory first (lines 354 to 385), then deletes them with one transaction per chunk on `runtime.NumCPU()` goroutines (lines 390 to 408). Nothing limits the rate.
-3. It holds the batch's lock for the whole call (line 337). `Put` takes the same lock (line 104), so a store into that batch waits until the batch's eviction ends.
-4. The radius is raised after one pass at the old radius (`pkg/storer/reserve.go` 555 to 558), so the node stops claiming the chunks below the new radius minutes after the restart, long before it has deleted them.
-5. New chunks are accepted while the reserve is over capacity (`ReservePutter`, `pkg/storer/reserve.go` 461 to 481); only the eviction brings it back.
+1. `unreserve` (`pkg/storer/reserve.go` 483 to 563) fixes its `target`, reserve size minus capacity, when it starts (line 497). Chunks that arrive later raise the reserve again and start the next over-capacity eviction. Each batch is asked for `max(target-totalEvicted, minEvictCount)` chunks.
+2. `EvictBatchBin` (`pkg/storer/internal/reserve/reserve.go` 331 to 430) collects every chunk to evict into memory first (lines 354 to 385), then deletes them with one transaction per chunk on `runtime.NumCPU()` goroutines (lines 390 to 408). Nothing limits the rate or the memory.
+3. It holds the batch's lock for the whole call (line 337). `Put` (line 104) and `Get` (lines 306 to 308) take the same lock, so stores into the batch and retrievals of its chunks wait until the batch's eviction ends.
+4. The radius is raised after one pass at the old radius (`pkg/storer/reserve.go` 555 to 558), before the main deletion at the new radius.
+5. New chunks are accepted while the reserve is over capacity (`ReservePutter`, lines 461 to 481).
+6. Deleting a chunk does not shrink files on disk. Sharky's `release` only marks the slot reusable (`pkg/sharky/shard.go` 197 to 198); its files shrink only through `TruncateAt` during recovery at start (`pkg/sharky/recovery.go` 106 to 113). Pebble frees space only after compaction (#627).
 
-So eviction is as fast and as wide as the machine allows, on purpose, although nothing about a radius increase needs it to be fast: chunks below the radius are no longer the node's responsibility and only take disk space until they are gone.
+So eviction runs as fast and as wide as the machine allows, although a radius increase does not need it to be fast: chunks below the radius are no longer the node's responsibility.
 
 ## Hypothesis
 
-Deleting at a bounded rate, in small rounds that release their locks, keeps a node responsive during a radius increase: it keeps serving retrievals, syncing, answering handshakes and sampling within its budget, and a machine with several such nodes stays reachable. The cost is a longer eviction, hours instead of the fastest possible, which is acceptable while the disk has room. When the disk is nearly full, eviction switches to full speed, as today.
-
-The hypothesis that the sw-1 stall was caused by eviction load is not yet confirmed: the machine's logs are not readable yet (see "Assumptions to revise").
+Deleting in small rounds, with few workers and a bounded rate, keeps a node responsive during a radius increase: it keeps serving retrievals, syncing, answering handshakes and sampling within its budget, and a machine with several such nodes stays reachable. The cost is a longer eviction, which is acceptable because the chunks below the radius cost only disk space while they wait. Unconditional rounds also bound the memory of an eviction, whatever the rate.
 
 ## Design
 
 All changes are inside the node. Nothing depends on other nodes on the same machine or on server settings.
 
-### 1. Rounds instead of one long call
+### 1. Rounds, always
 
-`unreserve` evicts in rounds of at most `evictionRound` chunks (compiled in, 1,000). A round reads up to that many items of the batch below the radius, deletes them, updates the counters, and releases the batch lock before the next round. This also bounds the memory of one round (the subject of [#628](https://github.com/crtahlin/wasp/issues/628), which this design satisfies for the paced path) and gives stores into the batch a chance between rounds.
+`EvictBatchBin` works in rounds of at most `evictionRound` chunks (compiled in; 1,000, smaller only if the bench measurement shows rounds of 1,000 still cause latency spikes). A round:
 
-Deleting the items of one round may keep the existing per-chunk transactions and the `NumCPU` limit at first; batching them into fewer transactions is [#624](https://github.com/crtahlin/wasp/issues/624) and changes only the cost per round.
+- iterates the batch's `BatchRadiusItem` entries with `Prefix: batchID` and, after the first round, `PrefixAtStart` from the last key the previous round read, so it never walks again over the deletion markers of earlier rounds (`pkg/storage/pebblestore/store.go` 258 to 280). Not `SkipFirst`: the resume key was deleted, so skipping the first result would skip a live item;
+- stops when the batch's prefix ends, when it has collected `evictionRound` items, or when it reaches the count asked for;
+- deletes those items, adds them to `size` and to the evicted counter, and releases the batch lock.
 
-### 2. A rate limit between rounds
+Rounds apply at every rate, including 0. This answers the collect-everything part of #628: the memory of an eviction is bounded by one round instead of growing with the target. #628's other parts (measuring the memory curve, and the cost of `pinUuids` lookups per item) stay with that issue.
 
-A token bucket (`golang.org/x/time/rate`, already a dependency) with rate `reserve-eviction-rate` chunks per second and a burst of one round. Before each round, eviction waits for tokens for the whole round. The wait observes the context and `db.quit`, so shutdown and a batch-expiry signal still stop it as today.
+**Releasing the lock between rounds is safe.** All eviction runs on the single `reserveWorker` goroutine (`pkg/storer/reserve.go` 253 to 305), so two rounds never overlap. A chunk stored into the batch between rounds is either at or above the radius, and not evicted, or below it, and taken by a later round. `size` is updated after each round. A batch expiry aborts `unreserve` as today, and the expired-batch marker is deleted only after the batch is gone (lines 334 to 336). The radius is persisted by `SetRadius` (`pkg/storer/internal/reserve/reserve.go` 717 to 723).
 
-Expired batches (`evictExpiredBatches`) use the same limiter: an expiry of a large batch on every node at the same block is the other way a whole network evicts at once.
+### 2. Pacing: rate and workers
 
-### 3. Urgent eviction when the disk is nearly full
+A token bucket (`golang.org/x/time/rate`, already a dependency) with rate `reserve-eviction-rate` chunks per second and a burst of one round. Before each round eviction takes tokens for the round. The batch-expiry signal is a channel (`pkg/storer/reserve.go` 504, 528), not a context, so the wait is a `select` on a timer for the delay the limiter reserves (`Limiter.ReserveN`), `db.quit`, the batch-expiry channel and the context; any of the last three cancels the reservation and returns as today.
 
-Before each round, eviction checks the free space of the filesystem holding the data directory (`statfs` on Unix, `GetDiskFreeSpaceEx` on Windows, both through `golang.org/x/sys`, already a dependency). When it is below `reserve-eviction-urgent-free-space`, the round runs without waiting for tokens. Back above it, pacing resumes. The check costs one system call per round.
+When the rate is above 0, a round deletes on `reserve-eviction-workers` goroutines (compiled in at 2 unless the bench shows otherwise) instead of `runtime.NumCPU()`. Limiting the rate alone would only cap the average: each round would still run its deletions on every CPU thread, so the peak load would stay. At rate 0 the round keeps `runtime.NumCPU()`, today's behaviour apart from the round size.
 
-This is what makes a slow rate safe: the node never runs out of disk because of pacing, since it evicts at full speed as soon as space is short.
+### 3. Never falling behind: evict at least as fast as chunks arrive
 
-### 4. Yielding to a sample
+The node counts its own reserve puts (`ReservePutter`) over a sliding window of one minute. Eviction runs at `max(reserve-eviction-rate, arrival rate)`, so the excess never grows during a paced eviction, whatever the rate setting. This needs no system call and no knowledge of the filesystem.
 
-Pausing eviction while a reserve sample runs is [#625](https://github.com/crtahlin/wasp/issues/625). Rounds make it a check of one flag before each round. It is specified there, not here, but this design is what it builds on.
+An earlier draft switched to full speed when free disk space was low. It is dropped: deleting chunks does not free filesystem space (Problem, point 6), so a node that turned urgent would stay urgent until restart, and on a filesystem shared by several nodes every node would cross the threshold together and evict at full speed, recreating scenario A.
 
-### 5. What stays the same
+**The disk cost of pacing.** Chunks that arrive during a paced eviction cannot always reuse slots that are not yet freed, so the shard files grow by about 4 KB per arriving chunk for as long as the eviction lasts, and the space is reclaimed only by compaction (#627) and sharky's truncation at start. On a settled node this is small; on a node pulling at full speed it is the main cost, which is why the eviction follows the arrival rate.
 
-- The radius is still raised at the same point (`pkg/storer/reserve.go` 555 to 558). Changing when the radius rises changes what the node claims to the network, and is out of scope.
-- What is evicted, and in which order of batches, is unchanged.
-- `reserve-eviction-rate: 0` gives today's behaviour: no waiting, and one call per batch for the whole remaining target.
+### 4. What is dropped, and why
+
+**Deferring the deletion while the disk has room** (an idea in #623) is dropped. It would be safe for sampling (Notes below), push-sync (`waitNetworkRFunc`, `pkg/node/node.go` 1450 to 1465) and salud, but it has two costs this design avoids: the sharky growth above for the whole deferral, and that a worker sitting inside `unreserve` cannot lower the radius if the network shrinks meanwhile. Pacing gives most of the benefit without them.
+
+### 5. Expired batches
+
+`evictExpiredBatches` uses the same rounds and the same limiter. Pacing it has a cost to other nodes that a radius increase does not have: an expired batch's chunks stay inside the radius for longer, so peers that pull-sync from this node fetch them and reject them on stamp validation, spending their bandwidth, and the `ReserveSize` this node reports through the status protocol (`pkg/status/status.go` 141) stays inflated for longer. Because an expiry is predictable, a random start delay per node (for example up to 10 minutes) would spread a network-wide expiry without slowing the deletion of chunks inside the radius. Which of the two is used for expired batches is an open question for the operator.
 
 ### 6. Counters and log
 
-The evicted counter and reserve size are updated after each round (today: after each batch; [#626](https://github.com/crtahlin/wasp/issues/626) covers progress reporting in full). One Info line when an eviction starts says whether it is paced or urgent, the target and the rate.
+The evicted counter and the reserve size are updated after each round (today: after each batch). One Info line when an eviction starts says the target, the rate and the number of workers. Full progress reporting is #626.
+
+### 7. What stays the same
+
+- The radius is raised at the same point. Changing when it rises changes what the node claims to the network.
+- What is evicted, and in which order of batches.
+- With `reserve-eviction-rate: 0`: no waiting and `runtime.NumCPU()` workers, as today; only the rounds and the arrival-rate floor (which has no effect at full speed) differ.
 
 ## Protocol impact
 
-None. Eviction is local to the node. Nothing under `pkg/p2p`, `pkg/swarm` or `pkg/config` changes, and no message or timing seen by peers changes. A paced node holds chunks below its radius for longer and can still serve them if asked; it does not claim them.
+None. Eviction is local to the node. Nothing under `pkg/p2p`, `pkg/swarm` or `pkg/config` changes, and no message format changes. Peers see a node that holds chunks below its radius for longer and can still serve them if asked, and, for paced expired batches, chunks that fail stamp validation for longer (section 5).
 
 ## Configuration
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `reserve-eviction-rate` | 2,000 chunks per second (see "Decision for the operator") | The most chunks the node evicts per second while the disk has room. 0 means no limit, today's behaviour. |
-| `reserve-eviction-urgent-free-space` | 10 GB | Below this much free space on the data directory's filesystem, eviction runs at full speed. 0 turns urgent eviction off. |
+| `reserve-eviction-rate` | 0 until the bench measurement exists (see "Decisions for the operator") | The most chunks the node evicts per second, raised to the arrival rate when that is higher. 0 means no limit and today's number of workers. |
 
-**Raising `reserve-eviction-rate`:** a radius increase finishes sooner and the disk space comes back sooner, at the cost of more disk and CPU load during it, closer to today's behaviour that took sw-1 offline. Other nodes pay only if this node becomes unresponsive: retrievals and syncs through it fail or slow down, and a host with several nodes can take all of them offline together.
+**Raising `reserve-eviction-rate`:** a radius increase finishes sooner, at the cost of more disk and CPU load during it, closer to today's behaviour that took sw-1 offline. Other nodes pay only if this node becomes unresponsive: retrievals and syncs through it fail or slow down. For expired batches a higher rate shortens the time peers fetch and reject expired chunks.
 
-**Lowering it:** the node stays more responsive, but holds the excess chunks for longer. At 2,000 per second an excess of 14 million chunks takes about 2 hours; at 500 about 8 hours. The disk must hold the excess for that time, and the reserve keeps growing with new chunks meanwhile; if new chunks arrive faster than the rate, the excess only shrinks when urgent eviction starts. Other nodes are not affected.
+**Lowering it:** the node stays more responsive, but the eviction takes longer and the shard files grow about 4 KB per chunk arriving meanwhile, reclaimed only by compaction. For expired batches, peers fetch and reject expired chunks for longer, which costs their bandwidth, and the reserve size this node reports stays inflated for longer.
 
-**Raising `reserve-eviction-urgent-free-space`:** urgent eviction starts earlier, so a small disk is protected sooner, but more evictions run at full speed and lose the benefit of pacing. **Lowering it:** pacing holds closer to a full disk; set too low, the disk can fill before urgent eviction frees space, and a full disk stops the node from storing anything.
+**Expected rates (estimates to replace with the bench measurement):** if the rate today, with ten nodes evicting at once, was about 1,400 chunks per second per node (assumption, see below), the machine as a whole deleted about 14,000 per second while stalling. A per-node rate of 300 would keep ten nodes at about 3,000 per second together, about a fifth of that, and an excess of 14 million chunks would take about 13 hours per node.
 
-Both settings take effect at start; they are not on-disk layout.
+The setting takes effect at start; it is not on-disk layout.
 
 ## Measurement
 
-Accepted against [#622](https://github.com/crtahlin/wasp/issues/622), with 3 runs per condition.
+**State between runs:** each run starts from a copy of the data directory taken once before the first run (a stopped node, `cp -a` or a filesystem snapshot), restored before every run. Without it each run would first need about a day of pull-syncing to refill the reserve.
 
-**Single node, bench-1 or bench-2:** one node, reserve doubling lowered by one (an eviction of about half the reserve), nothing else running. Conditions: `reserve-eviction-rate: 0` (today) and the default. Recorded every 15 s: radius, reserve size, evicted count, resident memory, CPU, disk utilisation, API `/health` latency, a libp2p greeting answered or not, a known chunk retrieved or not; plus the duration and failed-chunk counts of a worst-case sample taken during the eviction, and the total eviction time.
+**Single node first, bench-1 or bench-2.** One node, nothing else running, reserve doubling lowered by one (an eviction of about half the reserve). Conditions, 3 runs each:
 
-**Ten nodes at once, sw-1:** scenario A with the default rate, compared with the run of 2026-10-08. Each run on sw-1 is a full increase and refill cycle of about a day, so 3 runs there take about 3 days of rental; if that is not available, sw-1 gives one run and the bench gives the three, and the result says so.
+1. today's code (`main`);
+2. rounds at rate 0 (separates the memory effect of rounds from pacing);
+3. rounds at a paced rate, with 2 workers;
+4. expired-batch eviction of a large batch: today's code, and the paced version.
 
-**Accepted when**, in all runs:
-1. the node answers `/health` within 1 s and the libp2p greeting within 5 s throughout the eviction (today on sw-1: no answer for hours);
-2. a worst-case sample during the eviction finishes within the budget of the machine's chain (about 570 s today, about 230 s with 2-second blocks) with no failed chunks;
-3. the eviction completes, and the reserve returns to capacity, within the time the rate predicts plus 20 %.
+Recorded every 15 s: radius, reserve size, evicted count, resident memory and Go heap, CPU, disk utilisation, API `/health` latency, whether the libp2p greeting is answered, whether a known chunk is retrieved, the arrival rate; plus the duration and failed-chunk counts of a worst-case sample during the eviction, the total eviction time and the growth of the shard files.
 
-**A negative result** looks like this: with pacing the node is still unresponsive or samples still fail, which would mean the load comes from something other than the deletion rate (for example memory, [#628](https://github.com/crtahlin/wasp/issues/628), or compaction, [#627](https://github.com/crtahlin/wasp/issues/627)); or the eviction never finishes at the default rate because new chunks arrive faster, which would mean the default is too low.
+**Ten nodes at once, sw-1,** only after the bench result, and only if rental time allows: scenario A with the paced rate, compared with the run of 2026-10-08. Each sw-1 run is a full increase and refill cycle; if fewer than 3 runs fit, the result says so.
+
+**Accepted when,** in all 3 runs of the paced condition on the bench:
+1. `/health` answers within 1 s and the libp2p greeting within 5 s throughout the eviction;
+2. a worst-case sample during the eviction finishes within the budget of the chain the bench node is on, with no failed chunks;
+3. peak memory does not grow with the eviction target (conditions 2 and 3 against 1);
+4. the eviction completes within the time the rate predicts, plus 20 %.
+
+**A negative result** looks like this: with rounds and pacing the node is still unresponsive or samples still fail, which would point at something else (compaction, #627, or the per-chunk transactions, #624); or the eviction never finishes because the arrival-rate floor does not keep up, which would mean the arrival measurement is wrong.
 
 ## Rollout and rollback
 
-On by default (see the decision below). An operator gets today's behaviour with `reserve-eviction-rate: 0`. A node interrupted in the middle of a paced eviction resumes it after a restart, because `reserveWorker` triggers `unreserve` whenever the reserve is over capacity (`pkg/storer/reserve.go` 245 to 247). Rolling back means installing the previous release; no data changes.
+With the default of 0, the only change an operator sees is the bounded memory of rounds. Pacing is turned on by setting a rate. A node interrupted in the middle of an eviction resumes it after a restart, because `reserveWorker` triggers `unreserve` whenever the reserve is over capacity (`pkg/storer/reserve.go` 245 to 247). Rolling back means installing the previous release; no data changes.
 
 ## Upstream portability
 
-Self-contained in `pkg/storer` and `pkg/storer/internal/reserve`, which are unchanged from upstream v2.8.2, so the change applies to Bee as it is. Upstream would need the two settings and the decision on a default.
+The core change is in `pkg/storer/internal/reserve`, unchanged from upstream v2.8.2, and in the `unreserve` loop. The wasp-only shutdown checks of #407 would be left out of an upstream port. Upstream would need the setting and the decision on a default.
 
 ## Operator extras (optional)
 
-On top of the node-level pacing, an operator running several nodes on one machine may also:
-- set a memory limit per node (`GOMEMLIMIT` in the service environment), so one node cannot take memory the others need;
-- give the services a lower I/O and CPU weight (`IOWeight=`, `CPUWeight=` in systemd), so eviction yields to interactive use of the machine.
+On top of the node-level fix, an operator running several nodes on one machine may also set a memory limit per node (`GOMEMLIMIT`) and lower I/O and CPU weights for the services (`IOWeight=`, `CPUWeight=` in systemd). Neither is needed for the fix to work, and the measurement runs without them.
 
-Neither is needed for the fix to work, and the measurement runs without them.
+## Notes
+
+- **A radius-increase eviction never deletes chunks the sampler reads.** `sampleBins` limits the sample to bins at or above the storage radius (`pkg/storer/sample.go` 651 to 659), and the radius rises before the deletion at the new radius (`pkg/storer/reserve.go` 555 to 557), which deletes only bins below it. For a radius increase, eviction and sampling compete only for the disk. The correctness concern in #625 applies to expired-batch eviction, which deletes inside the radius.
 
 ## Assumptions to revise with the sw-1 data
 
-The sw-1 logs from 2026-10-08 are not readable yet ([#622](https://github.com/crtahlin/wasp/issues/622)). These parts of the spec rest on assumptions:
+The sw-1 logs from 2026-10-08 are not readable yet (#622):
 
-1. **The stall was caused by eviction load (disk and CPU), not only by memory.** If the kernel log shows out-of-memory kills or memory pressure as the cause, [#628](https://github.com/crtahlin/wasp/issues/628) comes first, and pacing is still needed but second.
-2. **The deletion rate of today's code.** From Pebble's flushed bytes it was in the order of 1,400 chunks per second per node with ten nodes at once; not counted directly. The default rate is chosen against this.
-3. **New chunks arrive much slower than the default rate** on a settled node, so a paced eviction finishes. To be checked against the pull-sync rates of the sw-1 nodes during the eviction.
-4. **Samples failed or slowed during the eviction.** Expected from the code, not yet seen in a sample log.
+1. **The stall came from eviction load, not only from memory.** If the kernel log shows out-of-memory kills, the rounds (memory) matter more than the rate; both are in this design.
+2. **Today's deletion rate of about 1,400 chunks per second per node** is derived, not counted: Pebble flushed about 34 MB per minute per node, about 0.57 MB per second, and the figure assumes about 400 bytes of index writes per deleted chunk (five index entries removed per chunk, `RemoveChunkWithItem`). It could be off by a factor of two either way.
+3. **New chunks arrive far slower than any useful rate** on a settled node, so the arrival-rate floor rarely applies. To check against the pull-sync rates during the eviction.
+4. **Samples slowed during the eviction.** Expected from disk contention, not yet seen in a sample log.
 
-## Decision for the operator
+## Decisions for the operator
 
-1. **The default rate.** Rule 8 says a new setting defaults to the current behaviour, which is no limit. The spec proposes 2,000 chunks per second instead, because the current behaviour is what takes nodes offline. The alternative is a default of 0 and documentation that recommends a rate.
-2. **The urgent threshold of 10 GB**, or a percentage of the disk instead.
-
-## Open questions
-
-- Whether expired-batch eviction should use the same rate or a separate one: a large batch expiring is predictable for the whole network at the same block, so a separate, higher rate might be preferred.
+1. **Turn pacing on by default after the bench measurement?** Rule 8 keeps the default at 0 until a measurement justifies a value. The measurement will propose one.
+2. **Expired batches:** pace them like a radius increase (cost to peers, section 5), or keep them at full speed and spread a network-wide expiry with a random start delay per node instead.
 
 Generated with help of AI.
