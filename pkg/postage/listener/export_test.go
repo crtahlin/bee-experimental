@@ -29,3 +29,14 @@ func SetStaleTimings(watch, warnRepeat time.Duration) func() {
 	staleWatchInterval, staleWarnRepeat = watch, warnRepeat
 	return func() { staleWatchInterval, staleWarnRepeat = oldW, oldR }
 }
+
+// MinBlockPage is the smallest page the listener falls back to.
+const MinBlockPage = minBlockPage
+
+// SetStaleMaxBackoff replaces the cap of the wait after a failed call while
+// stale, for a test, and returns a function that restores it. New copies it.
+func SetStaleMaxBackoff(d time.Duration) func() {
+	old := staleMaxBackoff
+	staleMaxBackoff = d
+	return func() { staleMaxBackoff = old }
+}

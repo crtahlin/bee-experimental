@@ -33,6 +33,7 @@ type metrics struct {
 	Stale                prometheus.Gauge
 	SecondsSinceProgress prometheus.Gauge
 	BlocksBehind         prometheus.Gauge
+	PageBlocks           prometheus.Gauge
 }
 
 func newMetrics() metrics {
@@ -133,6 +134,12 @@ func newMetrics() metrics {
 			Subsystem: subsystem,
 			Name:      "blocks_behind",
 			Help:      "confirmed chain head minus the listener's next block; -1 while unknown, that is, while stale and no block number call has succeeded since",
+		}),
+		PageBlocks: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "page_blocks",
+			Help:      "blocks per log query; halves when a log query fails, down to 100, and doubles back after 3 pages applied in a row",
 		}),
 	}
 }

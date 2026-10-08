@@ -33,6 +33,13 @@ const (
 	blockPage          = 5000      // how many blocks to sync every time we page
 	blockPageSnapshot  = 50000     // how many blocks to sync every time from snapshot
 	defaultBatchFactor = uint64(5) // minimal number of blocks to sync at once
+
+	// minBlockPage is the smallest page the listener falls back to when log
+	// queries fail: 500 s of chain at 5 s blocks, 200 s at 2 s (#583).
+	minBlockPage = 100
+	// pageGrowAfter is how many pages applied in a row at a reduced size
+	// double the page again (#583).
+	pageGrowAfter = 3
 )
 
 // DefaultConfirmationDepth is how many blocks behind the chain head events must
@@ -57,6 +64,9 @@ var batchFactorOverridePublic = "5"
 var (
 	staleWatchInterval = time.Second
 	staleWarnRepeat    = 30 * time.Minute
+	// staleMaxBackoff caps the wait after a failed call while stale; the wait
+	// doubles from backoffTime only while stale (#583).
+	staleMaxBackoff = 60 * time.Second
 )
 
 // Deadlines of the listener's own chain calls. Without them a call that never
@@ -101,6 +111,7 @@ type listener struct {
 	filterLogsTimeout           time.Duration
 	watchInterval               time.Duration
 	warnRepeat                  time.Duration
+	maxBackoff                  time.Duration
 	// stallShutdown, when positive, stops the node once the batch store has
 	// been stale this long (postage-stall-shutdown, #583). Zero never stops.
 	stallShutdown time.Duration
@@ -152,6 +163,7 @@ func New(
 		filterLogsTimeout:           filterLogsTimeout,
 		watchInterval:               staleWatchInterval,
 		warnRepeat:                  staleWarnRepeat,
+		maxBackoff:                  staleMaxBackoff,
 
 		batchCreatedTopic:       postageStampContractABI.Events["BatchCreated"].ID,
 		batchTopUpTopic:         postageStampContractABI.Events["BatchTopUp"].ID,
@@ -374,6 +386,27 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 	}
 	paged := true
 
+	// The page shrinks when a log query fails and grows back after pages
+	// apply at the smaller size; the wait after a failed call grows only
+	// while stale (#583).
+	page := pageSize
+	pagesAtSize := 0
+	errWait := l.backoffTime
+	l.metrics.PageBlocks.Set(float64(page))
+	failedCall := func() {
+		if !l.Stale() {
+			errWait = l.backoffTime
+			return
+		}
+		if errWait <= 0 {
+			errWait = l.backoffTime
+		}
+		errWait *= 2
+		if errWait > l.maxBackoff {
+			errWait = l.maxBackoff
+		}
+	}
+
 	l.lastProgress.Store(time.Now().UnixNano())
 	l.staleLatched.Store(false)
 	l.listening.Store(true)
@@ -403,7 +436,7 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 				remainingBlocks := nextExpectedBatchBlock - lastConfirmedBlock
 				expectedWaitTime = l.blockTime() * time.Duration(remainingBlocks)
 			} else {
-				expectedWaitTime = l.backoffTime
+				expectedWaitTime = errWait
 			}
 
 			if !paged {
@@ -432,6 +465,7 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 				l.metrics.BackendErrors.Inc()
 				l.logger.Warning("could not get block number", "error", err)
 				l.setLastErr(err)
+				failedCall()
 				lastConfirmedBlock = 0
 				continue
 			}
@@ -463,10 +497,10 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 			// A page in the non-paged branch reaches the confirmed head: once
 			// it is applied, the listener is caught up (#583).
 			caughtUpPage := true
-			if to-from >= pageSize {
+			if to-from >= page {
 				paged = true
 				caughtUpPage = false
-				to = from + pageSize - 1
+				to = from + page - 1
 			}
 			l.metrics.BackendCalls.Inc()
 
@@ -480,6 +514,18 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 				l.metrics.BackendErrors.Inc()
 				l.logger.Warning("could not get blockchain log", "error", err)
 				l.setLastErr(err)
+				failedCall()
+				// The block number answered and the log query did not: try
+				// a smaller page next, down to minBlockPage. A failed block
+				// number query does not change the page (#583).
+				if page > minBlockPage {
+					page /= 2
+					if page < minBlockPage {
+						page = minBlockPage
+					}
+					l.metrics.PageBlocks.Set(float64(page))
+				}
+				pagesAtSize = 0
 				lastConfirmedBlock = 0
 				// Wait backoffTime before retrying, as after a failed block
 				// number query; a paged pass would otherwise retry at once.
@@ -494,6 +540,18 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 
 			from = to + 1
 			l.lastProgress.Store(time.Now().UnixNano())
+			errWait = l.backoffTime
+			if page < pageSize {
+				pagesAtSize++
+				if pagesAtSize >= pageGrowAfter {
+					page *= 2
+					if page > pageSize {
+						page = pageSize
+					}
+					pagesAtSize = 0
+					l.metrics.PageBlocks.Set(float64(page))
+				}
+			}
 			if caughtUpPage {
 				// Caught up: the stale state ends only here, not on any
 				// applied page, and the startup wait ends (#583).
