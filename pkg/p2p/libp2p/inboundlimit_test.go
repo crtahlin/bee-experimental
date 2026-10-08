@@ -224,10 +224,14 @@ func TestInboundLimitExemptions(t *testing.T) {
 
 	l, inner, _, _ := newTestLimiter(t, 1, 1)
 	loop := mustAddr(t, "/ip4/127.0.0.1/tcp/1634")
+	loop6 := mustAddr(t, "/ip6/::1/tcp/1634")
 	remote := mustAddr(t, "/ip4/203.0.113.1/tcp/1634")
 
 	if got := admitN(t, l, loop, 5); got != 5 {
-		t.Fatalf("got %d loopback admitted, want all 5", got)
+		t.Fatalf("got %d IPv4 loopback admitted, want all 5", got)
+	}
+	if got := admitN(t, l, loop6, 5); got != 5 {
+		t.Fatalf("got %d IPv6 loopback admitted, want all 5", got)
 	}
 	for range 5 {
 		if _, err := l.OpenConnection(network.DirOutbound, true, remote); err != nil {
@@ -237,10 +241,10 @@ func TestInboundLimitExemptions(t *testing.T) {
 	if got := admitN(t, l, remote, 2); got != 1 {
 		t.Fatalf("got %d inbound admitted, want the burst of 1 untouched by loopback and outbound", got)
 	}
-	// 5 loopback, 5 outbound and 1 admitted inbound stay open in the
+	// 10 loopback, 5 outbound and 1 admitted inbound stay open in the
 	// inner manager; the refused inbound one was given back.
-	if got := inner.held(); got != 11 {
-		t.Fatalf("inner manager holds %d connections, want 11", got)
+	if got := inner.held(); got != 16 {
+		t.Fatalf("inner manager holds %d connections, want 16", got)
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	ma "github.com/multiformats/go-multiaddr"
 	manet "github.com/multiformats/go-multiaddr/net"
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/time/rate"
 )
 
@@ -188,8 +189,12 @@ type inboundLimiter struct {
 	general   *rate.Limiter
 	knownFull *rate.Limiter
 	known     *knownFullPeers
-	metrics   metrics
 	now       func() time.Time
+
+	// The per-bucket counters, resolved once rather than on every
+	// connection.
+	admittedGeneral, admittedKnownFull prometheus.Counter
+	refusedGeneral, refusedKnownFull   prometheus.Counter
 
 	// limitLoopback applies the buckets to loopback addresses too, which
 	// are otherwise exempt. Only tests set it, to reach the limit from
@@ -203,10 +208,13 @@ type inboundLimiter struct {
 
 func newInboundLimiter(inner network.ResourceManager, cfg inboundLimitConfig, known *knownFullPeers, m metrics, now func() time.Time) *inboundLimiter {
 	l := &inboundLimiter{
-		ResourceManager: inner,
-		known:           known,
-		metrics:         m,
-		now:             now,
+		ResourceManager:   inner,
+		known:             known,
+		now:               now,
+		admittedGeneral:   m.InboundAdmitted.WithLabelValues(inboundBucketGeneral),
+		admittedKnownFull: m.InboundAdmitted.WithLabelValues(inboundBucketKnownFull),
+		refusedGeneral:    m.InboundRefusals.WithLabelValues(inboundBucketGeneral),
+		refusedKnownFull:  m.InboundRefusals.WithLabelValues(inboundBucketKnownFull),
 	}
 	if cfg.enabled {
 		l.general = rate.NewLimiter(rate.Limit(cfg.rate), cfg.burst)
@@ -223,22 +231,33 @@ func (l *inboundLimiter) OpenConnection(dir network.Direction, usefd bool, endpo
 	if err != nil || dir != network.DirInbound || l.general == nil {
 		return scope, err
 	}
-	key, ok := addressKey(endpoint)
-	if !ok || (key.Addr().IsLoopback() && !l.limitLoopback) {
+	// Loopback is checked on the address itself: the key of an IPv6
+	// address is its /56, which for ::1 is ::/56 and no longer loopback.
+	if manet.IsIPLoopback(endpoint) && !l.limitLoopback {
 		return scope, nil
 	}
-	bucket, label := l.general, inboundBucketGeneral
+	key, ok := addressKey(endpoint)
+	if !ok {
+		return scope, nil
+	}
+	bucket, admitted, refused := l.general, l.admittedGeneral, l.refusedGeneral
 	if l.known.contains(key) {
-		bucket, label = l.knownFull, inboundBucketKnownFull
+		bucket, admitted, refused = l.knownFull, l.admittedKnownFull, l.refusedKnownFull
 	}
 	if !bucket.AllowN(l.now(), 1) {
 		scope.Done()
 		l.lastRefusal.Store(l.now().UnixNano())
-		l.metrics.InboundRefusals.WithLabelValues(label).Inc()
+		refused.Inc()
 		return nil, errInboundRateLimited
 	}
-	l.metrics.InboundAdmitted.WithLabelValues(label).Inc()
+	admitted.Inc()
 	return scope, nil
+}
+
+// enabled reports whether the total inbound rate applies. With the limit
+// off, no known full peers are recorded.
+func (l *inboundLimiter) enabled() bool {
+	return l != nil && l.general != nil
 }
 
 // refusedWithin reports whether a connection was refused within d before
@@ -255,6 +274,9 @@ func (l *inboundLimiter) refusedWithin(d time.Duration) (time.Time, bool) {
 // recordKnownFull marks the address a full peer is connected from as a
 // known full peer's.
 func (s *Service) recordKnownFull(m ma.Multiaddr) {
+	if !s.inbound.enabled() {
+		return
+	}
 	s.knownFull.record(m)
 	s.metrics.KnownFullAddresses.Set(float64(s.knownFull.len()))
 }
@@ -262,6 +284,9 @@ func (s *Service) recordKnownFull(m ma.Multiaddr) {
 // refreshKnownFull marks a known full peer's address as seen now, when the
 // peer disconnects.
 func (s *Service) refreshKnownFull(m ma.Multiaddr) {
+	if !s.inbound.enabled() {
+		return
+	}
 	s.knownFull.refresh(m)
 }
 
@@ -283,10 +308,17 @@ func (s *Service) knownFullWorker() {
 			s.knownFull.sweep()
 			s.metrics.KnownFullAddresses.Set(float64(s.knownFull.len()))
 		case <-refresh.C:
-			for _, m := range s.peers.fullPeerConnAddrs() {
-				s.recordKnownFull(m)
-			}
+			s.refreshConnectedFullPeers()
 		}
+	}
+}
+
+// refreshConnectedFullPeers marks the addresses of all connected full
+// peers as seen now; the hourly pass, so a full peer connected for days
+// does not expire.
+func (s *Service) refreshConnectedFullPeers() {
+	for _, m := range s.peers.fullPeerConnAddrs() {
+		s.recordKnownFull(m)
 	}
 }
 
@@ -299,7 +331,9 @@ func (s *Service) observeReachability(r network.Reachability) {
 	} else {
 		s.metrics.ReachabilityPublic.Set(0)
 	}
-	if r != network.ReachabilityPrivate {
+	// Two AutoNAT clients report on the same event bus (#615), so the
+	// same change can arrive twice: count and warn only on a change.
+	if prev := network.Reachability(s.lastReachability.Swap(int32(r))); r != network.ReachabilityPrivate || prev == network.ReachabilityPrivate {
 		return
 	}
 	s.metrics.ReachabilityToPrivate.Inc()

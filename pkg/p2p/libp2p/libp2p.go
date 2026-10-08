@@ -115,6 +115,7 @@ type Service struct {
 	inbound            *inboundLimiter
 	knownFull          *knownFullPeers
 	knownFullQuit      chan struct{}
+	lastReachability   atomic.Int32
 	closeOnce          sync.Once
 	protocolsmu        sync.RWMutex
 	reacher            p2p.Reacher
