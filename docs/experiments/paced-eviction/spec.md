@@ -33,29 +33,37 @@ All changes are inside the node. Nothing depends on other nodes on the same mach
 
 ### 1. Rounds, always
 
-`EvictBatchBin` works in rounds of at most `evictionRound` chunks (compiled in; 1,000, smaller only if the bench measurement shows rounds of 1,000 still cause latency spikes). A round:
+`EvictBatchBin` works in rounds of at most `evictionRound` chunks (compiled in; 1,000, smaller only if the bench measurement shows rounds of 1,000 still cause latency spikes). A round reads at most one burst of the rate limiter, which is one round. A round:
 
-- iterates the batch's `BatchRadiusItem` entries with `Prefix: batchID` and, after the first round, `PrefixAtStart` from the last key the previous round read, so it never walks again over the deletion markers of earlier rounds (`pkg/storage/pebblestore/store.go` 258 to 280). Not `SkipFirst`: the resume key was deleted, so skipping the first result would skip a live item;
-- stops when the batch's prefix ends, when it has collected `evictionRound` items, or when it reaches the count asked for;
+- iterates the batch's `BatchRadiusItem` entries (key: batch ID, bin, address, stamp hash; `pkg/storer/internal/reserve/items.go` 35 to 38) with `Prefix: batchID` in the first round and, after it, `PrefixAtStart` from the last key the previous round read, so it never walks again over the deletion markers of earlier rounds. Not `SkipFirst`: the resume key was deleted, so skipping the first result would skip a live item. With `PrefixAtStart` pebblestore bounds the iteration only by the namespace, not by the batch (`pkg/storage/pebblestore/store.go` 243 to 246), so the callback stops explicitly when an item's `BatchID` differs from the batch being evicted, as well as at `Bin >= bin` as today. The leveldb engine is still selectable (`pkg/storer/storer.go` 331, 337) and positions a `PrefixAtStart` query differently, so the resume behaviour is tested on both engines;
+- stops when the batch's entries end, when it has collected `evictionRound` items, or when it reaches the count asked for;
 - deletes those items, adds them to `size` and to the evicted counter, and releases the batch lock.
 
 Rounds apply at every rate, including 0. This answers the collect-everything part of #628: the memory of an eviction is bounded by one round instead of growing with the target. #628's other parts (measuring the memory curve, and the cost of `pinUuids` lookups per item) stay with that issue.
 
-**Releasing the lock between rounds is safe.** All eviction runs on the single `reserveWorker` goroutine (`pkg/storer/reserve.go` 253 to 305), so two rounds never overlap. A chunk stored into the batch between rounds is either at or above the radius, and not evicted, or below it, and taken by a later round. `size` is updated after each round. A batch expiry aborts `unreserve` as today, and the expired-batch marker is deleted only after the batch is gone (lines 334 to 336). The radius is persisted by `SetRadius` (`pkg/storer/internal/reserve/reserve.go` 717 to 723).
+**Interface.** `EvictBatchBin(ctx, batchID, count, bin, hooks)` gains a `hooks` value with two per-round callbacks supplied by `pkg/storer`: `before(n int) error`, called after a round has read `n` items and before it deletes them (it waits for tokens, and returns an error to abort on shutdown or expiry), and `after(n int)`, called with the number deleted (it updates metrics and the arrival accounting). With empty hooks, rounds run at full speed.
+
+**Releasing the lock between rounds is safe.** All eviction runs on the single `reserveWorker` goroutine (`pkg/storer/reserve.go` 253 to 305), so two rounds never overlap. A chunk stored into the batch between rounds is at or above the radius, and not evicted, or below it: then a later round takes it if its key comes after the resume point, and the next `unreserve` takes it if it comes before. `size` is updated after each round. A batch expiry aborts `unreserve` as today, and the expired-batch marker is deleted only after the batch is gone (lines 334 to 336). After such an abort the resume key is lost, and a restarted `unreserve` walks the deleted entries of that batch once more; acceptable for a rare event. The radius is persisted by `SetRadius` (`pkg/storer/internal/reserve/reserve.go` 717 to 723).
 
 ### 2. Pacing: rate and workers
 
-A token bucket (`golang.org/x/time/rate`, already a dependency) with rate `reserve-eviction-rate` chunks per second and a burst of one round. Before each round eviction takes tokens for the round. The batch-expiry signal is a channel (`pkg/storer/reserve.go` 504, 528), not a context, so the wait is a `select` on a timer for the delay the limiter reserves (`Limiter.ReserveN`), `db.quit`, the batch-expiry channel and the context; any of the last three cancels the reservation and returns as today.
+A token bucket (`golang.org/x/time/rate`, already a dependency) with a burst of one round. A round **reads first, then takes tokens for the items it actually read** (`Limiter.ReserveN(now, n)` in the `before` hook), and does not wait at all when it read nothing. The batch-expiry signal is a channel (`pkg/storer/reserve.go` 504, 528), not a context, so the wait is a `select` on a timer for the reserved delay, `db.quit`, the batch-expiry channel and the context; any of the last three cancels the reservation and returns as today. A setting of 0 maps to `rate.Inf`: in `x/time/rate`, `Limit(0)` allows only the burst and then blocks.
 
-When the rate is above 0, a round deletes on `reserve-eviction-workers` goroutines (compiled in at 2 unless the bench shows otherwise) instead of `runtime.NumCPU()`. Limiting the rate alone would only cap the average: each round would still run its deletions on every CPU thread, so the peak load would stay. At rate 0 the round keeps `runtime.NumCPU()`, today's behaviour apart from the round size.
+**Effect on the radius increase.** The first pass of `unreserve` runs at the old radius over every batch (`pkg/storer/reserve.go` 518 to 553), and most batches hold nothing below it. Because rounds that read nothing do not wait, that pass takes about as long as today, and the radius still rises about 1 s after the eviction starts (measured on sw-1, #621). Taking tokens before reading would have made each batch after the first burst wait about 3.3 s at 300 per second; with about 426 batches the radius would have risen after about 23 minutes, during which `CommittedDepth()` stays one below the network's and salud marks the node unhealthy for a storage radius discrepancy (`pkg/salud/salud.go` 247 to 249).
 
-### 3. Never falling behind: evict at least as fast as chunks arrive
+When the rate is finite, a round deletes on `evictionWorkers` goroutines (compiled in at 2 unless the bench shows otherwise) instead of `runtime.NumCPU()`. Limiting the rate alone would only cap the average: each round would still run its deletions on every CPU thread, so the peak load would stay. At rate 0 the round keeps `runtime.NumCPU()`, today's behaviour apart from the round size.
 
-The node counts its own reserve puts (`ReservePutter`) over a sliding window of one minute. Eviction runs at `max(reserve-eviction-rate, arrival rate)`, so the excess never grows during a paced eviction, whatever the rate setting. This needs no system call and no knowledge of the filesystem.
+### 3. Keeping up with arrivals
+
+The node counts arrivals as increases of its reserve `size` over a sliding window of one minute, not as `ReservePutter` calls: `Put` returns early for a chunk the reserve already holds (`pkg/storer/internal/reserve/reserve.go` 115 to 118), and a stamp-index replacement does not grow `size` (lines 284 to 288).
+
+The effective rate is `max(reserve-eviction-rate, arrival rate)`. When that is above what `evictionWorkers` workers delete, the worker count rises, up to `runtime.NumCPU()`, and falls back when arrivals slow down: each round uses the smallest worker count that met the effective rate in the previous rounds, measured from how long each round's deletions took. So the excess does not grow during a paced eviction. The cost is the pacing benefit while arrivals are high: during a pull-sync burst the node deletes about as fast as it receives, with more workers and more disk load, even when the disk has room. This is chosen over capping the floor, because a capped floor lets the excess, and with it the shard files, grow without bound during a long burst. It needs no system call and no knowledge of the filesystem.
+
+**Coupling.** Eviction and pull-sync compete for the same disk, so a busy eviction slows the puller, which lowers the arrival rate and with it the floor; with a one-minute window the risk of the two oscillating is low. While the puller pauses for a sample (#23), arrivals drop to 0 and the floor with them, so eviction falls back to the configured rate, which is the intended behaviour during a sample.
 
 An earlier draft switched to full speed when free disk space was low. It is dropped: deleting chunks does not free filesystem space (Problem, point 6), so a node that turned urgent would stay urgent until restart, and on a filesystem shared by several nodes every node would cross the threshold together and evict at full speed, recreating scenario A.
 
-**The disk cost of pacing.** Chunks that arrive during a paced eviction cannot always reuse slots that are not yet freed, so the shard files grow by about 4 KB per arriving chunk for as long as the eviction lasts, and the space is reclaimed only by compaction (#627) and sharky's truncation at start. On a settled node this is small; on a node pulling at full speed it is the main cost, which is why the eviction follows the arrival rate.
+**The disk cost of pacing.** Chunks that arrive during a paced eviction cannot always reuse slots that are not yet freed, so the shard files grow by about 4 KB per arriving chunk for as long as the eviction lasts, and the space is reclaimed only by compaction (#627) and sharky's truncation at start. Following the arrival rate keeps this to the arrivals during the eviction.
 
 ### 4. What is dropped, and why
 
@@ -71,7 +79,7 @@ The evicted counter and the reserve size are updated after each round (today: af
 
 ### 7. What stays the same
 
-- The radius is raised at the same point. Changing when it rises changes what the node claims to the network.
+- The radius is raised at the same point in the code and, because empty rounds do not wait, at about the same time after the start (section 2). Changing when it rises changes what the node claims to the network.
 - What is evicted, and in which order of batches.
 - With `reserve-eviction-rate: 0`: no waiting and `runtime.NumCPU()` workers, as today; only the rounds and the arrival-rate floor (which has no effect at full speed) differ.
 
@@ -83,11 +91,11 @@ None. Eviction is local to the node. Nothing under `pkg/p2p`, `pkg/swarm` or `pk
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `reserve-eviction-rate` | 0 until the bench measurement exists (see "Decisions for the operator") | The most chunks the node evicts per second, raised to the arrival rate when that is higher. 0 means no limit and today's number of workers. |
+| `reserve-eviction-rate` | 0 until the bench measurement exists (see "Decisions for the operator") | The most chunks the node evicts per second, raised to the arrival rate when that is higher, with more workers if needed. 0 means no limit and today's number of workers. |
 
 **Raising `reserve-eviction-rate`:** a radius increase finishes sooner, at the cost of more disk and CPU load during it, closer to today's behaviour that took sw-1 offline. Other nodes pay only if this node becomes unresponsive: retrievals and syncs through it fail or slow down. For expired batches a higher rate shortens the time peers fetch and reject expired chunks.
 
-**Lowering it:** the node stays more responsive, but the eviction takes longer and the shard files grow about 4 KB per chunk arriving meanwhile, reclaimed only by compaction. For expired batches, peers fetch and reject expired chunks for longer, which costs their bandwidth, and the reserve size this node reports stays inflated for longer.
+**Lowering it:** the node stays more responsive, but the eviction takes longer and the shard files grow about 4 KB per chunk arriving meanwhile, reclaimed only by compaction. When arrivals exceed the rate the node deletes at the arrival rate anyway, so a low setting does not let the excess grow, but it does not protect the host during a sync burst either. For expired batches, peers fetch and reject expired chunks for longer, which costs their bandwidth, and the reserve size this node reports stays inflated for longer.
 
 **Expected rates (estimates to replace with the bench measurement):** if the rate today, with ten nodes evicting at once, was about 1,400 chunks per second per node (assumption, see below), the machine as a whole deleted about 14,000 per second while stalling. A per-node rate of 300 would keep ten nodes at about 3,000 per second together, about a fifth of that, and an excess of 14 million chunks would take about 13 hours per node.
 
@@ -95,26 +103,30 @@ The setting takes effect at start; it is not on-disk layout.
 
 ## Measurement
 
-**State between runs:** each run starts from a copy of the data directory taken once before the first run (a stopped node, `cp -a` or a filesystem snapshot), restored before every run. Without it each run would first need about a day of pull-syncing to refill the reserve.
+**State between runs.** Each run starts from a copy of the data directory taken once before the first run (a stopped node, `cp -a` or a filesystem snapshot), restored before every run; otherwise each run would first need about a day of pull-syncing to refill the reserve. For a node at doubling 1 the copy is about 35 GB of sharky files plus the index store, per node; the runner checks there is room for the copy and one restored run before it starts. After each restore it records the batches that expired since the copy was taken and the catch-up sync rate, because a restored node syncs what it missed, which competes with the eviction.
 
-**Single node first, bench-1 or bench-2.** One node, nothing else running, reserve doubling lowered by one (an eviction of about half the reserve). Conditions, 3 runs each:
+**Conditions, 3 runs each, interleaved** (1, 2, 3, 4, then again, then again), so that a change in network load affects every condition alike:
 
 1. today's code (`main`);
 2. rounds at rate 0 (separates the memory effect of rounds from pacing);
-3. rounds at a paced rate, with 2 workers;
-4. expired-batch eviction of a large batch: today's code, and the paced version.
+3. rounds at a paced rate, with `evictionWorkers` workers;
+4. expired-batch eviction of a large batch, today's code and the paced version. The batch is made to expire on demand on a testnet bench node: buy a batch with a lifetime of a few hours, store about a million chunks under it by local upload (on testnet the node's radius covers them), take the data-directory copy, and let the batch expire; each later run restores the copy and waits for the expiry again.
 
-Recorded every 15 s: radius, reserve size, evicted count, resident memory and Go heap, CPU, disk utilisation, API `/health` latency, whether the libp2p greeting is answered, whether a known chunk is retrieved, the arrival rate; plus the duration and failed-chunk counts of a worst-case sample during the eviction, the total eviction time and the growth of the shard files.
+Recorded every 15 s: radius, reserve size, evicted count, resident memory and Go heap, CPU, disk utilisation, API `/health` latency, whether the libp2p greeting is answered, whether a known chunk is retrieved, the arrival rate and the worker count; plus the duration and failed-chunk counts of a worst-case sample during the eviction, the total eviction time and the growth of the shard files.
 
-**Ten nodes at once, sw-1,** only after the bench result, and only if rental time allows: scenario A with the paced rate, compared with the run of 2026-10-08. Each sw-1 run is a full increase and refill cycle; if fewer than 3 runs fit, the result says so.
+**Setup.** One bench node can lower its doubling only from 1 to 0 (`max-reserve-capacity-doubling` defaults to 1, `cmd/bee/cmd/cmd.go` 454): an eviction of about 4 million chunks without contention. Today's code may pass the criteria there, which would show nothing (rule 7). So the first step is to run condition 1 on that setup and check whether it breaks criterion 1 or 2. If it does not, the setup becomes four nodes at doubling 1 on one bench host whose disk holds them, evicting together: enough to put a bench disk under the kind of load sw-1 had with ten, while fitting one bench machine. Acceptance is judged on whichever setup reproduces the problem with condition 1.
 
-**Accepted when,** in all 3 runs of the paced condition on the bench:
+**Time.** A paced run of about 4 million chunks at 300 per second takes about 3.9 hours; four conditions times 3 runs, with restores, is about two days of bench time.
+
+**sw-1,** only after the bench result and if rental time allows: scenario A with the paced rate, compared with the run of 2026-10-08. If fewer than 3 runs fit, the result says so.
+
+**Accepted when,** on the setup that reproduces the problem, condition 1 breaks criterion 1 or 2, and in all 3 runs of condition 3:
 1. `/health` answers within 1 s and the libp2p greeting within 5 s throughout the eviction;
 2. a worst-case sample during the eviction finishes within the budget of the chain the bench node is on, with no failed chunks;
 3. peak memory does not grow with the eviction target (conditions 2 and 3 against 1);
-4. the eviction completes within the time the rate predicts, plus 20 %.
+4. the eviction completes within the time the rate predicts, plus 20 %, and the radius rises as soon after the start as in condition 1.
 
-**A negative result** looks like this: with rounds and pacing the node is still unresponsive or samples still fail, which would point at something else (compaction, #627, or the per-chunk transactions, #624); or the eviction never finishes because the arrival-rate floor does not keep up, which would mean the arrival measurement is wrong.
+**A negative result** looks like this: with rounds and pacing the node is still unresponsive or samples still fail, which would point at something else (compaction, #627, or the per-chunk transactions, #624); or the eviction never finishes because deletion cannot keep up with arrivals even at `runtime.NumCPU()` workers.
 
 ## Rollout and rollback
 
