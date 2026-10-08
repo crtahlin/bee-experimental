@@ -50,6 +50,14 @@ const MaxConfirmationDepth = 64
 // for testing, set externally
 var batchFactorOverridePublic = "5"
 
+// Deadlines of the listener's own chain calls. Without them a call that never
+// answers blocks the loop until the connection itself fails (#583). They are
+// variables only so tests can shorten them; New copies them.
+var (
+	blockNumberTimeout = 30 * time.Second
+	filterLogsTimeout  = 60 * time.Second
+)
+
 var (
 	ErrPostageSyncingStalled = errors.New("postage syncing stalled")
 	ErrPostagePaused         = errors.New("postage contract is paused")
@@ -77,6 +85,8 @@ type listener struct {
 	stallingTimeout             time.Duration
 	backoffTime                 time.Duration
 	syncingStopped              *syncutil.Signaler
+	blockNumberTimeout          time.Duration
+	filterLogsTimeout           time.Duration
 
 	// Cached postage stamp contract event topics.
 	batchCreatedTopic       common.Hash
@@ -109,6 +119,8 @@ func New(
 		metrics:                     newMetrics(),
 		stallingTimeout:             stallingTimeout,
 		backoffTime:                 backoffTime,
+		blockNumberTimeout:          blockNumberTimeout,
+		filterLogsTimeout:           filterLogsTimeout,
 
 		batchCreatedTopic:       postageStampContractABI.Events["BatchCreated"].ID,
 		batchTopUpTopic:         postageStampContractABI.Events["BatchTopUp"].ID,
@@ -308,7 +320,9 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 			start := time.Now()
 
 			l.metrics.BackendCalls.Inc()
-			to, err := l.ev.BlockNumber(ctx)
+			callCtx, cancelCall := context.WithTimeout(ctx, l.blockNumberTimeout)
+			to, err := l.ev.BlockNumber(callCtx)
+			cancelCall()
 			if err != nil {
 				if errors.Is(err, context.Canceled) {
 					return nil
@@ -348,7 +362,9 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 			}
 			l.metrics.BackendCalls.Inc()
 
-			events, err := l.ev.FilterLogs(ctx, l.filterQuery(big.NewInt(int64(from)), big.NewInt(int64(to))))
+			callCtx, cancelCall = context.WithTimeout(ctx, l.filterLogsTimeout)
+			events, err := l.ev.FilterLogs(callCtx, l.filterQuery(big.NewInt(int64(from)), big.NewInt(int64(to))))
+			cancelCall()
 			if err != nil {
 				if errors.Is(err, ErrParseSnapshot) {
 					return err
