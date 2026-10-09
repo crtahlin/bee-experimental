@@ -69,7 +69,7 @@ All durations below assume no arrivals. With arrivals at rate a, the excess drai
 1. **Batch-expiry evictions now skip lottery rounds (likely the larger cost; hypothesis).**
    - The #649 episode covers both `unreserve` and `evictExpiredBatches` (`pkg/storer/reserve.go`, both wrapped by `evictionRun`), and the gate fires once an episode has been active for 60 s.
    - At 500/s an episode passes 60 s after about 31,000 chunks (one burst of 1,000 plus 60 s x 500). So **any expired batch with more than about 31,000 chunks on this node makes it sit out the rounds during its eviction.**
-   - At rate 0 the threshold is several hundred thousand chunks (about 2,600 to 3,150 chunks/s measured on the dense host, faster on a node that evicts alone).
+   - At rate 0 the threshold is, as a hypothesis, about 160,000 to 190,000 chunks on the dense host (60 s at the measured 2,600 to 3,150 chunks/s) and more on a node that evicts alone (not measured).
    - Expiry is routine, so this probably happens far more often than a radius increase.
    - **Measurement:** the size of each expiry eviction, from `bee_localstore_expired_count` per expiry and the `evict expired batches start` log line, on the bench nodes and a staked node over a week, against the 31,000 threshold.
    - **Open question, not changed here:** whether batch-expiry eviction should count toward the #649 gate at all. It is tracked in [#663](https://github.com/crtahlin/wasp/issues/663); this spec does not change the gate.
@@ -103,19 +103,20 @@ All durations below assume no arrivals. With arrivals at rate a, the excess drai
 
 ## Tests
 
-1. **Real command flags, all three channels.** Built on the start command's flag set, as `cmd/bee/cmd/rpc_endpoints_test.go` does:
+1. **Real command flags, all three channels.** The read at `start.go:481` moves into a small helper (for example `reserveEvictionRate(c.config)`) that both `start.go` and the test call. The test builds a `command`, registers the real flags with `(*command).setAllFlags` (`cmd/bee/cmd/cmd.go:352`), loads the config through the same viper setup as the start command, and checks:
    - the key unset gives 500;
    - `reserve-eviction-rate: 0` in a config file gives 0;
    - the environment variable set to 0 gives 0;
    - `--reserve-eviction-rate=0` gives 0;
    - an empty environment variable gives 500.
 
-   The value checked is the one passed to the node options at `start.go`.
+   The value checked is the helper's return value, which is what `start.go` passes to the node options.
 2. **Storer:** with 0 no pacer exists (`TestEvictionPacerOffAtZero` already covers `newEvictionPacer`); with 500 a pacer exists.
 3. **Eviction keeps up with fast arrivals** (storer level, real time):
-   - rate 500, arrivals at 2,000/s for 5 s while over capacity;
-   - **fresh samples:** the excess at the end is within 1,000 + 60 x (2,000 - 500) chunks of where it started (the lag bound), and the reserve reaches capacity within 5 s after arrivals stop;
-   - **stale samples:** the arrival samples are older than 60 s before the burst; the excess grows by at most the lag bound and then stops growing;
+   - rate 500, a starting excess of 2,000 chunks over capacity, then arrivals at 2,000/s for 5 s;
+   - **fresh samples** (the arrival samples already show about 2,000/s when the burst starts): the excess grows by less than about 3,750 chunks over the burst (half of (2,000 - 500) x 5 s, while the averaged arrival rate catches up);
+   - **stale samples** (the arrival samples are older than 60 s when the burst starts): the excess grows by at most (A - 500) x burst duration, 7,500 chunks for 5 s at 2,000/s;
+   - after arrivals stop, the reserve reaches capacity within 25 s: the worst case is 2,000 + 7,500 = 9,500 chunks at no less than 500/s, about 19 s, plus margin;
    - the tolerance is stated in the test, which uses the pacer's injectable clock where the arrival window is involved.
 4. Existing pacer, eviction and #649 tests pass unchanged.
 
