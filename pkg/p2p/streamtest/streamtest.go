@@ -268,7 +268,6 @@ type stream struct {
 	lock            sync.Mutex
 	version         *semver.Version
 	versionErr      error
-	readDeadline    readDeadline
 }
 
 func newStream(in, out *record, version *semver.Version, versionErr error) *stream {
@@ -280,7 +279,7 @@ func (s *stream) Read(p []byte) (int, error) {
 		return 0, ErrStreamClosed
 	}
 
-	return s.out.read(p, s.readDeadline.wait())
+	return s.out.Read(p)
 }
 
 // SetReadDeadline sets the deadline for reads. A read waiting for data
@@ -288,7 +287,7 @@ func (s *stream) Read(p []byte) (int, error) {
 // including a read that is already blocked; buffered data is not consumed. A
 // zero time clears the deadline.
 func (s *stream) SetReadDeadline(t time.Time) error {
-	s.readDeadline.set(t)
+	s.out.readDeadline.set(t)
 	return nil
 }
 
@@ -415,6 +414,9 @@ type record struct {
 	dataSigC chan struct{}
 	latency  time.Duration
 	closed   bool
+	// readDeadline is set by the stream that reads this record; one
+	// stream reads each record.
+	readDeadline readDeadline
 }
 
 func newRecord(latency time.Duration) *record {
@@ -424,13 +426,12 @@ func newRecord(latency time.Duration) *record {
 	}
 }
 
+// Read blocks until data is written, the record is closed, or the read
+// deadline set through the reading stream's SetReadDeadline passes.
 func (r *record) Read(p []byte) (n int, err error) {
-	return r.read(p, nil)
-}
-
-// read is Read with a deadline channel; a nil channel never fires.
-func (r *record) read(p []byte, deadline <-chan struct{}) (n int, err error) {
 	defer time.Sleep(r.latency)
+
+	deadline := r.readDeadline.wait()
 
 	for r.c == r.bytesSize() {
 		select {
