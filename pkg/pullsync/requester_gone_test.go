@@ -366,3 +366,52 @@ func TestUnwatchedWithoutReadDeadline(t *testing.T) {
 		}
 	})
 }
+
+// TestReplacedThenResetCountedOnce: a request replaced by the same peer
+// (#640) whose requester then resets before the watcher stops is counted as
+// replaced only.
+func TestReplacedThenResetCountedOnce(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		reached := make(chan struct{})
+		release := make(chan struct{})
+		var calls atomic.Int32
+		restore := pullsync.SetAfterMakeOffer(func() {
+			if calls.Add(1) == 1 {
+				close(reached)
+				<-release
+			}
+		})
+		// restored after the server Syncer closes (cleanups run in
+		// reverse order), so no handler reads the hook while it changes
+		t.Cleanup(restore)
+
+		server, _ := newPullSync(t, nil, 5,
+			mock.WithSubscribeResp(nil, nil), mock.WithSubscribeResp(nil, nil))
+		client := newClient(t, server, peerA)
+		ctx1, cancel1 := context.WithCancel(context.Background())
+		ctx2, cancel2 := context.WithCancel(context.Background())
+		defer cancel2()
+
+		first := startSync(ctx1, client, 22, 240)
+		synctest.Wait()
+		second := startSync(ctx2, client, 22, 240)
+		<-reached
+		// the replaced request is held after its offer step; its
+		// requester now resets, which its watcher still sees
+		cancel1()
+		<-first
+		synctest.Wait()
+		close(release)
+		synctest.Wait()
+
+		if got := server.RequestsReplaced("same_start"); got != 1 {
+			t.Fatalf("same_start %v, want 1", got)
+		}
+		if got := server.RequestsAbandonedTotal(); got != 0 {
+			t.Fatalf("abandoned %v, want 0: a replaced request is counted as replaced only", got)
+		}
+
+		cancel2()
+		<-second
+	})
+}
