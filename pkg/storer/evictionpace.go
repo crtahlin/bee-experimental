@@ -177,6 +177,17 @@ func (p *evictionPacer) observe(n int, took time.Duration) {
 	p.setWorkers(p.workers)
 }
 
+// shiftHeadroom moves the start of the current stretch of headroom forward
+// by d, the time eviction was paused for a sample, so a pause does not count
+// as spare deletion capacity (#649).
+func (p *evictionPacer) shiftHeadroom(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.headroomSince.IsZero() {
+		p.headroomSince = p.headroomSince.Add(d)
+	}
+}
+
 // wait pays for n deleted chunks: it waits until the limiter, set to the
 // effective rate, allows them. It is called with the batch lock released.
 // quit, expiry and the context end the wait and cancel the reservation; a
@@ -251,11 +262,23 @@ func (db *DB) evictionHooks(ctx context.Context, expired bool, expiry <-chan str
 			return nil
 		}
 	}
-	h.Pay = func(int) error { return stop() }
+	// No round runs while a reserve sample runs (#649): Before takes the
+	// eviction barrier for one round, and Pay waits for a sample before
+	// any rate-limiter wait, with every lock released.
+	h.Before = func() (func(), error) { return db.evictionBarrier(ctx, expiry) }
+	h.Pay = func(int) error {
+		if err := stop(); err != nil {
+			return err
+		}
+		return db.waitWhileSampling(ctx, expiry)
+	}
 	if p := db.evictionPacer; p != nil {
 		h.Workers = p.Workers
 		h.Pay = func(n int) error {
 			if err := stop(); err != nil {
+				return err
+			}
+			if err := db.waitWhileSampling(ctx, expiry); err != nil {
 				return err
 			}
 			return p.wait(ctx, n, db.quit, expiry)

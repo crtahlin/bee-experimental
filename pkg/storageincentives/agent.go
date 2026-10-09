@@ -451,6 +451,16 @@ func (a *Agent) handleSample(ctx context.Context, round uint64) (bool, error) {
 	a.metrics.NeighborhoodSelected.Inc()
 	a.logger.Info("neighbourhood chosen", "round", round)
 
+	// A node that has been evicting for a while sits out the round: a
+	// sample would compete with the eviction and miss its deadline, and
+	// during a network-wide event neighbours evict at different paces
+	// (#649). Read live, not cached per phase: one atomic read.
+	if d := a.store.EvictingFor(); d >= storer.EvictingMinAge {
+		a.logger.Info("skipping round because node is evicting", "round", round, "evicting_for", d.Round(time.Second))
+		a.metrics.SkippedWhileEvicting.Inc()
+		return false, nil
+	}
+
 	if !a.state.IsFullySynced() {
 		a.logger.Info("skipping round because node is not fully synced")
 		return false, nil
@@ -477,6 +487,15 @@ func (a *Agent) handleSample(ctx context.Context, round uint64) (bool, error) {
 	}
 	dur := time.Since(now)
 	a.metrics.SampleDuration.Set(dur.Seconds())
+
+	// A radius step between reading the depth and the start of the sample
+	// changes the committed depth; a sample at the old depth could differ
+	// from the neighbourhood's, so the round is not played (#649). The
+	// eviction barrier keeps a step from landing during the sample itself.
+	if d := a.store.CommittedDepth(); d != committedDepth {
+		a.logger.Info("skipping round because the committed depth changed during the sample", "round", round, "sample_depth", committedDepth, "committed_depth", d)
+		return false, nil
+	}
 
 	a.logger.Info("produced sample", "hash", sample.ReserveSampleHash, "radius", committedDepth, "round", round)
 

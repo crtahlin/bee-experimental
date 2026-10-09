@@ -46,6 +46,8 @@ type metrics struct {
 	HeldValidationErrors          prometheus.Counter
 	ReserveEvictionWorkers        prometheus.Gauge
 	ReserveArrivalRate            prometheus.Gauge
+	EvictionPausedSeconds         prometheus.Counter
+	EvictionPauseCapped           prometheus.Counter
 }
 
 // newMetrics is a convenient constructor for creating new metrics.
@@ -310,6 +312,22 @@ func newMetrics() metrics {
 				Subsystem: subsystem,
 				Name:      "reserve_arrival_rate",
 				Help:      "Chunks per second added to the reserve over the last minute, as seen by a paced eviction (wasp #623). Updated only while a paced eviction runs; between evictions it keeps its last value.",
+			},
+		),
+		EvictionPausedSeconds: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Namespace: m.Namespace,
+				Subsystem: subsystem,
+				Name:      "eviction_paused_seconds_total",
+				Help:      "Time reserve eviction spent waiting for a reserve sample to end (wasp #649).",
+			},
+		),
+		EvictionPauseCapped: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Namespace: m.Namespace,
+				Subsystem: subsystem,
+				Name:      "eviction_pause_capped_total",
+				Help:      "Stretches of sampling that reached the cap on how long eviction waits; eviction then ran during the sample (wasp #649).",
 			},
 		),
 	}

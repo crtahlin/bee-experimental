@@ -20,6 +20,7 @@ type metrics struct {
 	SampleDuration          prometheus.Gauge
 	Round                   prometheus.Gauge
 	InsufficientFundsToPlay prometheus.Counter
+	SkippedWhileEvicting    prometheus.Counter
 
 	// total calls to chain backend
 	BackendCalls  prometheus.Counter
@@ -63,6 +64,12 @@ func newMetrics() metrics {
 			Subsystem: subsystem,
 			Name:      "insufficient_funds_to_play",
 			Help:      "Count of games skipped due to insufficient balance to participate.",
+		}),
+		SkippedWhileEvicting: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "skipped_while_evicting",
+			Help:      "Selected rounds skipped because the node had been evicting from its reserve for at least a minute (wasp #649).",
 		}),
 		ClaimPhase: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: m.Namespace,

@@ -261,7 +261,7 @@ func (db *DB) reserveWorker(ctx context.Context, ready chan<- struct{}) {
 			return
 		case <-batchExpiryTrigger:
 
-			err := db.evictExpiredBatches(ctx)
+			err := db.evictionRun(func() error { return db.evictExpiredBatches(ctx) })
 			if err != nil {
 				// A shutdown is not a fault, and the worker is stopping
 				// anyway, so it returns rather than warning (#407).
@@ -280,7 +280,7 @@ func (db *DB) reserveWorker(ctx context.Context, ready chan<- struct{}) {
 		case <-overCapTrigger:
 
 			db.metrics.OverCapTriggerCount.Inc()
-			if err := db.unreserve(ctx); err != nil {
+			if err := db.evictionRun(func() error { return db.unreserve(ctx) }); err != nil {
 				if errors.Is(err, ErrDBQuit) {
 					return
 				}
@@ -581,10 +581,22 @@ func (db *DB) unreserve(ctx context.Context) (err error) {
 			}
 		}
 
+		// No radius step while a reserve sample runs: on a default node
+		// the sample walks from the storage radius up, and the rounds
+		// after a step delete in the bin it walks (#649).
+		release, err := db.evictionBarrier(ctx, batchExpiry)
+		if errors.Is(err, errEvictionExpiry) {
+			db.logger.Debug("stopping unreserve, received batch expiration signal")
+			return nil
+		}
+		if err != nil {
+			return err
+		}
 		radius++
 		db.logger.Info("reserve radius increase", "radius", radius)
 		_ = db.reserve.SetRadius(radius)
 		db.metrics.StorageRadius.Set(float64(radius))
+		release()
 	}
 
 	return errMaxRadius
@@ -606,7 +618,7 @@ func (db *DB) ReserveIterateChunks(cb func(swarm.Chunk) (bool, error)) error {
 // IsSampling reports whether a reserve sample is currently running. The puller
 // reads it to pause pulling during sampling. See issue #23.
 func (db *DB) IsSampling() bool {
-	return db.samplingInProgress.Load()
+	return db.samplingActive.Load() > 0
 }
 
 func (db *DB) StorageRadius() uint8 {

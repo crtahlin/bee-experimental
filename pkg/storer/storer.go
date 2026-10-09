@@ -145,6 +145,10 @@ type Reserve interface {
 	ReserveSample(context.Context, []byte, uint8, uint64, *big.Int) (Sample, error)
 	WindowedSample(context.Context, []byte, uint8, uint64, *big.Int) (Sample, error)
 	ReserveSize() int
+	// EvictingFor returns how long the current eviction episode has been
+	// actively evicting, or 0. The storage incentives agent sits out a
+	// round when it is at least EvictingMinAge (#649).
+	EvictingFor() time.Duration
 }
 
 // ReserveIterator is a helper interface which can be used to iterate over all
@@ -782,9 +786,20 @@ type DB struct {
 	// is 0, which is the default (#623).
 	evictionPacer *evictionPacer
 
-	// samplingInProgress is set while ReserveSample runs, so the puller can
-	// pause pulling and leave the store quiet for the sample. See issue #23.
-	samplingInProgress atomic.Bool
+	// samplingActive counts the reserve samples running, so the puller can
+	// pause pulling and leave the store quiet for the sample (issue #23). A
+	// counter, not a flag: two samples can overlap (#649).
+	samplingActive atomic.Int32
+	// samplingMu guards the stretch of sampling eviction waits for (#649).
+	samplingMu        sync.Mutex
+	samplingCount     int
+	samplingSince     time.Time // when samplingCount last went from 0 to 1
+	samplingCapWarned bool      // the cap Warning was logged this stretch
+	// evictionMu is held across one eviction round and one radius step, so
+	// a sample can wait for the one in progress (#649).
+	evictionMu sync.Mutex
+	// episode measures how long the node has been evicting (#649).
+	episode evictionEpisode
 
 	pinIntegrity *PinIntegrity
 }
@@ -1046,6 +1061,15 @@ func (db *DB) ResetReserve(ctx context.Context) error {
 // Metrics returns set of prometheus collectors.
 func (db *DB) Metrics() []prometheus.Collector {
 	collectors := m.PrometheusCollectorsFromFields(db.metrics)
+	collectors = append(collectors, prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Namespace: m.Namespace,
+			Subsystem: "localstore",
+			Name:      "eviction_running_seconds",
+			Help:      "Active time of the current reserve eviction episode, not counting time paused for a sample; 0 when none (wasp #649).",
+		},
+		func() float64 { return db.EvictingFor().Seconds() },
+	))
 	if v, ok := db.storage.(m.Collector); ok {
 		collectors = append(collectors, v.Metrics()...)
 	}
