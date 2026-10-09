@@ -338,6 +338,54 @@ password-file: "/usr/local/var/lib/swarm-bee/password"
 ## books after 4 refused dials, and can make other nodes, and this node itself,
 ## judge it unreachable
 # p2p-inbound-connection-rate: 30
+
+## apply the inbound stream limits per peer and per protocol group set by the
+## p2p-inbound-stream* settings; off by default until they are measured on real
+## nodes. With it on, a peer or protocol group that reaches its limit has new
+## inbound streams refused (stream reset 0x1002), which keeps one peer or
+## protocol from taking the node-wide stream cap; a refused neighbour cannot
+## sync from or retrieve through this node while it is at the limit, and an
+## upstream neighbour may retry at once in a loop that costs both nodes CPU
+# p2p-inbound-stream-limits: false
+
+## inbound streams one peer may hold at once across all protocols, when
+## p2p-inbound-stream-limits is on; 0 uses the default of 256, -1 turns this
+## limit off, other negative values are refused. Raising it lets one peer take
+## more of this node's stream cap; lowering it can refuse a legitimate
+## neighbour, which then cannot sync from or retrieve through this node, and an
+## upstream neighbour may retry in a tight loop that costs both nodes CPU
+# p2p-inbound-streams-per-peer: 0
+
+## inbound streams kept free for pull-sync, which other protocols and un-
+## negotiated streams cannot use, when p2p-inbound-stream-limits is on; 0 uses
+## the default of 2000, -1 turns this reserve off, other negative values are
+## refused. Raising it leaves less of the node-wide cap for retrieval, push-sync
+## and new connections from other peers; lowering it lets those take more of the
+## room neighbours need to sync from this node
+# p2p-inbound-stream-reserve-pullsync: 0
+
+## inbound streams kept free for every protocol other than pull-sync, when
+## p2p-inbound-stream-limits is on; 0 uses the default of 1000, -1 turns this
+## reserve off, other negative values are refused. Raising it leaves less room
+## for neighbours to sync from this node; lowering it lets pull-sync take room
+## that retrieval, push-sync and new connections need
+# p2p-inbound-stream-reserve-other: 0
+
+## inbound streams the node holds at once before their protocol is negotiated,
+## when p2p-inbound-stream-limits is on; 0 uses the default of 1024, -1 turns
+## this limit off (refused while a reserve is on), other negative values are
+## refused. Raising it leaves less room in the cap for negotiated streams;
+## lowering it can refuse streams of peers that open many at once, such as a
+## neighbour reconnecting after a restart
+# p2p-inbound-streams-transient: 0
+
+## inbound streams one peer may hold at once before their protocol is
+## negotiated, when p2p-inbound-stream-limits is on; 0 uses the default of 64,
+## -1 turns this limit off, other negative values are refused. Raising it lets
+## one peer hold more silent streams that count against the node-wide limit;
+## lowering it can refuse a neighbour that opens its pull-sync streams at once
+## on connect (about 52 at radius 6)
+# p2p-inbound-streams-unnegotiated-per-peer: 0
 ## new inbound connections the node accepts at once above
 ## p2p-inbound-connection-rate, per bucket; 0 uses the default of 200, -1 turns
 ## the limit off, other negative values are refused. Raising it lets a larger

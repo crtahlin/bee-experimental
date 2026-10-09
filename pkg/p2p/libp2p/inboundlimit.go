@@ -204,6 +204,10 @@ type inboundLimiter struct {
 	// lastRefusal is the time of the last refusal in Unix nanoseconds,
 	// zero if none.
 	lastRefusal atomic.Int64
+
+	// streams enforces the inbound stream limits that the resource
+	// manager cannot express. Nil while the limits are off.
+	streams *streamLimits
 }
 
 func newInboundLimiter(inner network.ResourceManager, cfg inboundLimitConfig, known *knownFullPeers, m metrics, now func() time.Time) *inboundLimiter {

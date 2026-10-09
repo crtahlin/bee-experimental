@@ -37,6 +37,12 @@ type metrics struct {
 	StreamsRefusedByPeer       *prometheus.CounterVec
 	InboundStreamsPerPeerMax   prometheus.Gauge
 	InboundStreamPeersOver     *prometheus.GaugeVec
+
+	InboundStreamsRefused             *prometheus.CounterVec
+	InboundStreamsGroup               *prometheus.GaugeVec
+	InboundStreamsUnnegotiatedPeerMax prometheus.Gauge
+	InboundStreamsPerPeerHighWater    prometheus.Gauge
+	InboundStreamsTransientHighWater  prometheus.Gauge
 }
 
 func newMetrics() metrics {
@@ -187,6 +193,36 @@ func newMetrics() metrics {
 			Name:      "inbound_stream_peers_over",
 			Help:      "Number of peers holding more inbound streams than the threshold, read every 30 s.",
 		}, []string{"threshold"}),
+		InboundStreamsRefused: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "inbound_streams_refused_total",
+			Help:      "Number of inbound streams refused by the stream limits of p2p-inbound-stream-limits, by limit: un-negotiated streams of one peer, or the pull-sync or other protocol group. Per-peer and transient refusals are in libp2p_rcmgr_blocked_resources.",
+		}, []string{"limit"}),
+		InboundStreamsGroup: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "inbound_streams_group",
+			Help:      "Number of negotiated inbound streams in each protocol group, while p2p-inbound-stream-limits is on.",
+		}, []string{"group"}),
+		InboundStreamsUnnegotiatedPeerMax: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "inbound_streams_unnegotiated_per_peer_max",
+			Help:      "The largest number of un-negotiated inbound streams one peer held since the previous 30 s scan, while p2p-inbound-stream-limits is on.",
+		}),
+		InboundStreamsPerPeerHighWater: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "inbound_streams_per_peer_high_water",
+			Help:      "The largest number of inbound streams any one peer held at any moment since the previous 30 s scan, from every change the resource manager reports.",
+		}),
+		InboundStreamsTransientHighWater: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "inbound_streams_transient_high_water",
+			Help:      "The largest number of un-negotiated (transient) inbound streams the node held at any moment since the previous 30 s scan.",
+		}),
 	}
 }
 
