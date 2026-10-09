@@ -22,6 +22,8 @@ type metrics struct {
 	DuplicateRuid        prometheus.Counter     // number of duplicate RUID requests we got
 	LastReceived         *prometheus.CounterVec // last timestamp of the received chunks per bin
 	Held                 prometheus.Counter     // chunks held while the batch store is stale (#583)
+	RequestsReplaced     *prometheus.CounterVec // waiting requests ended because the peer asked again (#640)
+	WaitingRequests      prometheus.Gauge       // requests waiting for their first chunk (#640)
 }
 
 func newMetrics() metrics {
@@ -101,6 +103,19 @@ func newMetrics() metrics {
 				Name:      "last_received",
 				Help:      `The last timestamp of the received chunks per bin.`,
 			}, []string{"bin"}),
+		RequestsReplaced: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: m.Namespace,
+				Subsystem: subsystem,
+				Name:      "requests_replaced_total",
+				Help:      "Inbound requests still waiting for their first chunk that were ended because the same peer asked again for the same bin: reason same_start (same start) or over_cap (more than two waiting for the bin). Counted by the new request. A request ended just as its offer was ready still completes, and is counted (#640).",
+			}, []string{"reason"}),
+		WaitingRequests: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "waiting_requests",
+			Help:      "Inbound requests currently waiting for their first chunk (#640).",
+		}),
 	}
 }
 
