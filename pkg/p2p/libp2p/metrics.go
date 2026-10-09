@@ -34,6 +34,9 @@ type metrics struct {
 	ReachabilityToPrivate      prometheus.Counter
 	StreamHandlerErrResetCount prometheus.Counter
 	HeadersExchangeDuration    prometheus.Histogram
+	StreamsRefusedByPeer       *prometheus.CounterVec
+	InboundStreamsPerPeerMax   prometheus.Gauge
+	InboundStreamPeersOver     *prometheus.GaugeVec
 }
 
 func newMetrics() metrics {
@@ -166,6 +169,24 @@ func newMetrics() metrics {
 			Name:      "headers_exchange_duration",
 			Help:      "The duration spent exchanging the headers.",
 		}),
+		StreamsRefusedByPeer: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "streams_refused_by_peer_total",
+			Help:      "Number of streams this node opened that the peer refused at its resource limit (stream reset code 0x1002), by protocol and stream. Peers on older libp2p versions reset with code 0 and are not counted.",
+		}, []string{"protocol", "stream"}),
+		InboundStreamsPerPeerMax: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "inbound_streams_per_peer_max",
+			Help:      "The largest number of inbound streams one peer holds, from the resource manager, read every 30 s.",
+		}),
+		InboundStreamPeersOver: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "inbound_stream_peers_over",
+			Help:      "Number of peers holding more inbound streams than the threshold, read every 30 s.",
+		}, []string{"threshold"}),
 	}
 }
 
