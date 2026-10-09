@@ -1,6 +1,6 @@
 # Stream refusal metrics
 
-Issue: #636. This spec covers **metrics only**, the first item of #636, plus the per-peer view needed to size the limits in #638. It changes no behaviour: no limit, no stream and nothing on the wire.
+Issue: #636. This spec covers **observation only**: the first item of #636, plus the per-peer view needed to size the limits in #638. It changes no behaviour: no limit, no stream and nothing on the wire.
 
 ## Terms
 
@@ -10,101 +10,94 @@ Issue: #636. This spec covers **metrics only**, the first item of #636, plus the
 
 ## Problem
 
-On sw-1 on 2026-10-09 (#622, scenario B), 121 peers refused pull-sync streams from our nodes with error code 4098 (`0x1002`), and one node stopped refilling its reserve at 75 % (#636). Two things could not be seen:
+On sw-1 on 2026-10-09 (#622, scenario B), 121 peers refused pull-sync streams from our nodes with error code 4098 (`0x1002`), and one node stopped refilling its reserve at 75 % (#636). Two things were hard to see:
 
 1. **Refusals by peers** appear only as a debug line of the puller (`syncWorker interval failed`, `pkg/puller/puller.go:493`), mixed with every other failure. The worker error counter (`bee_puller_worker_errors`) does not say why. Finding them took a debug logger on every node and a log parse.
-2. **Refusals here** cannot be seen at all. The resource manager's blocked counters are not exported with the node's setup; only the open stream counts are (`libp2p_rcmgr_streams`, `libp2p_rcmgr_limit`). So an operator cannot tell whether their node is the one refusing its neighbours.
+2. **Who holds the streams.** The node already exports the resource manager's own metrics: `rcmgr.MustRegisterWith(o.Registry)` (`pkg/p2p/libp2p/libp2p.go:259-261`) registers the go-libp2p collectors (`p2p/host/resource-manager/stats.go`), fed by the trace reporter. They include `libp2p_rcmgr_blocked_resources{dir, scope, resource}` (`stats.go:124`), which counts refusals here, and the histograms `libp2p_rcmgr_peer_streams` and `libp2p_rcmgr_previous_peer_streams` (`stats.go:60`, `:69`), whose buckets end at 256. **Correction:** an earlier version of this spec, and #636, said refusals here are not observable; they are, through `libp2p_rcmgr_blocked_resources`, which shows a series only after the first block. What is missing is the size of the largest per-peer holdings above 256 and which peer holds them: on 2026-10-09 the histograms showed one peer holding about 4,500 inbound pull-sync streams on stake-1, and peers holding 700 to 1,100 on seven sw-1 nodes, with no way to tell which peer.
 
 ## Hypothesis
 
-With one counter on each side, an operator can see whether their node is refused by its peers, by which protocol, and whether it refuses others. The 24-hour measurement in #636 needs both counters to decide between raising the stream caps (rule 8) and changing how pull-sync holds streams.
+With a counter for refusals by peers and an exact per-peer view of inbound streams, an operator can see whether their node is refused, by which protocol, whether a few peers hold most of the streams, and which peers those are. The 24-hour measurement in #636 needs these to choose between raising the stream caps (rule 8), changing how pull-sync holds streams, and the per-peer limits in #638.
 
 ## Design
 
-### 1. Refused here
+### 1. Refused here: use the existing metric
 
-Where wasp can observe it, verified in go-libp2p v0.48.0:
+`libp2p_rcmgr_blocked_resources{dir="inbound", scope="system", resource="streams"}` is the "refused here" signal; no new counter is added. The documentation (`docs/DIFFERENCES.md` and the metrics description) says so, and that the series appears only after the first block.
 
-- **Opening the stream scope.** The swarm calls `ResourceManager().OpenStream(peer, network.DirInbound)` for every accepted inbound stream and resets it with `0x1002` when that fails (`p2p/net/swarm/swarm_conn.go:139-141`). The node already wraps the resource manager (`inboundLimiter`, `pkg/p2p/libp2p/inboundlimit.go:187`, installed with `libp2p.ResourceManager(inbound)`, `pkg/p2p/libp2p/libp2p.go:358`), so the wrapper adds `OpenStream(peer, dir)`: it calls the inner manager and, on an error, counts it.
-- **Setting the protocol.** After negotiation the host calls `SetProtocol` on the stream (`p2p/host/basic/basic_host.go:350` for inbound; `:481` and `:510` for outbound), which calls the stream scope's `SetProtocol` (`p2p/net/swarm/swarm_stream.go:155`, `p2p/host/resource-manager/rcmgr.go:856`), and resets with `0x1002` on an error. The wrapper's `OpenStream` returns its own scope type around the inner `network.StreamManagementScope`; its `SetProtocol` counts an error. The node sets no protocol or service limits today, so this path cannot fail now; it is counted so that a later per-protocol limit is visible.
-
-Metric:
-
-- `bee_libp2p_streams_refused_total{direction, stage, reason}`, a counter.
-  - `direction`: `inbound` or `outbound`. Outbound refusals here happen when this node's own outbound cap (10,000) is reached; they are counted too, since they also stop pull-sync.
-  - `stage`: `open` (the scope could not be opened) or `protocol` (`SetProtocol` failed).
-  - `reason`: `limit` when the error matches `network.ErrResourceLimitExceeded` with `errors.Is` (the rcmgr errors `ErrStreamOrConnLimitExceeded` and `ErrMemoryLimitExceeded` unwrap to it, `p2p/host/resource-manager/error.go:15`, `:62`), otherwise `other`.
-
-No peer label: label values must stay bounded.
+If refusals at protocol negotiation (`SetProtocol`, `p2p/host/basic/basic_host.go:350`, `:481`, `:510`) need counting later, the place is `rcmgr.WithMetrics` with a `MetricsReporter` (`p2p/host/resource-manager/metrics.go:51`; `BlockStream` at `rcmgr.go:429`, `BlockProtocol` at `metrics.go:114`), not a wrapper around the stream scope. The node sets no protocol or service limits today, so that path cannot refuse anything now, and it is not added.
 
 ### 2. Refused by a peer
 
-Every outbound Swarm stream goes through `Service.NewStream` (`pkg/p2p/libp2p/libp2p.go`, line 1447 to 1488): `newStreamForPeerID` negotiates the protocol, then `sendHeaders` exchanges headers. A refusal surfaces in either step as a wrapped remote `*network.StreamError`. The sw-1 failures read `send headers: read message: stream reset (remote): code: 0x1002`, so the wrapping keeps the error (`headers.go:26`, `:39` and `libp2p.go:1486` all use `%w`).
+Every outbound Swarm stream goes through `Service.NewStream` (`pkg/p2p/libp2p/libp2p.go`, line 1447 to 1488): `newStreamForPeerID` negotiates the protocol, then `sendHeaders` exchanges headers. A refusal surfaces in either step as a wrapped remote `*network.StreamError`. The full error text seen on sw-1 was `send headers: read message: stream reset (remote): code: 0x1002: transport error: stream reset by remote, error code: 4098`; every layer wraps with `%w` (`headers.go:26`, `:39`, `libp2p.go:1486`), so `errors.As` reaches the `*network.StreamError` with `Remote` true.
 
 In `NewStream`, on an error from either step: if `errors.As` finds a `*network.StreamError` with `Remote` true and `ErrorCode == network.StreamResourceLimitExceeded`, count it.
 
 Metric:
 
-- `bee_libp2p_streams_refused_by_peer_total{protocol}`, a counter. `protocol` is the Swarm protocol name and version (`pullsync/1.4.0` and so on), which is bounded.
+- `bee_libp2p_streams_refused_by_peer_total{protocol, stream}`, a counter. `protocol` is the Swarm protocol name and version (`pullsync/1.4.0`), `stream` the stream name (`pullsync`, `cursors`); both come from code, so the label set is bounded.
 
-Optional, if cheap: a debug line `stream refused by peer` with the peer address and protocol, at the same verbosity as the puller's interval failure, so one peer can be followed without parsing other lines.
+Peers on older libp2p versions reset with code 0 and are not counted; the counter is a lower bound. Streams that a peer resets later, after the headers, are not counted either.
 
-Streams that a peer resets later, after the headers, for example during a pull-sync exchange, are not counted: that is not where the sw-1 refusals happened, and other resets would mix in.
+A debug line `stream refused by peer` with the peer overlay, protocol and stream name lets one peer be followed without parsing other lines.
 
 ### 3. Inbound streams per peer
 
-The two counters say that refusals happen, not who holds the streams. To tell a few peers holding many streams (a fault or misbehaviour on their side) from many peers holding the usual number (load), and to size the per-peer limit proposed in #638 from data (rule 8: measure first), the node also reports how inbound streams are spread over peers.
+The two signals above say that refusals happen, not who holds the streams. Every 30 s a goroutine reads the inner resource manager's own accounting: `ListPeers()` (`rcmgr.ResourceManagerState`, `p2p/host/resource-manager/extapi.go:23`, `:95`) and, for each peer, `ViewPeer(p, ...)` with `Stat().NumStreamsInbound`. This is the exact count the limits apply to, read without touching connections or stream locks. The node keeps a reference to the inner manager (it is wrapped by #617's `inboundLimiter`).
 
-Every 30 s a goroutine walks `host.Network().Conns()`, and for each connection `conn.GetStreams()` (go-libp2p v0.48.0 `p2p/net/swarm/swarm_conn.go:287`, a copy of the stream set under the connection's lock), counts the streams whose `Stat().Direction` is inbound, and sums them per remote peer (a peer can hold more than one connection). From the per-peer counts it sets gauges, with no peer ID as a label:
+Gauges, with no peer ID as a label:
 
-- `bee_libp2p_inbound_streams_per_peer_max`: the largest count;
-- `bee_libp2p_inbound_streams_per_peer_p99`: the 99th percentile (with fewer than 100 peers, the second-largest count);
-- `bee_libp2p_inbound_stream_peers_over{threshold}`: the number of peers above 64, 256 and 1,000 inbound streams;
-- the same three for pull-sync streams only (`Protocol()` equal to the pull-sync protocol ID), with the suffix `_pullsync`. This costs one string comparison per stream, so it is included.
+- `bee_libp2p_inbound_streams_per_peer_max`: the largest per-peer count;
+- `bee_libp2p_inbound_stream_peers_over{threshold}`: the number of peers above 64, 256 and 1,000 inbound streams.
 
-When the largest count exceeds the highest threshold (1,000), a debug line `peer holds many inbound streams` names that peer, its count and its pull-sync count.
+**Naming the peers (operator request).** When a peer holds more than 256 inbound streams, the node logs at **info** level, at most once per peer per hour, a line `peer holds many inbound streams` with:
 
-**Cost.** One pass is proportional to the number of streams: about 150 connections and, on a busy node, up to the cap of about 5,000 inbound streams plus the outbound ones, so at most about 15,000 stream records per pass, each a read of `Stat()` and a map update. Each `GetStreams` call holds one connection's stream lock only while copying its set. That is well under a millisecond of work every 30 s.
+- the libp2p peer ID;
+- its overlay (from the peer registry, `pkg/p2p/libp2p/peer.go:197`);
+- its Ethereum address, from its signed bzz address in the address book (`addressbook.Get(overlay)`, `pkg/addressbook/addressbook.go:124`; `bzz.Address.EthereumAddress`, `pkg/bzz/address.go:39`, recovered from the signature at line 122); empty if the address book has no record;
+- its inbound stream count.
 
-**Why 30 s.** Pull-sync streams live for minutes (a live sync request waits for new chunks), so a slower scan still sees the pattern, while a faster one adds lock traffic on every connection for no gain. A short burst between two scans is missed; the refusal counters above catch its effect.
+At **debug** level each scan logs the top three peers with the same fields. These are public network identifiers that every peer already exchanges in the handshake; no other data is logged. The once-per-hour limit keeps a persistent case from flooding the log: a map from peer ID to the time of its last line, pruned of peers not seen in the scan.
+
+**Cost.** `ListPeers` returns the peers the manager tracks (about 150 on a busy node), and `ViewPeer` takes that peer scope's lock briefly to copy its counters, so one pass is about 150 short lock acquisitions every 30 s. The address book read happens only for a peer over the threshold, at most once per hour per peer.
+
+**Why 30 s.** Pull-sync streams live for minutes (a live request waits for new chunks), so the pattern is visible at this interval, and a faster one adds lock traffic for no gain. A short burst between two scans is missed; the refusal counters show its effect.
 
 ### 4. Documentation
 
-`docs/DIFFERENCES.md` gets the two metrics in the metrics table. Nothing else changes.
+`docs/DIFFERENCES.md` gets the new metrics and the info line, and names `libp2p_rcmgr_blocked_resources` as the signal for refusals here. A note records that wrapping the resource manager in #617 hides `connmgr.GetConnLimiter`, so go-libp2p's startup warning about the connection manager's limits cannot fire; it has no effect on behaviour.
 
 ## Protocol impact
 
-None. Both counters observe errors the node already receives or produces. No message, stream, protocol ID, limit or reset code changes. `make protocol-freeze` must report the wire surface unchanged.
+None. The counter observes errors the node already receives; the scan reads local accounting. No message, stream, protocol ID, limit or reset code changes. `make protocol-freeze` must report the wire surface unchanged.
 
 ## Configuration
 
-None. No setting is added; this is observation only.
+None. No setting is added; the thresholds and the interval are compiled in for this observation step.
 
 ## Measurement
 
-The change is accepted on tests plus one real-node check; the 24-hour measurement in #636 then uses the counters.
+The change is accepted on tests plus one real-node check; the 24-hour measurement in #636 then uses these signals.
 
 **Tests:**
 
-1. Refused here, `open` stage: a service with an inner resource manager whose `OpenStream` returns `ErrStreamOrConnLimitExceeded` counts one inbound `open`/`limit` refusal per attempt; a non-limit error counts as `other`.
-2. Refused here, `protocol` stage: a scope whose `SetProtocol` fails is counted as `protocol`.
-3. Refused by a peer: a test peer whose resource manager refuses inbound streams (a stream cap of 0 on that peer) makes `NewStream` to it fail, and the counter for that protocol rises by one; a stream that fails for another reason (unknown protocol, peer gone) does not count.
-4. The wrapper still forwards every other `ResourceManager` method unchanged (the existing inbound-limit tests keep passing).
-5. Per-peer gauges: two test peers opening 3 and 70 inbound streams to the node give a maximum of 70, one peer over 64, none over 256, and the pull-sync gauges count only streams of that protocol; the debug line appears only above the highest threshold.
+1. Refused by a peer: a test peer whose resource manager refuses inbound streams (a stream cap of 0) makes `NewStream` to it fail and the counter for that protocol and stream rises by one; a stream that fails for another reason (unknown protocol, peer gone) does not count.
+2. Per-peer gauges: two test peers opening 3 and 70 inbound streams give a maximum of 70, one peer over 64 and none over 256.
+3. The info line: a peer over the threshold is logged once with peer ID, overlay and Ethereum address, and not again within the hour; a peer with no address-book record is logged with an empty Ethereum address.
 
-Mutation checks: drop the `Remote` check (a local reset would then count), drop the code check (any reset would count), drop the `errors.As` (nothing counts); each must fail a test.
+Mutation checks: drop the `Remote` check, the code check, or the `errors.As` in item 1; drop the once-per-hour map in item 3; each must fail a test.
 
-**Real nodes:** deploy to the sw-1 nodes during the next refill, or to a bench node pulling from mainnet peers, and compare the new `refused_by_peer` counter for `pullsync/1.4.0` over 10 minutes with a puller debug log taken at the same time: the counts of `error code: 4098` lines and the counter must agree within the few intervals a log rotation or timing boundary can split. A negative result is a counter that stays at 0 while the log shows refusals (the error is not reaching `NewStream` as a `*network.StreamError`), or counts that differ by more than that margin.
+**Real nodes:** on stake-1 and the sw-1 nodes, the info line must name the peers the histograms show above 256 (the one at about 4,500 on stake-1 and those at 700 to 1,100 on sw-1), and `bee_libp2p_inbound_streams_per_peer_max` must agree with the highest bucket the histograms put them in. For refusals by peers, compare the counter for `pullsync/1.4.0` and stream `pullsync` over 10 minutes with a puller debug log taken at the same time (`error code: 4098` lines only); the two must agree within the intervals a timing boundary can split. A negative result is a counter at 0 while the log shows refusals, or a peer over the threshold in the histograms that the info line never names.
 
 ## Rollout and rollback
 
-Ships in the next build; there is nothing to turn on. Rollback is the previous build; the metrics disappear and nothing else changes.
+Ships in the next build; there is nothing to turn on. Rollback is the previous build; the metrics and the log line disappear and nothing else changes.
 
 ## Upstream portability
 
-Both parts port to upstream Bee: upstream builds its resource manager in the same place (`pkg/p2p/libp2p/libp2p.go:230-237` at `v2.8.2`) but has no wrapper, so the port adds a small wrapper around the resource manager with `OpenStream` only. The `NewStream` check is a few lines in the same function upstream.
+Both parts port to upstream Bee: the `NewStream` check is a few lines in the same function, and the scan needs only the resource manager upstream already builds (`pkg/p2p/libp2p/libp2p.go:230-237` at `v2.8.2`), which implements `ResourceManagerState`.
 
 ## To check during implementation
 
-- Whether the wrapper's own scope type must forward every `network.StreamManagementScope` method (`ProtocolScope`, `SetService`, `ServiceScope`, `PeerScope`, `Done` and the resource methods) and keep the same identity checks the swarm relies on, if any.
-- Whether `errors.As` reaches the `*network.StreamError` through the protobuf reader's error in every libp2p version the repository pins (verify against `go.mod`).
+- That the inner manager returned by `rcmgr.NewResourceManager` satisfies `rcmgr.ResourceManagerState` in the pinned go-libp2p version, and that `ViewPeer` does not create a scope for a peer that has left.
+- Whether `errors.As` reaches the `*network.StreamError` for a refusal during protocol negotiation as well as during `sendHeaders` (the sw-1 case was `sendHeaders`).
