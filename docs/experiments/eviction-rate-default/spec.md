@@ -72,7 +72,7 @@ All durations below assume no arrivals. With arrivals at rate a, the excess drai
    - At rate 0 the threshold is several hundred thousand chunks (about 2,600 to 3,150 chunks/s measured on the dense host, faster on a node that evicts alone).
    - Expiry is routine, so this probably happens far more often than a radius increase.
    - **Measurement:** the size of each expiry eviction, from `bee_localstore_expired_count` per expiry and the `evict expired batches start` log line, on the bench nodes and a staked node over a week, against the 31,000 threshold.
-   - **Open question, not changed here:** whether batch-expiry eviction should count toward the #649 gate at all. It is tracked in a separate issue; this spec does not change the gate.
+   - **Open question, not changed here:** whether batch-expiry eviction should count toward the #649 gate at all. It is tracked in [#663](https://github.com/crtahlin/wasp/issues/663); this spec does not change the gate.
 2. **Radius-increase evictions take longer.**
    - Half of a default reserve (capacity 4,194,304, about 2 M chunks) takes at least about 70 minutes at 500/s, instead of a few minutes.
    - Half of a reserve at doubling 3 (about 14 to 17 M chunks) takes at least about 8 hours, instead of about 1 h 14 min measured on the dense host.
