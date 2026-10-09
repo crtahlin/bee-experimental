@@ -51,7 +51,7 @@ So there are two harms: **time** (a sample during a long eviction misses its dea
 
 - **Opens** when an eviction run (`unreserve` or `evictExpiredBatches`) starts and no episode is open.
 - **Stays open** across runs: a run that ends while work remains (`EvictionTarget() > 0`, or an `expiredBatchItem` still recorded) does not close it.
-- **Closes** when a run ends with `EvictionTarget() == 0` and no expired batch pending, or when no run has been active for `episodeIdleGrace` (10 s, compiled in). The grace covers the gap between a run that ended for an expiry and the next run the worker starts.
+- **Closes** when a run ends with `EvictionTarget() == 0` and no expired batch pending, or when no run has been active for `episodeIdleGrace` (10 s, compiled in). The grace is evaluated when the state is read: `EvictingFor()` returns 0 if no run is active and the last run ended more than the grace ago, and the next run then opens a new episode. No timer is needed. The grace covers the gap between a run that ended for an expiry and the next run the worker starts.
 - **Active time** is the sum of time spent inside runs of the episode, **excluding** time paused for a sample (section 3). Pausing must not turn a short top-up into "evicting": a 2-second top-up paused by a 5-minute sample stays at 2 s.
 
 `func (db *DB) EvictingFor() time.Duration` returns the active time of the open episode, or 0. It is added to `storer.Reserve` (`pkg/storer/storer.go:142-148`), the agent's store type, not to `RadiusChecker`, which also serves the puller, salud and the API. Mocks gain it with a setter.
@@ -87,6 +87,7 @@ if d := a.store.EvictingFor(); d >= evictingMinAge {
 - Eviction holds it around each `evictRound` (read and delete of one round) and around `radius++; SetRadius` in `unreserve` (`reserve.go:584-588`). It is **never** held across `Pay`, the pause or the rate-limiter wait.
 - Under the lock, before the round or the radius step, eviction checks `IsSampling()`. If a sample runs, it releases the lock and pauses (below), then re-checks.
 - `reserveSample` increments the counter, then locks and unlocks `evictionMu` once, then reads `StorageRadius()` (`sample.go:243`). The lock-unlock waits for at most one round (1,000 chunks) or one radius step already in progress; after it, every later round and step sees the counter and waits.
+- **Depth check after the barrier:** the agent passes its committed depth into the sample (`agent.go` `makeSample`), read before the barrier. After the lock-unlock, `reserveSample` compares `CommittedDepth()` with that value and fails the sample with an error if they differ, since a radius step completed between the agent's read and the barrier. The agent logs it and the round is not played, which is safer than sampling at a stale depth.
 - This cannot deadlock: the sample takes the lock once and holds nothing else while waiting, and eviction never waits for the sample while holding it.
 
 The check before each round covers the first round of the next `evictBatch` after a radius step, which today runs before any `Pay` (`Pay` follows only a round that deleted something), and a sample that starts between a `Pay` and the next round.
@@ -96,10 +97,10 @@ The round check needs a hook into `EvictBatchBin`: `EvictionHooks` gains `Before
 **Pause.** `waitWhileSampling(ctx, expiry)` polls `IsSampling` every 250 ms (as the puller does, `puller.go:419-428`) and returns `ErrDBQuit` on `db.quit`, `errEvictionExpiry` on `expiry` and `ctx.Err()` on the context, in that order, as `stop()` does. It counts paused time and excludes it from the episode's active time.
 
 - **Bounds:** the agent's sample context ends at the next reveal phase (`agent.go:157`), about 570 s at 5-second blocks. A `/rchash` sample is bounded only by its HTTP request (`pkg/api/rchash.go:125`). A sample ends or fails and the counter is decremented on every return.
-- **Cap:** a single pause is capped at `maxEvictionPause` (15 minutes, compiled in). When it is reached, eviction logs a Warning (`reserve eviction resumed after waiting 15m for a sample`) and continues; the barrier then lets rounds run during that sample. This keeps a stuck or very slow sample from holding the reserve over capacity indefinitely.
+- **Cap:** the cap applies to the whole continuous sampling stretch, not to one pause. `DB` records when the sampling counter last went from 0 to 1. Once that stretch has lasted `maxEvictionPause` (15 minutes, compiled in), `Before`, the radius-step check and the pause stop waiting, and rounds and radius steps run normally until the counter returns to 0; the next stretch starts a new 15 minutes. When the cap is reached, eviction logs one Warning per stretch (`reserve eviction resumed after a sample ran for 15m`) and increments the counter. A per-pause cap would not work: after each round the next check would pause again for up to 15 minutes. This keeps a stuck or very slow sample, or back-to-back `/rchash` calls, from holding the reserve over capacity indefinitely.
 - **Overfill:** pull-sync is paused while a sample runs (#23), so only push-sync arrivals add to the reserve during a pause: minutes of uploads at most.
 - **Locks:** the pause runs with the batch lock and `evictionMu` released, so uploads, retrievals and puts of that batch proceed. The 1 ms yield between rounds (`EvictionYield`) is unchanged.
-- **Paced mode:** the pause runs before the limiter wait, so no reservation is held during it. The limiter refills during a pause up to one burst (`evictionpace.go:81`, burst = one round), so the first round after a pause runs without waiting, then the configured rate applies. The worker step-down compares deletion rate with wall-clock time (`:169`); paused time is excluded from that measurement, so a pause is not counted as spare capacity.
+- **Paced mode:** the pause runs before the limiter wait, so no reservation is held during it. The limiter refills during a pause up to one burst (`evictionpace.go:81`, burst = one round), so the first round after a pause runs without waiting, then the configured rate applies. The worker step-down compares deletion rate with wall-clock time (`:159-169`); after a pause, `headroomSince` is shifted forward by the paused time, so a pause is not counted as a stretch of spare capacity.
 - A shutdown during the pause stops the eviction as a shutdown between rounds does today (#407: `ErrDBQuit`, no warning). A batch expiry ends an `unreserve` as today (it returns nil on `errEvictionExpiry`, `reserve.go:567-569`); for `evictExpiredBatches` (`expiry == nil`) a nil channel never fires, as today.
 - Every sample pauses eviction, including `/rchash`; bench scripts that call `/rchash` during an eviction measurement see the eviction pause, and the measurement plan accounts for it.
 
@@ -109,7 +110,7 @@ The round check needs a hook into `EvictBatchBin`: `EvictionHooks` gains `Before
 |---|---|---|
 | `bee_storageincentives_skipped_while_evicting` | counter | selected rounds skipped by the gate |
 | `bee_localstore_eviction_paused_seconds_total` | counter | time eviction spent waiting for a sample |
-| `bee_localstore_eviction_pause_capped_total` | counter | pauses that reached `maxEvictionPause` |
+| `bee_localstore_eviction_pause_capped_total` | counter | sampling stretches that reached `maxEvictionPause` |
 | `bee_localstore_eviction_running_seconds` | gauge (`GaugeFunc` reading `EvictingFor()`, so it is never stale) | active time of the open eviction episode, 0 when none |
 
 - Info `skipping round because node is evicting` with `round` and `evicting_for`, alongside the existing skip lines.
@@ -125,7 +126,7 @@ The round check needs a hook into `EvictBatchBin`: `EvictionHooks` gains `Before
 
 ## Cost to a staked node
 
-Each selection that falls inside a large eviction is skipped: one round's reward chance. At the proposed default of 500 chunks/s (#651) a half-capacity eviction on a node with `reserve-capacity-doubling: 3` (capacity 4,194,304 x 8, about 33.5 M chunks, so about 14 to 17 M evicted when it halves) lasts about 8 hours, about 38 rounds of 152 blocks at 5 s. At committed depth 9 a neighbourhood is selected about once per 512 rounds, so a node misses a selection in about 7 % of such evictions (estimate). Without the gate, the measured samples would have missed the deadline anyway, so on a dense host the gate costs nothing it would have earned; on a host where this node evicts alone, a sample with eviction paused might have finished in time, and that round is lost. The minimum age keeps routine top-ups from costing anything. Label: `stake-risk`.
+Each selection that falls inside a large eviction is skipped: one round's reward chance. At the proposed default of 500 chunks/s (#651) a half-capacity eviction on a node with `reserve-capacity-doubling: 3` lasts about 8 hours, about 38 rounds of 152 blocks at 5 s. At committed depth 9 a neighbourhood is selected about once per 512 rounds, so a node misses a selection in about 7 % of such evictions (estimate). The figure is for the bench host's nodes, which run `reserve-capacity-doubling: 3` with a raised `max-reserve-capacity-doubling` (capacity 4,194,304 x 8, about 33.5 M chunks, about 14 to 17 M evicted when it halves); upstream allows at most 1 (`maxAllowedDoubling`, `pkg/node/node.go:274`). On a default node (capacity 4,194,304) a half-capacity eviction is about 2 M chunks, about 70 minutes at 500 chunks/s, about 6 rounds, so the miss chance is about 1 %. Without the gate, the measured samples would have missed the deadline anyway, so on a dense host the gate costs nothing it would have earned; on a host where this node evicts alone, a sample with eviction paused might have finished in time, and that round is lost. The minimum age keeps routine top-ups from costing anything. Label: `stake-risk`.
 
 ## Protocol impact
 
@@ -149,13 +150,13 @@ None. `evictingMinAge` (1 minute) and the 250 ms poll are compiled in. Rule 8: a
 8. Barrier: a sample that starts while a round is in progress waits for that round only; the round after it does not run until the sample ends (hook to hold a round open).
 9. Overlapping samples: two samples overlap; after the first ends, eviction stays paused until the second ends.
 10. Pause exits: `db.quit` during the pause returns `ErrDBQuit` and logs no warning; an expiry during a pause in `unreserve` ends it, which then returns nil; a cancelled context returns its error.
-11. Pause cap: a sample longer than `maxEvictionPause` (shortened in the test) lets eviction resume with the Warning and the counter.
+11. Pause cap: with a sampling stretch longer than `maxEvictionPause` (shortened in the test), eviction resumes with one Warning and one counter increment, and **several further rounds and a radius step run** while the sample still runs; after the counter returns to 0 and a new sample starts, eviction pauses again.
 12. Locks: during the pause a `Put` of the same batch completes.
 13. No sample: a full eviction takes no longer than today (within the 1 ms yield per round).
 
 Tests use `synctest` for time where the package already does.
 
-**Mutation checks** (each must make a test fail): gate removed; gate compares with `> 0` instead of the minimum age; episode closed at the end of every run; paused time counted as active time; round check removed (pause only in `Pay`); sampling check before `SetRadius` removed; `reserveSample` skips the lock-unlock; sampling counter turned back into a boolean; pause cap removed; pause ignores `db.quit`; pause skipped in the unpaced hooks.
+**Mutation checks** (each must make a test fail): cap applied per pause instead of per stretch; depth check after the barrier removed; gate removed; gate compares with `> 0` instead of the minimum age; episode closed at the end of every run; paused time counted as active time; round check removed (pause only in `Pay`); sampling check before `SetRadius` removed; `reserveSample` skips the lock-unlock; sampling counter turned back into a boolean; pause cap removed; pause ignores `db.quit`; pause skipped in the unpaced hooks.
 
 **Real nodes** (role names only): during the windowed runs of #650 on the ten-node host, take samples on two observer nodes and check that the observer's evicted counter and storage radius stay flat during its sample, that `eviction_paused_seconds_total` grows by about the sample duration, and the sample duration with this node paused but its nine neighbours evicting. A bench node cannot be made to be selected, so the gate itself is verified by unit tests, as for #583. On the staked node, the next eviction (if any) should show `skipped_while_evicting` only for selections that fall inside it.
 
