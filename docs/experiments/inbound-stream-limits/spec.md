@@ -95,14 +95,14 @@ The resource manager limits each protocol separately but cannot reserve room for
 
 **Transient streams.** A stream counts against the system cap from accept, before it has a protocol and so before it belongs to a group. Without a bound, un-negotiated streams could fill the room reserved for pull-sync and pull-sync would be refused at accept, before any group check runs. Two limits bound them:
 
-- **Per peer, in the wrapper: `U_peer = 32` un-negotiated inbound streams.** A peer can hold a stream un-negotiated for up to `DefaultNegotiationTimeout` (10 s, `basic_host.go:39`) without sending anything. Without a per-peer bound, one peer could fill the node-wide transient limit and block every new inbound stream from everyone for 10 s at a time, again and again. The wrapper's `OpenStream` counts un-negotiated inbound streams per peer ID (reserve first, roll back on refusal) and releases the count at the first of a successful `SetProtocol` or `Done()`. A correct peer opens a few streams at a time and negotiates each within milliseconds; 32 leaves room for a burst of parallel retrievals.
-- **Node-wide, in the resource manager: `Transient.StreamsInbound = T` with T = 1,024.** T is well above `U_peer`, so it takes at least 32 peers each holding silent streams to fill it. Negotiation takes milliseconds, so transient streams are few in normal use: 0 on every sw-1 node at each reading; the measurement records the maximum and the transient refusals.
+- **Per peer, in the wrapper: `U_peer = 64` un-negotiated inbound streams.** A peer can hold a stream un-negotiated for up to `DefaultNegotiationTimeout` (10 s, `basic_host.go:39`) without sending anything. Without a per-peer bound, one peer could fill the node-wide transient limit and block every new inbound stream from everyone for 10 s at a time, again and again. The wrapper's `OpenStream` counts un-negotiated inbound streams per peer ID (reserve first, roll back on refusal) and releases the count at the first of a successful `SetProtocol` or `Done()`. A correct peer negotiates each stream within milliseconds, but it can open many at once: on connect, a neighbour's puller at radius 6 opens up to about 52 pull-sync streams together (one per bin, 26 bins, live and historical), plus the cursors stream and the setup streams (handshake, pricing, hive, status). 64 covers that burst.
+- **Node-wide, in the resource manager: `Transient.StreamsInbound = T` with T = 1,024.** T is well above `U_peer`, so it takes at least 16 peers each holding silent streams to fill it. Negotiation takes milliseconds, so transient streams are few in normal use: 0 on every sw-1 node at each reading; the measurement records the maximum and the transient refusals.
 
 The group limits are then:
 - the other group may hold at most `cap - R_pull - T` = 5,000 - 2,000 - 1,024 = **1,976** negotiated inbound streams;
 - the pull-sync group may hold at most `cap - R_other - T` = 5,000 - 1,000 - 1,024 = **2,976**.
 
-1,976 for the other group is still about seven times the largest total measured on any node with #640 (278 at a reading, nearly all pull-sync), and 2,976 for pull-sync covers 57 neighbours at the 52-stream radius-6 bound.
+1,976 for the other group is still about seven times the largest total measured on any node with #640 (278 at a reading, nearly all pull-sync). 2,976 for pull-sync covers 56 neighbours at the radius-6 bound of 53 each (52 plus the cursors stream); 57 neighbours all at that bound at once would need 3,021, which happens only if every bin of every neighbour waits at the same moment. The measurement records the pull-sync group's maximum against 2,976.
 
 With these, pull-sync always has at least `R_pull` streams of room (the others plus transient can never exceed `cap - R_pull`), and the other group at least `R_other`. The guarantee covers negotiated streams; transient streams are bounded separately by T.
 
@@ -136,12 +136,13 @@ The peer's stream fails with 4098. A wasp requester counts it in `bee_libp2p_str
 
 - Per-peer and transient refusals: already exported by the resource manager, `libp2p_rcmgr_blocked_resources{dir="inbound",scope="peer"|"transient",resource="stream"}`.
 - New: `bee_libp2p_inbound_streams_refused_total{limit="peer_unnegotiated"|"group_pullsync"|"group_other"}`, each label created at start so the series exports 0.
-- New gauge: `bee_libp2p_inbound_streams_group{group="pullsync"|"other"}`.
+- New gauges: `bee_libp2p_inbound_streams_group{group="pullsync"|"other"}` and `bee_libp2p_inbound_streams_unnegotiated_per_peer_max`.
 - The per-peer histogram `libp2p_rcmgr_peer_streams` stays the count of observations above 256.
 
-**Attribution.** A count above 256 or a refusal is only useful if it says who and what. Two additions, both active whether the limits are on or off:
-- **A per-peer high-water mark.** A trace reporter wraps the existing `StatsTraceReporter` (passed through `rcmgr.WithTraceReporter`, `trace.go:30-47`) and, on each stream event of a peer scope, keeps the peer's current and highest inbound stream count since the last report. It forwards every event unchanged to the wrapped reporter, so today's metrics do not change. It must be quick (the reporter is called synchronously): one map update under a mutex. Entries are dropped when the peer scope is destroyed (`TraceDestroyScopeEvt`). This gives real maxima on the "off" half of the measurement, not 30-second samples.
-- **A log line when a peer passes 256, and on every per-peer, un-negotiated or group refusal,** rate-limited to once per peer per 10 minutes: peer ID, overlay, full or light, the peer's inbound stream counts per protocol read from the resource manager's state (`ResourceManagerState.Stat()`, as #639 already does), and which limit was hit. This extends the #639 line, which fires only for a peer still above 256 at the 30-second scan.
+**Attribution.** A count above 256 or a refusal is only useful if it says who and what. Three additions, all active whether the limits are on or off:
+- **A per-peer high-water mark.** A trace reporter wraps the existing `StatsTraceReporter` (passed through `rcmgr.WithTraceReporter`, `trace.go:30-47`) and, on each stream event of a peer scope, keeps the peer's current and highest inbound stream count since the last report. It does the same for the transient scope (the node-wide highest count of un-negotiated streams). It forwards every event unchanged to the wrapped reporter, so today's metrics do not change. It must be quick (the reporter is called synchronously): one map update under a mutex. Entries are dropped when the peer scope is destroyed (`TraceDestroyScopeEvt`). This gives real maxima on the "off" half of the measurement, not 30-second samples.
+- **A per-peer un-negotiated high-water mark,** kept by the wrapper from its own `U_peer` counts and exported as the gauge `bee_libp2p_inbound_streams_unnegotiated_per_peer_max` (highest since the last scrape window, reset each 30-second scan like the #639 gauge), so the value of `U_peer` can be checked against real bursts.
+- **A log line when a peer passes 256, and on every per-peer, un-negotiated or group refusal,** rate-limited to once per peer per 10 minutes: peer ID, overlay, full or light, which limit was hit, and the peer's inbound stream counts per protocol. The resource manager's `Stat()` has no per-peer, per-protocol breakdown, so the counts come from the host: `Network().ConnsToPeer(p)`, then each connection's `GetStreams()`, counting streams with `Stat().Direction` inbound by `Protocol()` (a stream still un-negotiated has an empty protocol and is counted as such). This runs only when a line is logged, so its cost is bounded by the rate limit. This extends the #639 line, which fires only for a peer still above 256 at the 30-second scan.
 
 ## Protocol impact
 
@@ -158,7 +159,7 @@ Follows the convention of the sibling settings (`p2p-inbound-connection-rate` an
 | `p2p-inbound-stream-reserve-pullsync` | 2,000 | no reserve for pull-sync |
 | `p2p-inbound-stream-reserve-other` | 1,000 | no reserve for the others |
 | `p2p-inbound-streams-transient` | 1,024 | no node-wide transient limit (refused at start while a reserve is on) |
-| `p2p-inbound-streams-unnegotiated-per-peer` | 32 | no per-peer un-negotiated limit |
+| `p2p-inbound-streams-unnegotiated-per-peer` | 64 | no per-peer un-negotiated limit |
 
 The switch is the operator's decision 1: while it is false, none of the limits apply and the built limit configuration equals today's. Switching the default to true, after the measurement, changes nothing else. With the switch on, any value set to -1 turns only that limit off; turning off a reserve while the other stays on is allowed.
 
@@ -190,7 +191,7 @@ On bench-1 with throwaway nodes (no stake), three runs each, limits off and on:
 5. **Silent streams:** one test peer opens streams and never negotiates them, as fast as it can. On: it is refused at `U_peer`, and a normal neighbour's pull-sync and retrieval streams are still admitted throughout. Off: record how long other peers are refused.
 6. **Restart:** restart the node with the limits on while its neighbours are connected, and record `blocked_resources{scope="transient"|"peer"}` and the group refusals for the first 10 minutes, when every neighbour reconnects and opens its streams at once.
 
-Pass for 1, 2, 5 and 6: the protected peer or protocol is never refused in any run, and the restart causes no refusal of a peer in normal use. For 3: the numbers are recorded; if the loop costs either node more than 0.5 core, the refusal path for pull-sync gets its own issue (for example a short refusal backoff on this side) before the default is switched on.
+Pass for 1, 2, 5 and 6: the protected peer or protocol is never refused in any run, and the restart causes no refusal of a peer in normal use, at any limit including `peer_unnegotiated`. For 3: the numbers are recorded; if the loop costs either node more than 0.5 core, the refusal path for pull-sync gets its own issue (for example a short refusal backoff on this side) before the default is switched on.
 
 ### On sw-1: is any legitimate peer refused
 
@@ -202,7 +203,7 @@ After the next build with #640, #641 and #643 is on all ten nodes, three windows
 
 Pass, the condition for the operator's decision 1:
 - **every observation above 256, on either half, attributed and classified** from the log line and the high-water mark: which peer, which protocols, and whether it is normal use (for example push-sync forwarding during an upload) or misbehaviour (a pile-up of one protocol, checked in a goroutine dump as for #640);
-- **zero refusals** of any peer in normal use at the per-peer, un-negotiated, transient or group limits on the "on" nodes, in all three windows, restarts included (`blocked_resources{scope="transient"}` stays 0 for peers in normal use);
+- **zero refusals** of any peer in normal use at the per-peer, un-negotiated, transient or group limits on the "on" nodes, in all three windows, restarts included (`blocked_resources{scope="transient"}` and the `peer_unnegotiated` refusals stay 0 for peers in normal use; the un-negotiated high-water mark is recorded against 64);
 - refill rate and CPU of the "on" half within the spread of the "off" half;
 - if any refusal of a peer in normal use occurs, the value is raised as stated above and the windows are repeated.
 
