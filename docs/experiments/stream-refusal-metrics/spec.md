@@ -23,7 +23,7 @@ With a counter for refusals by peers and an exact per-peer view of inbound strea
 
 ### 1. Refused here: use the existing metric
 
-`libp2p_rcmgr_blocked_resources{dir="inbound", scope="system", resource="streams"}` is the "refused here" signal; no new counter is added. The documentation (`docs/DIFFERENCES.md` and the metrics description) says so, and that the series appears only after the first block.
+`libp2p_rcmgr_blocked_resources{dir="inbound", scope="system", resource="stream"}` is the "refused here" signal. The label value is `stream`, singular (go-libp2p `stats.go:395`); `streams` is used only on `libp2p_rcmgr_limit` (`stats.go:208`); no new counter is added. The documentation (`docs/DIFFERENCES.md` and the metrics description) says so, and that the series appears only after the first block.
 
 If refusals at protocol negotiation (`SetProtocol`, `p2p/host/basic/basic_host.go:350`, `:481`, `:510`) need counting later, the place is `rcmgr.WithMetrics` with a `MetricsReporter` (`p2p/host/resource-manager/metrics.go:51`; `BlockStream` at `rcmgr.go:429`, `BlockProtocol` at `metrics.go:114`), not a wrapper around the stream scope. The node sets no protocol or service limits today, so that path cannot refuse anything now, and it is not added.
 
@@ -43,7 +43,7 @@ A debug line `stream refused by peer` with the peer overlay, protocol and stream
 
 ### 3. Inbound streams per peer
 
-The two signals above say that refusals happen, not who holds the streams. Every 30 s a goroutine reads the inner resource manager's own accounting: `ListPeers()` (`rcmgr.ResourceManagerState`, `p2p/host/resource-manager/extapi.go:23`, `:95`) and, for each peer, `ViewPeer(p, ...)` with `Stat().NumStreamsInbound`. This is the exact count the limits apply to, read without touching connections or stream locks. The node keeps a reference to the inner manager (it is wrapped by #617's `inboundLimiter`).
+The two signals above say that refusals happen, not who holds the streams. Every 30 s a goroutine reads the inner resource manager's own accounting with one call: `Stat().Peers` on `rcmgr.ResourceManagerState` (`p2p/host/resource-manager/extapi.go:110-131`), a map from peer ID to `network.ScopeStat`, whose `NumStreamsInbound` is the exact count the limits apply to. `Stat` copies the peer scopes it already tracks and creates none (unlike `ViewPeer`, which creates a scope for an untracked peer). The node reaches the inner manager through `inboundLimiter`'s embedded `ResourceManager` (`pkg/p2p/libp2p/inboundlimit.go:187`), or keeps the local `rm` from `New`, with a checked type assertion to `rcmgr.ResourceManagerState`; if the assertion fails the scan is disabled and a warning is logged once.
 
 Gauges, with no peer ID as a label:
 
@@ -53,13 +53,16 @@ Gauges, with no peer ID as a label:
 **Naming the peers (operator request).** When a peer holds more than 256 inbound streams, the node logs at **info** level, at most once per peer per hour, a line `peer holds many inbound streams` with:
 
 - the libp2p peer ID;
-- its overlay (from the peer registry, `pkg/p2p/libp2p/peer.go:197`);
-- its Ethereum address, from its signed bzz address in the address book (`addressbook.Get(overlay)`, `pkg/addressbook/addressbook.go:124`; `bzz.Address.EthereumAddress`, `pkg/bzz/address.go:39`, recovered from the signature at line 122); empty if the address book has no record;
+- its overlay, its Ethereum address and whether it is a full or a light node, all from the peer registry;
 - its inbound stream count.
 
-At **debug** level each scan logs the top three peers with the same fields. These are public network identifiers that every peer already exchanges in the handshake; no other data is logged. The once-per-hour limit keeps a persistent case from flooding the log: a map from peer ID to the time of its last line, pruned of peers not seen in the scan.
+At **debug** level each scan logs the top three peers with the same fields. These are public network identifiers that every peer already sends in the handshake; no other data is logged.
 
-**Cost.** `ListPeers` returns the peers the manager tracks (about 150 on a busy node), and `ViewPeer` takes that peer scope's lock briefly to copy its counters, so one pass is about 150 short lock acquisitions every 30 s. The address book read happens only for a peer over the threshold, at most once per hour per peer.
+**Registry change.** Light peers are never written to the address book (the handshake persists an address only when `i.FullNode && len(peerAddrs) > 0`, `pkg/p2p/libp2p/libp2p.go:751` at `933bf322`), so the address book cannot give the Ethereum address of an ultra-light peer, which is the case the operator asked about. The peer registry already stores the overlay and the full/light flag per peer ID (`overlays` and `full`, `pkg/p2p/libp2p/peer.go:22-23`, set in `addIfNotExists`). It also stores the Ethereum address, from `i.BzzAddress.EthereumAddress`, which the handshake already holds (`libp2p.go:760`, and `:1311` for outbound). `addIfNotExists` takes the address as a new argument, the entry is removed with the others on disconnect, and one new method returns overlay, Ethereum address and flag under a single `RLock`. No address-book read is needed.
+
+**Peers not in the registry.** A peer can hold streams without being in the registry: its handshake never finished, or it has just disconnected. It is logged with its peer ID only, with an empty overlay and Ethereum address. The once-per-hour map is keyed by peer ID and pruned of peers absent from the scan.
+
+**Cost.** `Stat` takes the manager lock once to copy the scope lists, then each peer scope's lock briefly to copy its counters: about 150 short lock acquisitions every 30 s on a busy node. The registry read happens only for the peers logged.
 
 **Why 30 s.** Pull-sync streams live for minutes (a live request waits for new chunks), so the pattern is visible at this interval, and a faster one adds lock traffic for no gain. A short burst between two scans is missed; the refusal counters show its effect.
 
@@ -83,9 +86,10 @@ The change is accepted on tests plus one real-node check; the 24-hour measuremen
 
 1. Refused by a peer: a test peer whose resource manager refuses inbound streams (a stream cap of 0) makes `NewStream` to it fail and the counter for that protocol and stream rises by one; a stream that fails for another reason (unknown protocol, peer gone) does not count.
 2. Per-peer gauges: two test peers opening 3 and 70 inbound streams give a maximum of 70, one peer over 64 and none over 256.
-3. The info line: a peer over the threshold is logged once with peer ID, overlay and Ethereum address, and not again within the hour; a peer with no address-book record is logged with an empty Ethereum address.
+3. The info line: a full peer and a light peer, each over the threshold, are each logged once with peer ID, overlay, Ethereum address and the full/light flag, and not again within the hour; a peer that holds streams but is not in the registry is logged with its peer ID only.
+4. The registry returns overlay, Ethereum address and flag for a connected peer, and nothing after it disconnects.
 
-Mutation checks: drop the `Remote` check, the code check, or the `errors.As` in item 1; drop the once-per-hour map in item 3; each must fail a test.
+Mutation checks: drop the `Remote` check, the code check, or the `errors.As` in item 1; drop the once-per-hour map in item 3; store no Ethereum address for light peers in item 4; each must fail a test.
 
 **Real nodes:** on stake-1 and the sw-1 nodes, the info line must name the peers the histograms show above 256 (the one at about 4,500 on stake-1 and those at 700 to 1,100 on sw-1), and `bee_libp2p_inbound_streams_per_peer_max` must agree with the highest bucket the histograms put them in. For refusals by peers, compare the counter for `pullsync/1.4.0` and stream `pullsync` over 10 minutes with a puller debug log taken at the same time (`error code: 4098` lines only); the two must agree within the intervals a timing boundary can split. A negative result is a counter at 0 while the log shows refusals, or a peer over the threshold in the histograms that the info line never names.
 
@@ -95,9 +99,9 @@ Ships in the next build; there is nothing to turn on. Rollback is the previous b
 
 ## Upstream portability
 
-Both parts port to upstream Bee: the `NewStream` check is a few lines in the same function, and the scan needs only the resource manager upstream already builds (`pkg/p2p/libp2p/libp2p.go:230-237` at `v2.8.2`), which implements `ResourceManagerState`.
+Both parts port to upstream Bee: the `NewStream` check is a few lines in the same function, the scan needs only the resource manager upstream already builds (`pkg/p2p/libp2p/libp2p.go:230-237` at `v2.8.2`), which implements `ResourceManagerState`, and the registry change adds one field next to the overlay.
 
 ## To check during implementation
 
-- That the inner manager returned by `rcmgr.NewResourceManager` satisfies `rcmgr.ResourceManagerState` in the pinned go-libp2p version, and that `ViewPeer` does not create a scope for a peer that has left.
+- That the inner manager returned by `rcmgr.NewResourceManager` satisfies `rcmgr.ResourceManagerState` in the pinned go-libp2p version (checked against v0.48.0; confirm against `go.mod` at implementation).
 - Whether `errors.As` reaches the `*network.StreamError` for a refusal during protocol negotiation as well as during `sendHeaders` (the sw-1 case was `sendHeaders`).
