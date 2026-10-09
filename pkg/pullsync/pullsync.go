@@ -80,6 +80,9 @@ type Syncer struct {
 	holder         postage.ChunkHolder
 	intervalsSF    singleflight.Group[string, *collectAddrsResult]
 	syncInProgress atomic.Int32
+	// waiting tracks inbound requests still building their offer, so a
+	// request the same peer replaced can be ended (#640).
+	waiting waitingRequests
 
 	maxPage uint64
 
@@ -102,7 +105,7 @@ func New(
 	if maxChunksPerSecond <= 0 {
 		maxChunksPerSecond = DefaultMaxChunksPerSecond
 	}
-	return &Syncer{
+	s := &Syncer{
 		streamer:    streamer,
 		store:       store,
 		metrics:     newMetrics(),
@@ -114,6 +117,8 @@ func New(
 		maxPage:     maxPage,
 		limiter:     ratelimit.New(time.Second/time.Duration(maxChunksPerSecond), int(maxPage)),
 	}
+	s.waiting.gauge = s.metrics.WaitingRequests.Set
+	return s
 }
 
 func (s *Syncer) Protocol() p2p.ProtocolSpec {
@@ -176,9 +181,34 @@ func (s *Syncer) handler(streamCtx context.Context, p p2p.Peer, stream p2p.Strea
 	// while makeOffer is executing (waiting for the new chunks)
 	w, r := protobuf.NewWriterAndReader(stream)
 
-	// make an offer to the upstream peer in return for the requested range
-	offer, err := s.makeOffer(ctx, rn)
+	// make an offer to the upstream peer in return for the requested range.
+	// Only this step can be ended by a newer request from the same peer for
+	// the same bin (#640); everything after it keeps the handler context.
+	reqCtx, cancelReq := context.WithCancelCause(ctx)
+	entry, ended, sameStart, overCap := s.waiting.register(p.Address, uint8(rn.Bin), rn.Start, cancelReq)
+	if sameStart > 0 {
+		s.metrics.RequestsReplaced.WithLabelValues(reasonSameStart).Add(float64(sameStart))
+	}
+	if overCap > 0 {
+		s.metrics.RequestsReplaced.WithLabelValues(reasonOverCap).Add(float64(overCap))
+	}
+	// Let the ended requests leave the shared collection before this one
+	// joins it. They return as soon as they see the cancel; joining while
+	// one leaves races inside the singleflight package.
+	for _, e := range ended {
+		select {
+		case <-e.done:
+		case <-reqCtx.Done():
+		}
+	}
+	offer, err := s.makeOffer(reqCtx, rn)
+	afterMakeOffer()
+	s.waiting.unregister(entry)
+	cancelReq(nil)
 	if err != nil {
+		if cause := context.Cause(reqCtx); errors.Is(cause, errRequestReplaced) {
+			err = cause
+		}
 		return fmt.Errorf("make offer: %w", err)
 	}
 
@@ -673,6 +703,10 @@ func (s *Syncer) Close() error {
 	}
 	return nil
 }
+
+// afterMakeOffer runs between makeOffer and unregistering the request. It
+// does nothing; tests replace it to force the boundary race (#640).
+var afterMakeOffer = func() {}
 
 // singleflight key for intervals
 func sfKey(bin uint8, start uint64) string {

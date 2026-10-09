@@ -125,6 +125,7 @@ type ReserveStore struct {
 	sampling         atomic.Bool
 
 	subResponses []chunksResponse
+	subs         map[*subscription]struct{}
 	putHook      func(swarm.Chunk) error
 
 	sample            storer.Sample
@@ -175,16 +176,36 @@ func (s *ReserveStore) CapacityDoubling() uint8 {
 	return uint8(s.capacityDoubling)
 }
 
-// IntervalChunks returns a set of chunk in a requested interval.
+// subscription is an open SubscribeBin call without a prepared response,
+// which PublishBin can deliver to.
+type subscription struct {
+	ctx   context.Context
+	bin   uint8
+	start uint64
+	out   chan *storer.BinC
+}
+
+// SubscribeBin returns the next prepared response (WithSubscribeResp). When no
+// prepared response is left it returns a subscription that stays open and
+// empty until PublishBin delivers to it or its context ends.
 func (s *ReserveStore) SubscribeBin(ctx context.Context, bin uint8, start uint64) (<-chan *storer.BinC, func(), <-chan error) {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	r := s.subResponses[s.chunksCalls]
-	s.chunksCalls++
-
 	out := make(chan *storer.BinC)
 	errC := make(chan error, 1)
+
+	if s.chunksCalls >= len(s.subResponses) {
+		sub := &subscription{ctx: ctx, bin: bin, start: start, out: out}
+		if s.subs == nil {
+			s.subs = make(map[*subscription]struct{})
+		}
+		s.subs[sub] = struct{}{}
+		return out, func() { s.dropSub(sub) }, errC
+	}
+
+	r := s.subResponses[s.chunksCalls]
+	s.chunksCalls++
 
 	go func() {
 		for _, c := range r.chunks {
@@ -200,6 +221,42 @@ func (s *ReserveStore) SubscribeBin(ctx context.Context, bin uint8, start uint64
 	}()
 
 	return out, func() {}, errC
+}
+
+func (s *ReserveStore) dropSub(sub *subscription) {
+	s.mtx.Lock()
+	delete(s.subs, sub)
+	s.mtx.Unlock()
+}
+
+// PublishBin delivers c to every open subscription without a prepared
+// response for bin whose start is at or below c.BinID. A subscription whose
+// context has ended is dropped instead.
+func (s *ReserveStore) PublishBin(bin uint8, c *storer.BinC) {
+	s.mtx.Lock()
+	var targets []*subscription
+	for sub := range s.subs {
+		if sub.bin == bin && sub.start <= c.BinID {
+			targets = append(targets, sub)
+		}
+	}
+	s.mtx.Unlock()
+
+	for _, sub := range targets {
+		select {
+		case sub.out <- c:
+		case <-sub.ctx.Done():
+			s.dropSub(sub)
+		}
+	}
+}
+
+// OpenSubscriptions returns the number of open subscriptions without a
+// prepared response.
+func (s *ReserveStore) OpenSubscriptions() int {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	return len(s.subs)
 }
 
 func (s *ReserveStore) ReserveSize() int {
