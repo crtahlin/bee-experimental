@@ -767,3 +767,62 @@ func TestStreamAttributionKeepsHighest(t *testing.T) {
 	}
 	assertReleased(t, s)
 }
+
+// TestStreamAttributionTakeDuringSnapshot checks that a snapshot that
+// finishes after the scan took the note does not write into the taken
+// note. Run with -race: before the fix, the worker wrote the note the
+// scan then read, with nothing ordering the two.
+func TestStreamAttributionTakeDuringSnapshot(t *testing.T) {
+	t.Parallel()
+
+	s, err := libp2p.NewStreamLimitStack(libp2p.StreamLimitOptions{}, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.RM.Close()
+	quit := make(chan struct{})
+	defer close(quit)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	slow := func(libp2ppeer.ID) map[string]int {
+		close(entered)
+		<-release
+		return map[string]int{string(protoRetrieval): 270}
+	}
+	s.StartSnapshots(slow, quit)
+
+	p := testPeer(t, 8)
+	burst(t, s, p, 270)
+	<-entered
+
+	// The scan takes the note while the snapshot runs, and reads it only
+	// after the snapshot has had time to finish. Its read waits on a timer
+	// it owns, not on the worker, so nothing orders the two.
+	readNow := make(chan struct{})
+	time.AfterFunc(100*time.Millisecond, func() { close(readNow) })
+	type result struct {
+		n  libp2p.AttributionNote
+		ok bool
+	}
+	got := make(chan result, 1)
+	taken := make(chan struct{})
+	go func() {
+		go func() { time.Sleep(20 * time.Millisecond); close(taken) }()
+		n, ok := s.TakeAndReadAfter(p, readNow)
+		got <- result{n, ok}
+	}()
+	<-taken
+	close(release)
+	r := <-got
+
+	if !r.ok {
+		t.Fatal("peer not noted")
+	}
+	if r.n.ByProtocol != nil {
+		t.Fatalf("taken note changed after the scan took it: %v", r.n.ByProtocol)
+	}
+	if r.n.MaxInbound != 270 {
+		t.Fatalf("highest count %d, want 270", r.n.MaxInbound)
+	}
+}

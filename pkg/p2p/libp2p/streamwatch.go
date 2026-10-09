@@ -119,12 +119,12 @@ func (w *streamWatch) attribute(stats map[libp2ppeer.ID]network.ScopeStat) {
 	}
 	for p, n := range w.attr.take() {
 		f := append(w.fields(peerStreams{peer: p, inbound: stats[p].NumStreamsInbound}), "reason", n.reason, "max_inbound_streams", n.maxInbound)
-		byProtocol := n.byProtocol
+		byProtocol, readAt := n.byProtocol, "noted"
 		if byProtocol == nil && w.protocols != nil {
-			byProtocol = w.protocols(p)
+			byProtocol, readAt = w.protocols(p), "scan"
 		}
 		if byProtocol != nil {
-			f = append(f, "inbound_by_protocol", byProtocol)
+			f = append(f, "inbound_by_protocol", byProtocol, "inbound_by_protocol_read_at", readAt)
 		}
 		w.logger.Info("peer passed an inbound stream threshold or limit", f...)
 	}

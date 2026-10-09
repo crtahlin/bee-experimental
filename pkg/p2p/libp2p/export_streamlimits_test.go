@@ -189,6 +189,19 @@ func (s *StreamLimitStack) TakeAttribution() map[libp2ppeer.ID]AttributionNote {
 	return out
 }
 
+// TakeAndReadAfter takes the notes, as the scan does, waits for wait,
+// then reads the note of p, as the scan's log line does after the take.
+func (s *StreamLimitStack) TakeAndReadAfter(p libp2ppeer.ID, wait <-chan struct{}) (AttributionNote, bool) {
+	for q, n := range s.attr.take() {
+		if q != p {
+			continue
+		}
+		<-wait
+		return AttributionNote{Reason: n.reason, MaxInbound: n.maxInbound, ByProtocol: n.byProtocol}, true
+	}
+	return AttributionNote{}, false
+}
+
 // StartSnapshots sets the function that reads a peer's streams by
 // protocol, and starts the snapshot worker until quit is closed.
 func (s *StreamLimitStack) StartSnapshots(protocols func(libp2ppeer.ID) map[string]int, quit <-chan struct{}) {

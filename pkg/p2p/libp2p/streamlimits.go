@@ -466,7 +466,8 @@ func (a *streamAttribution) run(quit <-chan struct{}) {
 }
 
 // snapshot reads the inbound streams of p by protocol into its note, if
-// it still has a note without one.
+// it still has a note without one. The note is written only while it is
+// still in the map: take may have handed it to the scan meanwhile.
 func (a *streamAttribution) snapshot(p libp2ppeer.ID) {
 	a.mu.Lock()
 	f := a.protocols
@@ -477,15 +478,16 @@ func (a *streamAttribution) snapshot(p libp2ppeer.ID) {
 	}
 	counts := f(p)
 	a.mu.Lock()
-	if n.byProtocol == nil {
+	if cur, ok := a.peers[p]; ok && cur == n && n.byProtocol == nil {
 		n.byProtocol = counts
 	}
 	a.mu.Unlock()
 }
 
-// take returns the notes since the previous call and marks each peer as
-// logged now, so it is not noted again for streamAttributionInterval.
-func (a *streamAttribution) take() map[libp2ppeer.ID]*streamNote {
+// take returns copies of the notes since the previous call and marks
+// each peer as logged now, so it is not noted again for
+// streamAttributionInterval.
+func (a *streamAttribution) take() map[libp2ppeer.ID]streamNote {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := a.now()
@@ -497,11 +499,12 @@ func (a *streamAttribution) take() map[libp2ppeer.ID]*streamNote {
 	if len(a.peers) == 0 {
 		return nil
 	}
-	notes := a.peers
-	a.peers = make(map[libp2ppeer.ID]*streamNote)
-	for p := range notes {
+	notes := make(map[libp2ppeer.ID]streamNote, len(a.peers))
+	for p, n := range a.peers {
+		notes[p] = *n
 		a.logged[p] = now
 	}
+	a.peers = make(map[libp2ppeer.ID]*streamNote)
 	return notes
 }
 
