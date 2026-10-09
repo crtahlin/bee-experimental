@@ -25,6 +25,7 @@ type metrics struct {
 	RequestsReplaced     *prometheus.CounterVec // waiting requests ended because the peer asked again (#640)
 	WaitingRequests      prometheus.Gauge       // requests waiting for their first chunk (#640)
 	RequestsAbandoned    *prometheus.CounterVec // waiting requests ended because the requester went away (#641)
+	RequestsRefused      *prometheus.CounterVec // requests refused before they were served (#643)
 	RequestsUnwatched    prometheus.Counter     // requests that waited without a watcher (#641)
 }
 
@@ -124,6 +125,13 @@ func newMetrics() metrics {
 				Subsystem: subsystem,
 				Name:      "requests_abandoned_total",
 				Help:      "Inbound requests still waiting for their first chunk that were ended because the requester went away: reason reset (the requester reset the stream), disconnect (the connection ended), eof (the requester closed its write side), error (another read error), or unexpected_data (the requester sent data before the offer, which a correct requester never does) (#641).",
+			}, []string{"reason"}),
+		RequestsRefused: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: m.Namespace,
+				Subsystem: subsystem,
+				Name:      "requests_refused_total",
+				Help:      "Inbound requests refused before they were served: reason bin_out_of_range (the requested bin is negative or not below the number of bins, which a correct requester never sends) (#643).",
 			}, []string{"reason"}),
 		RequestsUnwatched: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: m.Namespace,
