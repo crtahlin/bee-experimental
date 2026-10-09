@@ -182,15 +182,20 @@ func (s *Syncer) handler(streamCtx context.Context, p p2p.Peer, stream p2p.Strea
 	w, r := protobuf.NewWriterAndReader(stream)
 
 	// make an offer to the upstream peer in return for the requested range.
-	// Only this step can be ended by a newer request from the same peer for
-	// the same bin (#640); everything after it keeps the handler context.
+	// Only this step can be ended: by a newer request from the same peer for
+	// the same bin (#640), or by the requester going away (#641); everything
+	// after it keeps the handler context.
 	reqCtx, cancelReq := context.WithCancelCause(ctx)
-	entry, ended, sameStart, overCap := s.waiting.register(p.Address, uint8(rn.Bin), rn.Start, cancelReq)
+	entry, ended, sameStart, overCap := s.waiting.register(p.Address, uint8(rn.Bin), rn.Start, reqCtx, cancelReq)
 	if sameStart > 0 {
 		s.metrics.RequestsReplaced.WithLabelValues(reasonSameStart).Add(float64(sameStart))
 	}
 	if overCap > 0 {
 		s.metrics.RequestsReplaced.WithLabelValues(reasonOverCap).Add(float64(overCap))
+	}
+	watch := startWatcher(stream, cancelReq)
+	if watch == nil {
+		s.metrics.RequestsUnwatched.Inc()
 	}
 	// Let the ended requests leave the shared collection before this one
 	// joins it. They return as soon as they see the cancel; joining while
@@ -203,10 +208,16 @@ func (s *Syncer) handler(streamCtx context.Context, p p2p.Peer, stream p2p.Strea
 	}
 	offer, err := s.makeOffer(reqCtx, rn)
 	afterMakeOffer()
+	watch.stop()
 	s.waiting.unregister(entry)
+	cause := context.Cause(reqCtx)
 	cancelReq(nil)
+	if errors.Is(cause, errRequesterGone) || errors.Is(cause, errUnexpectedData) {
+		s.metrics.RequestsAbandoned.WithLabelValues(watch.reason).Inc()
+		return fmt.Errorf("make offer: %w (%s)", cause, watch.reason)
+	}
 	if err != nil {
-		if cause := context.Cause(reqCtx); errors.Is(cause, errRequestReplaced) {
+		if errors.Is(cause, errRequestReplaced) {
 			err = cause
 		}
 		return fmt.Errorf("make offer: %w", err)

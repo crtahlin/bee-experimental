@@ -34,6 +34,7 @@ type waitingKey struct {
 type waitingEntry struct {
 	key    waitingKey
 	start  uint64
+	ctx    context.Context // the request's context; done once it is ending
 	cancel context.CancelCauseFunc
 	done   chan struct{} // closed when the entry's handler unregisters it
 }
@@ -57,9 +58,12 @@ func (w *waitingRequests) changed() {
 
 // register adds a waiting request and ends the older requests it replaces:
 // every one with the same start, then the oldest until at most
-// maxWaitingPerBin remain, counting the new one. It returns the new entry, the
-// entries it ended and how many were ended for each reason.
-func (w *waitingRequests) register(peer swarm.Address, bin uint8, start uint64, cancel context.CancelCauseFunc) (e *waitingEntry, ended []*waitingEntry, sameStart, overCap int) {
+// maxWaitingPerBin remain, counting the new one. An entry whose context is
+// already done (ended by its requester going away, #641) is skipped: it is
+// neither ended nor counted, and does not count toward the cap; its own
+// handler removes it. It returns the new entry, the entries it ended and how
+// many were ended for each reason.
+func (w *waitingRequests) register(peer swarm.Address, bin uint8, start uint64, ctx context.Context, cancel context.CancelCauseFunc) (e *waitingEntry, ended []*waitingEntry, sameStart, overCap int) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -69,8 +73,13 @@ func (w *waitingRequests) register(peer swarm.Address, bin uint8, start uint64, 
 	key := waitingKey{peer: peer.ByteString(), bin: bin}
 	list := w.m[key]
 
-	kept := list[:0]
+	kept := make([]*waitingEntry, 0, len(list)+1)
+	live := 0
 	for _, old := range list {
+		if old.ctx.Err() != nil {
+			kept = append(kept, old)
+			continue
+		}
 		if old.start == start {
 			old.cancel(errRequestReplaced)
 			ended = append(ended, old)
@@ -78,15 +87,24 @@ func (w *waitingRequests) register(peer swarm.Address, bin uint8, start uint64, 
 			continue
 		}
 		kept = append(kept, old)
+		live++
 	}
-	for len(kept) >= maxWaitingPerBin {
-		kept[0].cancel(errRequestReplaced)
-		ended = append(ended, kept[0])
-		overCap++
-		kept = kept[1:]
+	if live >= maxWaitingPerBin {
+		rest := kept[:0]
+		for _, old := range kept {
+			if live >= maxWaitingPerBin && old.ctx.Err() == nil {
+				old.cancel(errRequestReplaced)
+				ended = append(ended, old)
+				overCap++
+				live--
+				continue
+			}
+			rest = append(rest, old)
+		}
+		kept = rest
 	}
 
-	e = &waitingEntry{key: key, start: start, cancel: cancel, done: make(chan struct{})}
+	e = &waitingEntry{key: key, start: start, ctx: ctx, cancel: cancel, done: make(chan struct{})}
 	w.m[key] = append(kept, e)
 	w.n += 1 - sameStart - overCap
 	w.changed()
