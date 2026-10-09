@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -267,6 +268,7 @@ type stream struct {
 	lock            sync.Mutex
 	version         *semver.Version
 	versionErr      error
+	readDeadline    readDeadline
 }
 
 func newStream(in, out *record, version *semver.Version, versionErr error) *stream {
@@ -278,7 +280,72 @@ func (s *stream) Read(p []byte) (int, error) {
 		return 0, ErrStreamClosed
 	}
 
-	return s.out.Read(p)
+	return s.out.read(p, s.readDeadline.wait())
+}
+
+// SetReadDeadline sets the deadline for reads. A read waiting for data
+// returns os.ErrDeadlineExceeded with no bytes once the deadline passes,
+// including a read that is already blocked; buffered data is not consumed. A
+// zero time clears the deadline.
+func (s *stream) SetReadDeadline(t time.Time) error {
+	s.readDeadline.set(t)
+	return nil
+}
+
+// readDeadline is a resettable deadline whose channel is closed when it
+// passes.
+type readDeadline struct {
+	mu    sync.Mutex
+	timer *time.Timer
+	c     chan struct{}
+}
+
+func (d *readDeadline) set(t time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.timer != nil {
+		d.timer.Stop()
+		d.timer = nil
+	}
+	if d.c == nil || isClosed(d.c) {
+		d.c = make(chan struct{})
+	}
+	if t.IsZero() {
+		return
+	}
+	c := d.c
+	dur := time.Until(t)
+	if dur <= 0 {
+		close(c)
+		return
+	}
+	d.timer = time.AfterFunc(dur, func() {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if !isClosed(c) {
+			close(c)
+		}
+	})
+}
+
+func (d *readDeadline) wait() <-chan struct{} {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.c == nil {
+		d.c = make(chan struct{})
+	}
+	return d.c
+}
+
+func isClosed(c chan struct{}) bool {
+	select {
+	case <-c:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *stream) Write(p []byte) (int, error) {
@@ -358,12 +425,21 @@ func newRecord(latency time.Duration) *record {
 }
 
 func (r *record) Read(p []byte) (n int, err error) {
+	return r.read(p, nil)
+}
+
+// read is Read with a deadline channel; a nil channel never fires.
+func (r *record) read(p []byte, deadline <-chan struct{}) (n int, err error) {
 	defer time.Sleep(r.latency)
 
 	for r.c == r.bytesSize() {
-		_, ok := <-r.dataSigC
-		if !ok {
-			return 0, io.EOF
+		select {
+		case _, ok := <-r.dataSigC:
+			if !ok {
+				return 0, io.EOF
+			}
+		case <-deadline:
+			return 0, os.ErrDeadlineExceeded
 		}
 	}
 

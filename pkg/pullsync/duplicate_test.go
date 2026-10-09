@@ -6,6 +6,7 @@ package pullsync_test
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -240,15 +241,16 @@ func TestReplacedAfterOfferStillCompletes(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		reached := make(chan struct{})
 		release := make(chan struct{})
-		calls := 0
+		var calls atomic.Int32
 		restore := pullsync.SetAfterMakeOffer(func() {
-			calls++
-			if calls == 1 {
+			if calls.Add(1) == 1 {
 				close(reached)
 				<-release
 			}
 		})
-		defer restore()
+		// restored after the server Syncer closes (cleanups run in
+		// reverse order), so no handler reads the hook while it changes
+		t.Cleanup(restore)
 
 		server, _ := newPullSync(t, nil, 5,
 			mock.WithSubscribeResp([]*storer.BinC{results[1]}, nil),

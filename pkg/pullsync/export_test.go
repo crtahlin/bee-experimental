@@ -42,3 +42,23 @@ func metricValue(m prometheus.Metric) float64 {
 	}
 	return d.GetGauge().GetValue()
 }
+
+// RequestsAbandoned returns the abandoned-request counter for a reason.
+func (s *Syncer) RequestsAbandoned(reason string) float64 {
+	return metricValue(s.metrics.RequestsAbandoned.WithLabelValues(reason))
+}
+
+// RequestsAbandonedTotal returns the abandoned-request counter summed over
+// every reason.
+func (s *Syncer) RequestsAbandonedTotal() float64 {
+	var sum float64
+	for _, r := range []string{reasonReset, reasonDisconnect, reasonEOF, reasonError, reasonUnexpectedData} {
+		sum += s.RequestsAbandoned(r)
+	}
+	return sum
+}
+
+// RequestsUnwatched returns the unwatched-request counter.
+func (s *Syncer) RequestsUnwatched() float64 {
+	return metricValue(s.metrics.RequestsUnwatched)
+}
