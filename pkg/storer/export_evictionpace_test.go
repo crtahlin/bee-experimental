@@ -103,3 +103,6 @@ func (db *DB) EvictionPausedSecondsForTest() float64 {
 func (db *DB) EvictionPauseCappedForTest() float64 {
 	return metricValue(db.metrics.EvictionPauseCapped)
 }
+
+// EvictionPacedForTest reports whether eviction is paced (#651).
+func (db *DB) EvictionPacedForTest() bool { return db.evictionPacer != nil }
