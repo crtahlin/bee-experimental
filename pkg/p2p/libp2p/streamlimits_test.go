@@ -301,6 +301,36 @@ func TestStreamLimitUnnegotiated(t *testing.T) {
 	assertReleased(t, s)
 }
 
+// TestStreamLimitSlotReleasedOnce checks that a stream gives its
+// un-negotiated slot back once: at negotiation, and not again when it
+// closes, so the peer's count stays exact.
+func TestStreamLimitSlotReleasedOnce(t *testing.T) {
+	t.Parallel()
+
+	s := newStack(t, libp2p.StreamLimitOptions{UnnegotiatedPerPeer: 3, Transient: 10, ReservePullSync: 20, ReserveOther: 20}, 100)
+	a := testPeer(t, 0)
+	negotiated, err := openNegotiated(s.RM, a, protoPullSync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	silent := make([]network.StreamManagementScope, 0, 3)
+	for range 3 {
+		sc, err := s.RM.OpenStream(a, network.DirInbound)
+		if err != nil {
+			t.Fatal(err)
+		}
+		silent = append(silent, sc)
+	}
+	negotiated.Done()
+	if _, err := s.RM.OpenStream(a, network.DirInbound); !errors.Is(err, libp2p.ErrUnnegotiatedPerPeer) {
+		t.Fatalf("fourth silent stream after a negotiated one closed: got %v, want %v", err, libp2p.ErrUnnegotiatedPerPeer)
+	}
+	for _, sc := range silent {
+		sc.Done()
+	}
+	assertReleased(t, s)
+}
+
 // TestStreamLimitTransient checks the node-wide transient limit: with
 // enough peers holding silent streams, a new stream is refused at accept.
 func TestStreamLimitTransient(t *testing.T) {
