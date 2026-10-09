@@ -24,31 +24,34 @@ The handler never checks the requested bin. It converts it with `uint8(rn.Bin)` 
 request for bin 40: still waiting after 1m0s, want it refused at once
 ```
 
-The test's reserve is the storer mock, so it shows that the handler accepts and waits; that the real reserve then waits for ever is read from `SubscribeBin` above, not measured.
+The test's reserve is the storer mock, so it shows that the handler accepts the request and waits (on the mock a valid bin with no chunks waits too). That the real reserve then waits for ever is read from `SubscribeBin` above, not measured; test 6 measures it.
 
 ## Change
 
 1. **Check first.** In `handler`, straight after the `Get` is read and before the #640 registration, the #641 watcher and `makeOffer`: if `rn.Bin < 0 || rn.Bin >= int32(swarm.MaxBins)`, return an error wrapping a new `errBinOutOfRange`. The handler's existing defer resets the stream. No registration, no watcher, no subscription.
 2. **Plain error, no penalty.** No disconnect and no blocklist: the peer is not punished, its request is just not served. This matches how other malformed requests are handled in this handler, and #638 is the place for per-peer limits. The handler error is logged at debug level by libp2p as today.
-3. **Metric:** `bee_pullsync_requests_refused_total{reason="bin_out_of_range"}`, a counter. On a network of correct clients it stays at 0, so any increase points at a broken or hostile requester.
-4. **Cursor handler:** not affected. It reads a `Syn` with no bin and answers with all cursors (`cursorHandler`, `pkg/pullsync/pullsync.go`, `ReserveLastBinIDs`).
+3. **Metric:** `bee_pullsync_requests_refused_total{reason="bin_out_of_range"}`, a counter. The `bin_out_of_range` label is created in `New`, so the series exports 0 from the start and "absent" can be told apart from "0". On a network of correct clients it stays at 0, so any increase points at a broken or hostile requester.
+4. **Cursor handler:** not affected. It reads a `Syn` with no bin and answers with all cursors (`cursorHandler`, `pkg/pullsync/pullsync.go:660`, `ReserveLastBinIDs`).
 5. **Conversions after the check** stay `uint8(rn.Bin)`, now safe.
 
 No wire change (rule 6): the messages are unchanged, and a refused request ends the way any failed request ends today, with a stream reset. No setting.
 
 ## Tests
 
-1. `TestBinOutOfRangeRefused` (portable, above): bin 40 through `Sync` is refused at once. Fails on unmodified code, passes with the change.
-2. **Raw stream values.** A `Get` written directly on a recorder stream for 32, 255, 278, -1 and -234 is refused at once; for each, `WaitingTracked()` stays 0 and the reserve mock records no `SubscribeBin` call. 278 and -234 show that the wrap to bin 22 no longer happens.
+1. `TestBinOutOfRangeRefused` (portable, above), committed with the code: bin 40 through `Sync` is refused at once. The server mock is built with `WithSubscribeResp(nil, nil)`, because upstream's mock panics on a subscription with no prepared response. Fails on unmodified code, passes with the change.
+2. **Raw stream values.** A `Get` written directly on a recorder stream for 32, 255, 278, -1 and -234 is refused at once; for each, `WaitingTracked()` stays 0 and the reserve mock records no `SubscribeBin` call. The mock gains a test-only counter for that, `SubscribeBinCalls()` in `pkg/storer/mock` (it has none today, and `OpenSubscriptions()` reads 0 after any return). 278 and -234 show that the wrap to bin 22 no longer happens.
 3. **Edges still served:** bins 0 and 31 are not refused.
 4. **Metric:** the counter rises by one per refused request.
-5. **Ordering:** a refused request never registers (checked with the #640 `afterMakeOffer` hook not being called, or `WaitingTracked()` read while the request would wait).
+5. **Ordering: a refused request never registers.** Checked by two observable results, not by a hook (`afterMakeOffer` runs only after `makeOffer`, so a check placed after `register` but before `makeOffer` would also skip it):
+   - `WaitingTracked()` is 0 after the refusal;
+   - a waiting request from the same peer for bin 22 with start S survives a following request with `Bin = -234` and start S (which wraps to bin 22), and `RequestsReplaced` stays 0. With the check moved after the #640 registration, the -234 request would register as (peer, 22, S), end the valid request as a duplicate and never unregister.
+6. **Real reserve (storer level, optional but planned):** with a real DB, subscribe to bin 40, put chunks in, and assert nothing is delivered within a deadline. This turns "the real reserve waits for ever" from a reading of `SubscribeBin` into a measurement.
 
 **Mutation checks** (each must make a test fail): check removed; upper bound `>` instead of `>=` (bin 32 accepted); lower bound removed (negative values accepted); check moved after the #640 registration; check done on `uint8(rn.Bin)` instead of `rn.Bin` (278 accepted as 22); metric not incremented.
 
 ## Upstream
 
-Affects upstream: the handler path is unchanged from v2.8.2 to upstream `master`, and test 1 fails on unmodified upstream `master` (cc5c4706e). It is upstream's because the handler trusts the requester's bin and converts it without a range check. The fix there is the same check. The issue gets the `affects-upstream` label and a row in `docs/UPSTREAM.md`.
+Affects upstream: the handler path is unchanged from v2.8.2 to upstream `master`, and test 1 fails on unmodified upstream `master` (cc5c4706e). It is upstream's because the handler trusts the requester's bin and converts it without a range check. The fix there is the same check. The issue gets the `affects-upstream` label and a row in `docs/UPSTREAM.md` (added by this spec PR as `open`, as rule 14 asks and #583 and #607 did). When the code merges, the row is amended to `done` with the branch and merge commit; if this spec PR were closed without merging, the row would land separately.
 
 ## Measurement
 
