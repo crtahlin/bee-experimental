@@ -43,6 +43,11 @@ const (
 
 var ErrUnsolicitedChunk = errors.New("peer sent unsolicited chunk")
 
+// errBinOutOfRange refuses a request for a bin the reserve cannot hold (#643).
+var errBinOutOfRange = errors.New("pullsync: requested bin out of range")
+
+const reasonBinOutOfRange = "bin_out_of_range"
+
 const (
 	MaxCursor             = math.MaxUint64
 	DefaultMaxPage uint64 = 250
@@ -118,6 +123,9 @@ func New(
 		limiter:     ratelimit.New(time.Second/time.Duration(maxChunksPerSecond), int(maxPage)),
 	}
 	s.waiting.gauge = s.metrics.WaitingRequests.Set
+	// Export the refusal series at 0, so an absent series and no refusals
+	// can be told apart.
+	s.metrics.RequestsRefused.WithLabelValues(reasonBinOutOfRange)
 	return s
 }
 
@@ -174,6 +182,15 @@ func (s *Syncer) handler(streamCtx context.Context, p p2p.Peer, stream p2p.Strea
 	var rn pb.Get
 	if err := r.ReadMsgWithContext(ctx, &rn); err != nil {
 		return fmt.Errorf("read get range: %w", err)
+	}
+
+	// The reserve holds bins 0 to swarm.MaxBins-1 only. Check the raw value
+	// before any conversion: a bin above that would wait for ever on an
+	// empty bin, and a value that does not fit a uint8 would wrap to another
+	// bin (#643).
+	if rn.Bin < 0 || rn.Bin >= int32(swarm.MaxBins) {
+		s.metrics.RequestsRefused.WithLabelValues(reasonBinOutOfRange).Inc()
+		return fmt.Errorf("%w: %d", errBinOutOfRange, rn.Bin)
 	}
 
 	// recreate the reader to allow the first one to be garbage collected

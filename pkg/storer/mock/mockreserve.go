@@ -124,6 +124,7 @@ var _ storer.ReserveStore = (*ReserveStore)(nil)
 type ReserveStore struct {
 	mtx         sync.Mutex
 	chunksCalls int
+	subCalls    int
 	putCalls    int
 	setCalls    int
 
@@ -217,6 +218,7 @@ type subscription struct {
 func (s *ReserveStore) SubscribeBin(ctx context.Context, bin uint8, start uint64) (<-chan *storer.BinC, func(), <-chan error) {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
+	s.subCalls++
 
 	out := make(chan *storer.BinC)
 	errC := make(chan error, 1)
@@ -275,6 +277,14 @@ func (s *ReserveStore) PublishBin(bin uint8, c *storer.BinC) {
 			s.dropSub(sub)
 		}
 	}
+}
+
+// SubscribeBinCalls returns how many times SubscribeBin was called, whether
+// or not a prepared response was left. For tests.
+func (s *ReserveStore) SubscribeBinCalls() int {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	return s.subCalls
 }
 
 // OpenSubscriptions returns the number of open subscriptions without a

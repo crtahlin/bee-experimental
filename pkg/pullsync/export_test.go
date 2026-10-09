@@ -62,3 +62,11 @@ func (s *Syncer) RequestsAbandonedTotal() float64 {
 func (s *Syncer) RequestsUnwatched() float64 {
 	return metricValue(s.metrics.RequestsUnwatched)
 }
+
+// RequestsRefused returns the refused-request counter for a reason.
+func (s *Syncer) RequestsRefused(reason string) float64 {
+	return metricValue(s.metrics.RequestsRefused.WithLabelValues(reason))
+}
+
+// ReasonBinOutOfRange is the refusal reason for a bin the reserve cannot hold.
+const ReasonBinOutOfRange = reasonBinOutOfRange
