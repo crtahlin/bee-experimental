@@ -349,6 +349,19 @@ func (c *command) setHomeDir() (err error) {
 	return nil
 }
 
+// defaultReserveEvictionRate is the reserve-eviction-rate a node uses when
+// the setting is unset: 500 chunks per second per node, chosen by the
+// operator ahead of the measurement in #650 (spec:
+// docs/experiments/eviction-rate-default/spec.md). An explicit 0 still
+// means no limit.
+const defaultReserveEvictionRate = 500
+
+// reserveEvictionRate returns the configured reserve-eviction-rate: the flag
+// default when the key is unset, the set value otherwise, including 0.
+func reserveEvictionRate(config *viper.Viper) int {
+	return config.GetInt(optionNameReserveEvictionRate)
+}
+
 func (c *command) setAllFlags(cmd *cobra.Command) {
 	cmd.Flags().String(optionNameDataDir, filepath.Join(c.homeDir, ".bee"), "data directory")
 	cmd.Flags().Uint64(optionNameCacheCapacity, 1_000_000, fmt.Sprintf("cache capacity in chunks, multiply by %d to get approximate capacity in bytes", swarm.ChunkSize))
@@ -394,7 +407,7 @@ func (c *command) setAllFlags(cmd *cobra.Command) {
 	cmd.Flags().Int(optionNameSamplerReadConcurrency, 0, "chunk loads the reserve sampler keeps in flight; 0 uses the default, which matches the CPU count and preserves previous behaviour")
 	cmd.Flags().Int(optionNameSamplerSortWindow, 0, "chunks the reserve sampler buffers and sorts into disk order before reading; 0 reads in bin order, which is the previous behaviour")
 	cmd.Flags().Int(optionNameReserveHasConcurrency, 0, "reserve lookups pullsync may have in flight at once; 0 leaves them unbounded, which is the previous behaviour")
-	cmd.Flags().Int(optionNameReserveEvictionRate, 0, "most chunks per second reserve eviction deletes, raised to the rate chunks arrive at; 0 means no limit, the previous behaviour")
+	cmd.Flags().Int(optionNameReserveEvictionRate, defaultReserveEvictionRate, "most chunks per second reserve eviction deletes, raised to the rate chunks arrive at; 0 (set explicitly) means no limit, the behaviour before this default; an empty value counts as unset. Raising it finishes an eviction sooner with more CPU and disk load meanwhile, which on a host with many nodes can make them all slow to serve and miss lottery samples; lowering it keeps the node responsive but keeps evicted and expired chunks on disk longer, makes the node sit out more lottery rounds while it evicts, and makes peers fetch and reject chunks of expired batches for longer")
 	cmd.Flags().Int(optionNameKademliaSaturationPeers, 0, "connected peers per bin below which the bin is not considered saturated; 0 uses the default of 8. Raising it consumes other nodes' connection budget, not only your own")
 	cmd.Flags().Int(optionNameKademliaOverSaturationPeers, 0, "connected peers per bin above which the bin is over-saturated and further peers are pruned; 0 uses the default of 18. Raising it consumes other nodes' connection budget, not only your own")
 	cmd.Flags().Int(optionNameLogSinkBuffer, log.DefaultSinkBuffer, "log lines that may wait to be written before further lines are dropped; 0 writes synchronously, which lets a stalled log reader block the node")

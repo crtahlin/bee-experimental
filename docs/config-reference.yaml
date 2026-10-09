@@ -334,8 +334,9 @@
 # reserve-capacity-doubling: 0
 
 ## most chunks per second reserve eviction deletes, raised to the rate chunks
-## arrive at; 0 means no limit, the previous behaviour
-# reserve-eviction-rate: 0
+## arrive at; default 500 (#651); 0 set explicitly means no limit, the
+## behaviour before that default; an empty value counts as unset
+# reserve-eviction-rate: 500
 
 ## reserve lookups pullsync may have in flight at once; 0 leaves them
 ## unbounded, which is the previous behaviour

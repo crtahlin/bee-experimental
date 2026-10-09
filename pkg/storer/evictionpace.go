@@ -188,22 +188,29 @@ func (p *evictionPacer) shiftHeadroom(d time.Duration) {
 	}
 }
 
+// reserve sets the limiter to the effective rate and reserves n tokens. It
+// returns the reservation and how long to wait for it, or nil when the
+// reservation is not possible (n is at most one round, the burst, so this
+// does not happen).
+func (p *evictionPacer) reserve(n int) (*rate.Reservation, time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := p.now()
+	p.lim.SetLimitAt(now, p.effective(now))
+	res := p.lim.ReserveN(now, n)
+	if !res.OK() {
+		return nil, 0
+	}
+	return res, res.DelayFrom(now)
+}
+
 // wait pays for n deleted chunks: it waits until the limiter, set to the
 // effective rate, allows them. It is called with the batch lock released.
 // quit, expiry and the context end the wait and cancel the reservation; a
 // nil channel never fires.
 func (p *evictionPacer) wait(ctx context.Context, n int, quit, expiry <-chan struct{}) error {
-	p.mu.Lock()
-	now := p.now()
-	p.lim.SetLimitAt(now, p.effective(now))
-	res := p.lim.ReserveN(now, n)
-	p.mu.Unlock()
-	if !res.OK() {
-		// n is at most one round, the burst, so this does not happen.
-		return nil
-	}
-	d := res.DelayFrom(now)
-	if d <= 0 {
+	res, d := p.reserve(n)
+	if res == nil || d <= 0 {
 		return nil
 	}
 	t := time.NewTimer(d)

@@ -65,11 +65,15 @@
 ## it follows the arrival rate when chunks arrive faster, so the excess over
 ## capacity does not grow.
 ##
-## 0 means no limit, the previous behaviour. Raising it finishes an eviction
-## sooner with more load; lowering it keeps the node responsive but lets the
-## shard files grow about 4 KB per chunk arriving meanwhile, and, for expired
-## batches, peers fetch and reject their chunks for longer.
-# reserve-eviction-rate: 0
+## Default 500 (#651); set 0 explicitly for no limit, the behaviour before
+## that default (an empty value counts as unset). Raising it finishes an
+## eviction sooner with more CPU and disk load, which on a host with many
+## nodes can make them slow to serve and miss lottery samples; lowering it
+## keeps the node responsive but keeps evicted and expired chunks on disk
+## longer (the shard files stay at their high-water mark), makes the node sit
+## out more lottery rounds while it evicts, and, for expired batches, makes
+## peers fetch and reject their chunks for longer.
+# reserve-eviction-rate: 500
 ## reserve lookups pullsync may have in flight at once.
 ##
 ## pullsync asks the reserve whether it already holds a chunk once per offered
