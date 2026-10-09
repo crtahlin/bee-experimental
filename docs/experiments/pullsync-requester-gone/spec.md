@@ -32,42 +32,52 @@ A waiting request whose stream returns from a read, with an error or with data, 
 
 ### 1. The watcher
 
-In `handler`, after `register` (#640) and before `makeOffer`, when the stream supports read deadlines (section 3), start one goroutine that does a single `Read` into a 1-byte buffer on the raw stream:
+In `handler`, after `register` (#640) and before `makeOffer`, when the stream supports read deadlines (section 3), start one goroutine that does a single `Read` into a 1-byte buffer on the raw stream. Whether the handler has **stopped** the watcher is decided by an atomic flag the handler sets **before** it calls `SetReadDeadline(now)` (section 2), never by the error value: yamux returns `yamux.ErrTimeout` (a `*yamux.Error` with `Timeout() == true`), which does not match `os.ErrDeadlineExceeded`, and the test recorder returns something else again. When the `Read` returns:
 
-- **Returns with `n == 0` and an error** (reset, EOF, or any other error except the deadline error of section 2): cancel `reqCtx` with the cause `errRequesterGone` and record the reason (`reset` for a stream reset, `eof` for `io.EOF`, `error` otherwise).
-- **Returns with `n > 0`:** the requester sent data before the offer. Cancel `reqCtx` with the cause `errUnexpectedData`, reason `unexpected_data`. The handler returns an error, so the deferred `stream.Reset()` runs, as for any other protocol error. No byte is handed on: a correct requester never sends here, so there is nothing to keep.
-- **Returns with the deadline error:** the handler stopped it (section 2); do nothing.
+- **The stop flag is set and `n == 0`:** the handler stopped it; do nothing, whatever the error.
+- **`n > 0`** (stop flag set or not): the requester sent data before the offer. Cancel `reqCtx` with the cause `errUnexpectedData`, reason `unexpected_data`. The handler returns an error, so the deferred `stream.Reset()` runs, as for any other protocol error. No byte is handed on: a correct requester never sends here, so there is nothing to keep. Detection is **best-effort**: bytes that arrived together with the `Get` were already buffered and discarded by the first protobuf reader (`pullsync.go`, the reader created before `ReadMsgWithContext(ctx, &rn)`, up to 4,096 bytes), so the watcher sees only data sent after the request started waiting.
+- **The stop flag is not set and `n == 0`:** cancel `reqCtx` with the cause `errRequesterGone` and record the reason:
+  - `reset`: the error is a `*network.StreamError` (`github.com/libp2p/go-libp2p/core/network`, `mux.go`) with `Remote == true`, that is, the requester reset this stream;
+  - `disconnect`: any other reset, including the one yamux gives every stream when the connection closes (`session.go`, `ErrStreamReset` with "connection closed", which libp2p maps to `network.ErrReset` without `Remote`), and `network.ErrReset` itself;
+  - `eof`: `io.EOF`, the requester closed its write side;
+  - `error`: anything else.
+  The classification uses only `errors.As` / `errors.Is` against these types from `core/network` and `io`; the yamux package is not imported by pullsync (the libp2p stream wrapper is the package boundary).
 
 The watcher reads from the stream itself, not through the protobuf reader. The reader created before `makeOffer` (`protobuf.NewWriterAndReader(stream)`) has not read anything yet; the existing code already relies on the requester sending nothing after its `Get` (the reader used for the `Get` is dropped, with whatever it may have buffered).
 
-The handler then proceeds exactly as after #640: `makeOffer(reqCtx, rn)` returns with the context error, the request unregisters itself, and the handler returns `make offer: <cause>` (the existing `context.Cause` check is extended to `errRequesterGone` and `errUnexpectedData`). Cancelling `reqCtx` releases this caller from the shared collection exactly as #640's replacement does, so the singleflight and tracking rules of #640 apply unchanged; no other request waits on this one.
+The handler then proceeds as after #640: `makeOffer(reqCtx, rn)` returns with the context error, the request unregisters itself, and the handler returns `make offer: <cause>` (the existing `context.Cause` check is extended to `errRequesterGone` and `errUnexpectedData`). Cancelling `reqCtx` releases this caller from the shared collection (`intervalsSF`) the same way #640's replacement does.
+
+**Singleflight:** #640 avoids the data race inside `resenje.org/singleflight` v0.4.0 (a leaving caller reads `c.shared` after unlocking, `singleflight.go:86`, while a joining caller writes it, `:43`) only for requests it ends itself, by waiting until they have left before the new request joins. A request the watcher ends leaves asynchronously, whoever is joining at that moment, so this change makes the existing race between peers (#647) somewhat more frequent; it does not add a new kind. #647 tracks the library fix.
+
+**Counting with #640:** the abandoned counter is incremented only when `context.Cause(reqCtx)` is the watcher's own error (`errRequesterGone` or `errUnexpectedData`), so a request #640 replaced first is counted only as replaced. #640's `register` currently counts every tracked same-start entry, including one the watcher has already cancelled but that has not yet unregistered; `register` is changed to skip entries whose context is already done (no cancel, no count, still removed when its own handler unregisters). With the watcher in place, `bee_pullsync_requests_replaced_total{reason="same_start"}` is expected to fall toward 0 for a requester that resets before asking again, which is every wasp and upstream requester (prediction to check in the measurement).
 
 ### 2. Stopping the watcher before the offer is written
 
 When `makeOffer` returns (with or without error), and before `unregister`:
 
-1. `SetReadDeadline(time.Now())` on the stream. A pending yamux `Read` returns `ErrTimeout` with no bytes; buffered data, if any, stays in the stream (`go-yamux/v5` `Stream.Read`: the deadline case returns before reading the buffer).
+1. Set the stop flag, then `SetReadDeadline(time.Now())` on the stream. A pending yamux `Read` with an empty buffer returns `ErrTimeout`. A yamux `Read` consumes buffered data whatever the deadline (it checks the deadline only when the buffer is empty, `stream.go`), so this step is lossless only because a correct requester sends nothing before the `Offer`; any byte there is the protocol error of section 1.
 2. Wait for the watcher goroutine to return (a channel it closes).
 3. `SetReadDeadline(time.Time{})` to clear the deadline, so the later `Want` read is not affected.
-4. If the watcher reported `unexpected_data` or `requester gone` in the same moment (the read returned something other than the deadline error), the handler treats the request as ended for that reason even if `makeOffer` succeeded: it does not write the offer, counts the reason, and returns the error. This covers a reset that arrives just as the chunk does.
+4. If the watcher read a byte (`n > 0`), the handler treats the request as ended with `unexpected_data` even if `makeOffer` succeeded: it does not write the offer, counts it, and returns the error. A reset or close that arrives after the stop flag is set is **not** acted on here (the `Read` returned with `n == 0` after the stop); the handler writes the offer, and the write or the following `Want` read fails as it does today. Only `n > 0` counts at the boundary.
 
 The watcher is stopped on every exit path of `makeOffer`, so no goroutine outlives the waiting phase. Steps 1 to 3 run after `makeOffer`, outside the #640 mutex.
 
-yamux applies `SetReadDeadline` only while the read side is open (`readState == halfOpen`); after a reset or close the watcher has already returned, so step 2 does not wait on a read that cannot be woken.
+yamux applies `SetReadDeadline` only while the read side is open (`readState == halfOpen`); after a reset or close the watcher's `Read` has already returned or returns at once, so step 2 does not wait on a read that cannot be woken. Setting and clearing the deadline closes and remakes a channel in yamux's `pipeDeadline`; no timer is started for a deadline already in the past.
 
 ### 3. Streams without read deadlines
 
-`p2p.Stream` does not declare `SetReadDeadline`. The watcher runs only when the stream implements `interface{ SetReadDeadline(time.Time) error }` and a first call `SetReadDeadline(time.Time{})` returns nil. In production every stream is a `*libp2p.stream` embedding `network.Stream` over yamux (TCP and WebSocket transports, `libp2p.go`), which supports it. Otherwise the handler behaves as after #640 and counts the request once in `bee_pullsync_requests_unwatched_total`, so a transport change that loses deadlines is visible.
+`p2p.Stream` does not declare `SetReadDeadline`. The watcher runs only when the stream implements `interface{ SetReadDeadline(time.Time) error }`. yamux's `SetReadDeadline` always returns nil, so the type assertion is the only check that matters; a non-nil return from a first `SetReadDeadline(time.Time{})` is still treated as "unsupported" for other implementations. In production every stream is a `*libp2p.stream` embedding `network.Stream` over yamux (TCP and WebSocket transports, `libp2p.go`), which supports it. Otherwise the handler behaves as after #640 and counts the request once in `bee_pullsync_requests_unwatched_total`, so a transport change that loses deadlines is visible.
 
 ### 4. Cost
 
-One goroutine and a 1-byte buffer per waiting request, alive only while it waits. Waiting requests are bounded per peer by #640 (two per bin; 64 per peer with 32 bins, more until #643 checks the bin) and node-wide by the inbound stream cap (5,014). The protobuf reader already starts a goroutine per `ReadMsgWithContext`, so the handler's goroutine count per request goes from about 2 to about 3 while waiting. Two `SetReadDeadline` calls per request take the yamux state lock briefly.
+One goroutine and a 1-byte buffer per request while it builds its offer. The watcher starts for every request, not only those that end up waiting; for a request that finds chunks at once it lives for the duration of `makeOffer` (milliseconds). Requests in the waiting phase are bounded per peer by #640 (two per bin; 64 per peer with 32 bins, more until #643 checks the bin) and node-wide by the inbound stream cap (5,014). Today a request has the handler goroutine and its quit goroutine while waiting; the watcher adds a third. Two `SetReadDeadline` calls per request take the yamux state lock briefly and close and remake one channel; no timer. Negligible against the stream itself.
 
 ### 5. Metrics
 
-- `bee_pullsync_requests_abandoned_total{reason}` with `reason` in `reset`, `eof`, `error`, `unexpected_data`: waiting requests ended because the watcher saw the requester gone or misbehaving. Counted once per request, by the watcher's report in the handler.
+- `bee_pullsync_requests_abandoned_total{reason}` with `reason` in `reset`, `disconnect`, `eof`, `error`, `unexpected_data`: waiting requests ended because the watcher saw the requester gone or misbehaving. Counted once per request, in the handler, only when `context.Cause(reqCtx)` is the watcher's error.
 - `bee_pullsync_requests_unwatched_total`: requests that waited without a watcher because the stream has no read deadline.
-- `bee_pullsync_requests_replaced_total` (#640) is unchanged. A request ended by #640 before the watcher sees anything is counted there only; the watcher's later read returns with the deadline error or after the handler stopped it, and is not counted.
+- `bee_pullsync_requests_replaced_total` (#640) keeps its meaning; with the `register` change of section 1 it no longer counts entries the watcher already ended. A request ended by #640 before the watcher sees anything is counted there only.
+- The handler's new errors (`errRequesterGone`, `errUnexpectedData`) do not wrap `network.ErrReset`, so libp2p's `StreamHandlerErrResetCount` (`libp2p.go`) does not count these requests; the new counter is where they show.
 
 ### 6. The cursor handler
 
@@ -87,18 +97,22 @@ None. The change ends only requests whose requester is gone or sent data a corre
 
 ## Measurement
 
-**Test support** (`pkg/p2p/streamtest`): the recorder's `stream` gains `SetReadDeadline(t time.Time) error`. A read on the `record` waits on the data signal, the close, or the deadline, and returns `os.ErrDeadlineExceeded` with no bytes on the deadline, leaving buffered data in place. A zero time clears it. The recorder's `Reset` is `FullClose`, so the requester's reset reaches the server as `io.EOF`; tests assert the reason accordingly (`eof` with the recorder).
+**Test support:**
+
+- `pkg/p2p/streamtest`: the recorder's `stream` gains `SetReadDeadline(t time.Time) error`. A read on the `record` waits on the data signal, the close, or the deadline, and setting a deadline **wakes a read that is already blocked** (as yamux's `pipeDeadline` does), returning `os.ErrDeadlineExceeded` with no bytes. A zero time clears it. The recorder's `Reset` is `FullClose`, so a requester's reset reaches the server as `io.EOF`; recorder tests assert `eof`.
+- A **real yamux stream** for the reasons the recorder cannot produce (`reset` with `Remote`, `disconnect`, and the real `ErrTimeout` at the stop): a client and server `yamux` session pair over `net.Pipe`, with a thin adapter giving a yamux stream the `p2p.Stream` methods (and `SetReadDeadline`), wrapping errors as libp2p's stream wrapper does so the `core/network` types are what the handler sees. Test file `pkg/pullsync/watcher_yamux_test.go`.
 
 **Tests** (`package pullsync_test`, a real server `Syncer` and the recorder; every test closes the server `Syncer`):
 
-1. **Reproduction, using only signals that exist upstream:** a requester calls `Sync` for an empty bin with a context, then cancels the context; `Sync` returns and resets its stream. The test then waits, with a deadline, for the recorder's `Records()` to return, which needs every server handler to have returned. On unmodified code the handler stays in `makeOffer` and the test fails with a message at its deadline; with the change it returns within the deadline. It uses no new metric and no new export, so it runs unchanged on upstream code, given the recorder's `SetReadDeadline` (which an upstream port would add with the change).
-2. **Data before the offer:** a raw requester writes a `Get` and then one more byte without waiting: the request ends with reason `unexpected_data` and the stream is reset.
+1. **Reproduction, using only signals that exist upstream:** a requester calls `Sync` for an empty bin with a context, then cancels the context; `Sync` returns and resets its stream. The test calls the recorder's `Records()` **from a separate goroutine** (it holds `recordsMu` while it waits for every handler) and waits for it with a deadline. On unmodified code the handler stays in `makeOffer` and the test fails with a message at its deadline, then closes the server `Syncer` so the handler and `goleak` (already run for the package, `main_test.go`) are satisfied; with the change `Records()` returns within the deadline. It uses no new metric and no new export, so it runs unchanged on upstream code, given the recorder's `SetReadDeadline` (which an upstream port would add with the change).
+2. **Data before the offer:** a raw requester writes a `Get`, the test waits until `WaitingTracked() == 1` (the request is in its waiting phase), and only then writes one more byte: the request ends with reason `unexpected_data` and the stream is reset. (A byte sent together with the `Get` is discarded by the first reader; that case is not detected, by design.)
 3. **No interference with a normal request:** a waiting request whose chunk then arrives (`PublishBin`, #640's mock extension) completes offer, want and delivery; the `Want` is read correctly after the watcher was stopped (no byte lost), and `requests_abandoned_total` stays 0.
-4. **Reset just as the chunk arrives:** with a hook between `makeOffer` and the watcher stop (the test-only hook #640 added in `export_test.go`), reset the requester's stream; the handler does not write the offer and counts the request once.
-5. **Interaction with #640:** the same peer asks again for the same (bin, start); the older request ends as `same_start` and is not also counted as abandoned.
-6. **Shared collection:** two peers wait on the same (bin, start); the first resets; the second keeps waiting and receives the chunk after `PublishBin`.
+4. **Data at the boundary:** with a hook between `makeOffer` and the watcher stop (the test-only hook #640 added in `export_test.go`), the requester writes one byte; the handler does not write the offer and counts `unexpected_data` once. A reset at the same point (yamux test) is not counted as abandoned: the offer write or the `Want` read fails as today.
+5. **Interaction with #640:** (a) the same peer asks again for the same (bin, start) **without** resetting: the older request ends as `same_start` and is not counted as abandoned; (b) the peer resets and then asks again: the older request ends as abandoned (`eof` on the recorder) and `same_start` stays 0.
+6. **Shared collection:** two peers wait on the same (bin, start). The test first makes sure peer 2's request is inside the shared collection's `Do` (a hook on the mock's `SubscribeBin`, or `WaitingTracked() == 2` plus the subscription count), then peer 1 resets; peer 2 keeps waiting and receives the chunk after `PublishBin`.
 7. **No deadline support:** a stream wrapper without `SetReadDeadline`: the request waits as today and `requests_unwatched_total` rises by one.
-8. **No goroutine leak:** after a run of requests that end in each way, the handler and watcher goroutines are gone (`goleak` or a goroutine count before and after, as the package's existing tests do).
+8. **No goroutine leak:** after a run of requests that end in each way, the handler and watcher goroutines are gone; the package's `goleak` check covers this.
+9. **Real yamux stream** (`watcher_yamux_test.go`): (a) the requester resets: reason `reset`; (b) the client session closes: reason `disconnect`; (c) the requester closes its write side: reason `eof`; (d) a normal request with a chunk: the stop's real `ErrTimeout` is ignored, the offer is written, the `Want` is read intact, and nothing is counted.
 
 The package also runs under `make test-race`.
 
@@ -109,13 +123,18 @@ Mutation checks, each must fail a test:
 - the deadline not cleared after the stop (test 3: the `Want` read fails);
 - the stop skipped, so the watcher keeps reading during the `Want` (test 3, or the race detector);
 - data before the offer treated as a normal wait (test 2);
-- a reset at the boundary not checked, so the offer is written (test 4);
+- the stop decided by the error value instead of the flag (test 9d: the normal request is counted as `error` and its offer not written);
+- a connection close classified as `reset` (test 9b);
+- abandonment counted without checking `context.Cause` (test 5a);
+- `register` counting entries already done (test 5b);
+- data at the boundary not checked, so the offer is written (test 4);
 - an abandoned request counted twice with #640's replacement (test 5).
 
 **Real nodes** (role names only): the build goes to the ten-node host with the next deployment.
 
 - `bee_pullsync_requests_abandoned_total` by reason, `bee_pullsync_requests_unwatched_total` (expected 0), `bee_pullsync_waiting_requests` and `bee_libp2p_inbound_streams_per_peer_max`, compared with the #640 build over the same kind of period (a refill and the hours after it).
-- A radius change on one node of the host (a capacity change and restart, as in the radius-change scenarios) should raise `requests_abandoned_total{reason="reset"}` on its neighbours on the host by about the number of its quiet live bins each, within seconds, where with #640 alone those requests stay waiting. Note the restart itself also disconnects, which already ends requests; the cleaner trigger is a radius change without restart, if one occurs during the run, read from the `radius decrease` log and the counter.
+- A radius change of a neighbour without a restart (read from its `radius decrease` log) should raise `requests_abandoned_total{reason="reset"}` on our node by about the number of its quiet live bins, within seconds, where with #640 alone those requests stay waiting. A restart of a neighbour shows as `disconnect`, not `reset`, and also ends requests today through the connection close.
+- `bee_pullsync_requests_replaced_total{reason="same_start"}` should fall toward 0 compared with the #640 build (prediction from section 1).
 - A negative result: `unwatched` above 0 on production streams, `unexpected_data` above 0 from wasp or upstream requesters (a protocol assumption is wrong), or the waiting-request gauge unchanged after radius changes of neighbours.
 
 ## Rollout and rollback
