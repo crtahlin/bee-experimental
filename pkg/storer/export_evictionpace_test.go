@@ -78,3 +78,28 @@ func ResetReserveSizeWithinRadiusForTest() {
 // IsEvictionExpiry reports whether err is the error a batch expiry ends an
 // eviction with.
 func IsEvictionExpiry(err error) bool { return errors.Is(err, errEvictionExpiry) }
+
+// SampleStartedForTest registers a running sample as reserveSample does,
+// including the wait at the eviction barrier (#649).
+func (db *DB) SampleStartedForTest() { db.sampleStarted() }
+
+// SampleDoneForTest ends a sample SampleStartedForTest registered.
+func (db *DB) SampleDoneForTest() { db.sampleDone() }
+
+// SetMaxEvictionPauseForTest sets the cap on how long eviction waits for one
+// stretch of sampling and returns a function that restores it.
+func SetMaxEvictionPauseForTest(d time.Duration) func() {
+	old := maxEvictionPause
+	maxEvictionPause = d
+	return func() { maxEvictionPause = old }
+}
+
+// EvictionPausedSecondsForTest returns bee_localstore_eviction_paused_seconds_total.
+func (db *DB) EvictionPausedSecondsForTest() float64 {
+	return metricValue(db.metrics.EvictionPausedSeconds)
+}
+
+// EvictionPauseCappedForTest returns bee_localstore_eviction_pause_capped_total.
+func (db *DB) EvictionPauseCappedForTest() float64 {
+	return metricValue(db.metrics.EvictionPauseCapped)
+}

@@ -368,6 +368,12 @@ type EvictionHooks struct {
 	// After is called with the batch lock held, right after a round deleted
 	// n items in the duration took.
 	After func(n int, took time.Duration)
+	// Before is called before each round, before the batch lock is taken.
+	// It may wait, and an error ends EvictBatchBin before the round. The
+	// returned release, if not nil, is called after the round, once the
+	// batch lock is released and before Pay (wasp #649: no round runs
+	// while a reserve sample runs).
+	Before func() (release func(), err error)
 	// Pay is called after the batch lock is released, for a round that
 	// deleted n > 0 items. It may wait, and it is where a shutdown or a
 	// batch expiry stops the eviction between rounds. An error ends
@@ -377,8 +383,9 @@ type EvictionHooks struct {
 
 // EvictBatchBin evicts the chunks of a batch in bins below the bin provided,
 // up to count chunks, in rounds of at most EvictionRound items. Each round
-// reads and deletes under the batch lock, calls hooks.After, releases the
-// lock, and then calls hooks.Pay. Pinned chunks are protected from eviction
+// calls hooks.Before, reads and deletes under the batch lock, calls
+// hooks.After, releases the lock, calls the release hooks.Before returned,
+// and then calls hooks.Pay. Pinned chunks are protected from eviction
 // to maintain data integrity.
 func (r *Reserve) EvictBatchBin(
 	ctx context.Context,
@@ -390,7 +397,18 @@ func (r *Reserve) EvictBatchBin(
 	total := 0
 	var resume string // ID of the last item the previous round read
 	for count > 0 {
+		var release func()
+		if hooks.Before != nil {
+			rel, err := hooks.Before()
+			if err != nil {
+				return total, err
+			}
+			release = rel
+		}
 		read, evicted, last, err := r.evictRound(ctx, batchID, min(count, evictionRound), bin, resume, hooks)
+		if release != nil {
+			release()
+		}
 		total += evicted
 		if err != nil {
 			return total, err

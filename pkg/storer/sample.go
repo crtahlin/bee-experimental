@@ -190,11 +190,14 @@ func (db *DB) reserveSample(
 	minBatchBalance *big.Int,
 	inWindow func([]byte) bool,
 ) (Sample, error) {
-	// Signal that a sample is running so the puller pauses pulling and leaves the
-	// store quiet. Cleared on every return, including error and cancellation, so
-	// a failed sample never leaves pulling paused. See issue #23.
-	db.samplingInProgress.Store(true)
-	defer db.samplingInProgress.Store(false)
+	// Signal that a sample is running so the puller pauses pulling and
+	// eviction pauses, leaving the store quiet. Cleared on every return,
+	// including error and cancellation, so a failed sample never leaves
+	// pulling or eviction paused. See issues #23 and #649. sampleStarted
+	// also waits for an eviction round or radius step in progress, so the
+	// radius read below is the one the whole sample sees.
+	db.sampleStarted()
+	defer db.sampleDone()
 
 	g, ctx := errgroup.WithContext(ctx)
 

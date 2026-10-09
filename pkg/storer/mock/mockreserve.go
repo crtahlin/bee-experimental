@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/ethersphere/bee/v2/pkg/storage"
 	"github.com/ethersphere/bee/v2/pkg/storer"
@@ -96,6 +97,21 @@ func WithSample(s storer.Sample) Option {
 	})
 }
 
+// WithEvictingFor sets what EvictingFor returns (#649).
+func WithEvictingFor(d time.Duration) Option {
+	return optionFunc(func(p *ReserveStore) {
+		p.evictingFor.Store(int64(d))
+	})
+}
+
+// WithSampleHook sets a function ReserveSample calls before it returns, so a
+// test can change the store while a sample runs (#649).
+func WithSampleHook(f func()) Option {
+	return optionFunc(func(p *ReserveStore) {
+		p.sampleHook = f
+	})
+}
+
 func WithWindowedSample(s storer.Sample) Option {
 	return optionFunc(func(p *ReserveStore) {
 		p.windowedSample = s
@@ -123,6 +139,7 @@ type ReserveStore struct {
 	reservesize      int
 	capacityDoubling int
 	sampling         atomic.Bool
+	evictingFor      atomic.Int64
 
 	subResponses []chunksResponse
 	subs         map[*subscription]struct{}
@@ -131,6 +148,7 @@ type ReserveStore struct {
 	sample            storer.Sample
 	windowedSample    storer.Sample
 	windowedSampleSet bool
+	sampleHook        func()
 }
 
 // NewReserve returns a new Reserve mock.
@@ -152,6 +170,14 @@ func (s *ReserveStore) IsSampling() bool                                     { r
 // puller pauses while it is set. See issue #23.
 func (s *ReserveStore) SetSampling(v bool)  { s.sampling.Store(v) }
 func (s *ReserveStore) IsFullySynced() bool { return true }
+
+// EvictingFor returns the duration SetEvictingFor set, 0 by default (#649).
+func (s *ReserveStore) EvictingFor() time.Duration { return time.Duration(s.evictingFor.Load()) }
+
+// SetEvictingFor sets what EvictingFor returns, so a test can check that the
+// storage incentives agent sits out a round while the node evicts.
+func (s *ReserveStore) SetEvictingFor(d time.Duration) { s.evictingFor.Store(int64(d)) }
+
 func (s *ReserveStore) StorageRadius() uint8 {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
@@ -335,6 +361,9 @@ func (s *ReserveStore) ReserveHas(addr swarm.Address, batchID []byte, stampHash 
 }
 
 func (s *ReserveStore) ReserveSample(context.Context, []byte, uint8, uint64, *big.Int) (storer.Sample, error) {
+	if s.sampleHook != nil {
+		s.sampleHook()
+	}
 	return s.sample, nil
 }
 
