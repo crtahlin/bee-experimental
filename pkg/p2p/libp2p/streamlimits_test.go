@@ -8,10 +8,12 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/ethersphere/bee/v2/pkg/log"
 	"github.com/ethersphere/bee/v2/pkg/p2p/libp2p"
 	golibp2p "github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/network"
@@ -195,7 +197,7 @@ func TestStreamLimitPerPeer(t *testing.T) {
 	for _, h := range held[1:] {
 		h.Done()
 	}
-	if got := s.TakeAttribution()[a]; got != libp2p.StreamReasonPeerLimit {
+	if got := s.TakeAttribution()[a].Reason; got != libp2p.StreamReasonPeerLimit {
 		t.Fatalf("attribution reason %q, want %q", got, libp2p.StreamReasonPeerLimit)
 	}
 	assertReleased(t, s)
@@ -560,4 +562,208 @@ func waitFor(t *testing.T, cond func() bool) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// burst opens n inbound streams for p on proto and closes them all.
+func burst(t *testing.T, s *libp2p.StreamLimitStack, p libp2ppeer.ID, n int) {
+	t.Helper()
+	held := make([]network.StreamManagementScope, 0, n)
+	for range n {
+		sc, err := openNegotiated(s.RM, p, protoRetrieval)
+		if err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, sc)
+	}
+	for _, h := range held {
+		h.Done()
+	}
+}
+
+// snapshotProbe stands for the host: it returns the peer's streams by
+// protocol as set at the moment it is called, and counts calls.
+type snapshotProbe struct {
+	mu      sync.Mutex
+	current int
+	calls   int
+}
+
+func (p *snapshotProbe) set(n int) {
+	p.mu.Lock()
+	p.current = n
+	p.mu.Unlock()
+}
+
+func (p *snapshotProbe) read(libp2ppeer.ID) map[string]int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls++
+	return map[string]int{string(protoRetrieval): p.current}
+}
+
+func (p *snapshotProbe) called() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.calls
+}
+
+// TestStreamAttributionAboveThreshold checks that a peer passing 256
+// inbound streams is noted with its highest count and a per-protocol
+// snapshot taken while the burst lasts, and not noted again within the
+// attribution interval once logged.
+func TestStreamAttributionAboveThreshold(t *testing.T) {
+	t.Parallel()
+
+	s, err := libp2p.NewStreamLimitStack(libp2p.StreamLimitOptions{}, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.RM.Close()
+	quit := make(chan struct{})
+	defer close(quit)
+	probe := &snapshotProbe{}
+	probe.set(300)
+	s.StartSnapshots(probe.read, quit)
+
+	p := testPeer(t, 5)
+	burst(t, s, p, 300)
+	waitFor(t, func() bool { return probe.called() == 1 })
+	probe.set(0) // the burst is over by the time the scan runs
+
+	n, ok := s.TakeAttribution()[p]
+	if !ok {
+		t.Fatal("peer above the threshold not noted")
+	}
+	if n.Reason != libp2p.StreamReasonAboveThreshold || n.MaxInbound != 300 || n.ByProtocol[string(protoRetrieval)] != 300 {
+		t.Fatalf("got %+v, want reason %q, max 300 and the snapshot taken during the burst", n, libp2p.StreamReasonAboveThreshold)
+	}
+
+	burst(t, s, p, 300)
+	if notes := s.TakeAttribution(); len(notes) != 0 {
+		t.Fatalf("peer noted again within the attribution interval: %+v", notes)
+	}
+	if got := probe.called(); got != 1 {
+		t.Fatalf("snapshots taken %d, want 1", got)
+	}
+}
+
+// TestStreamAttributionLog checks the attribution line: written at the
+// scan, with the reason, the highest count and the snapshot from when the
+// peer was noted.
+func TestStreamAttributionLog(t *testing.T) {
+	t.Parallel()
+
+	s, err := libp2p.NewStreamLimitStack(libp2p.StreamLimitOptions{}, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.RM.Close()
+	var buf syncBuffer
+	s.SetLogger(log.NewLogger(t.Name(), log.WithSink(&buf), log.WithVerbosity(log.VerbosityInfo)).Build())
+	quit := make(chan struct{})
+	defer close(quit)
+	probe := &snapshotProbe{}
+	probe.set(290)
+	s.StartSnapshots(probe.read, quit)
+
+	burst(t, s, testPeer(t, 6), 290)
+	waitFor(t, func() bool { return probe.called() == 1 })
+	probe.set(0)
+	s.Scan()
+
+	out := buf.String()
+	for _, want := range []string{
+		"peer passed an inbound stream threshold or limit",
+		`"reason"="above_threshold"`,
+		`"max_inbound_streams"=290`,
+		string(protoRetrieval) + `":290`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("log line misses %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestInboundStreamsByProtocol checks the per-protocol count on a real
+// host: inbound streams by protocol, outbound streams left out.
+func TestInboundStreamsByProtocol(t *testing.T) {
+	t.Parallel()
+
+	server, err := golibp2p.New(golibp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	client, err := golibp2p.New(golibp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	release := make(chan struct{})
+	defer close(release)
+	hold := func(s network.Stream) { <-release; _ = s.Close() }
+	server.SetStreamHandler(protoRetrieval, hold)
+	server.SetStreamHandler(protoPullSync, hold)
+	client.SetStreamHandler(protoRetrieval, hold)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := client.Connect(ctx, libp2ppeer.AddrInfo{ID: server.ID(), Addrs: server.Addrs()}); err != nil {
+		t.Fatal(err)
+	}
+	for _, proto := range []protocol.ID{protoRetrieval, protoRetrieval, protoPullSync} {
+		st, err := client.NewStream(ctx, server.ID(), proto)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.Write([]byte{1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A stream the server opens to the client is outbound for the server.
+	out, err := server.NewStream(ctx, client.ID(), protoRetrieval)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := out.Write([]byte{1}); err != nil {
+		t.Fatal(err)
+	}
+
+	want := map[string]int{string(protoRetrieval): 2, string(protoPullSync): 1}
+	var got map[string]int
+	waitFor(t, func() bool {
+		got = libp2p.InboundStreamsByProtocol(server.Network(), client.ID())
+		return reflect.DeepEqual(got, want)
+	})
+}
+
+// TestStreamAttributionKeepsHighest checks that a later note with a lower
+// count, here a group refusal, does not lower the peer's highest count.
+func TestStreamAttributionKeepsHighest(t *testing.T) {
+	t.Parallel()
+
+	// cap 1000, pull-sync reserve 600, transient 100: others may hold 300.
+	s := newStack(t, libp2p.StreamLimitOptions{PerPeer: -1, UnnegotiatedPerPeer: -1, ReservePullSync: 600, ReserveOther: -1, Transient: 100}, 1000)
+	p := testPeer(t, 7)
+	held := make([]network.StreamManagementScope, 0, 300)
+	for range 300 {
+		sc, err := openNegotiated(s.RM, p, protoRetrieval)
+		if err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, sc)
+	}
+	if _, err := openNegotiated(s.RM, p, protoRetrieval); !errors.Is(err, libp2p.ErrStreamGroupFull) {
+		t.Fatalf("stream over the group: got %v, want %v", err, libp2p.ErrStreamGroupFull)
+	}
+	for _, h := range held {
+		h.Done()
+	}
+	// The refused stream is held by the peer scope until it is refused
+	// at negotiation, so the highest count is 301.
+	n := s.TakeAttribution()[p]
+	if n.Reason != libp2p.StreamReasonAboveThreshold || n.MaxInbound != 301 {
+		t.Fatalf("got %+v, want the first reason and the highest count 301", n)
+	}
+	assertReleased(t, s)
 }

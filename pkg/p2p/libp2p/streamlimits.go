@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/libp2p/go-libp2p/core/network"
 	libp2ppeer "github.com/libp2p/go-libp2p/core/peer"
@@ -193,7 +194,7 @@ func newStreamLimits(cfg streamLimitsConfig, m metrics, attr *streamAttribution)
 // refuse counts a refusal and notes the peer for the attribution log.
 func (l *streamLimits) refuse(p libp2ppeer.ID, limit string) {
 	l.metrics.InboundStreamsRefused.WithLabelValues(limit).Inc()
-	l.attr.note(p, limit)
+	l.attr.note(p, limit, 0)
 }
 
 // reserveUnnegotiated takes one un-negotiated slot of peer p. It reports
@@ -373,39 +374,135 @@ func (l *inboundLimiter) OpenStream(p libp2ppeer.ID, dir network.Direction) (net
 	return &limitedStreamScope{StreamManagementScope: scope, limits: lim, peer: p, holdsSlot: holds}, nil
 }
 
+// streamNote is what the attribution log says about one peer: why it
+// was noted, the highest inbound stream count seen meanwhile, and its
+// inbound streams by protocol, read as soon as it was noted.
+type streamNote struct {
+	reason     string
+	maxInbound int
+	byProtocol map[string]int
+}
+
+// streamSnapshotQueue is how many noted peers can wait for their
+// per-protocol snapshot. A peer noted while the queue is full is read at
+// the next scan instead.
+const streamSnapshotQueue = 64
+
 // streamAttribution collects the peers to name in the attribution log:
 // those that passed the per-peer threshold or were refused at a limit.
-// Notes are taken on hot paths, so they only record the peer; the scan
-// does the slower work of naming it.
+// Notes are taken on hot paths, including inside the resource manager's
+// trace reporter, so note only updates a map and hands the peer to a
+// worker without blocking; the worker reads the peer's streams by
+// protocol at once, so a short burst is seen as it was. A peer named in
+// the log is not noted again for streamAttributionInterval.
 type streamAttribution struct {
-	mu    sync.Mutex
-	peers map[libp2ppeer.ID]string
+	now func() time.Time
+
+	mu        sync.Mutex
+	peers     map[libp2ppeer.ID]*streamNote
+	logged    map[libp2ppeer.ID]time.Time
+	protocols func(libp2ppeer.ID) map[string]int
+
+	snapshots chan libp2ppeer.ID
 }
 
-func newStreamAttribution() *streamAttribution {
-	return &streamAttribution{peers: make(map[libp2ppeer.ID]string)}
+func newStreamAttribution(now func() time.Time) *streamAttribution {
+	if now == nil {
+		now = time.Now
+	}
+	return &streamAttribution{
+		now:       now,
+		peers:     make(map[libp2ppeer.ID]*streamNote),
+		logged:    make(map[libp2ppeer.ID]time.Time),
+		snapshots: make(chan libp2ppeer.ID, streamSnapshotQueue),
+	}
 }
 
-func (a *streamAttribution) note(p libp2ppeer.ID, reason string) {
+// note records peer p with the reason and its inbound stream count, and
+// queues a per-protocol snapshot the first time p is noted.
+func (a *streamAttribution) note(p libp2ppeer.ID, reason string, inbound int) {
 	if a == nil {
 		return
 	}
 	a.mu.Lock()
-	if _, ok := a.peers[p]; !ok {
-		a.peers[p] = reason
+	if last, ok := a.logged[p]; ok && a.now().Sub(last) < streamAttributionInterval {
+		a.mu.Unlock()
+		return
+	}
+	n, ok := a.peers[p]
+	if !ok {
+		n = &streamNote{reason: reason}
+		a.peers[p] = n
+	}
+	n.maxInbound = max(n.maxInbound, inbound)
+	a.mu.Unlock()
+	if !ok {
+		select {
+		case a.snapshots <- p:
+		default:
+		}
+	}
+}
+
+// setProtocols sets the function that reads a peer's inbound streams by
+// protocol. It is set once the host exists, before run starts.
+func (a *streamAttribution) setProtocols(f func(libp2ppeer.ID) map[string]int) {
+	a.mu.Lock()
+	a.protocols = f
+	a.mu.Unlock()
+}
+
+// run takes the per-protocol snapshot of each queued peer until quit is
+// closed.
+func (a *streamAttribution) run(quit <-chan struct{}) {
+	for {
+		select {
+		case <-quit:
+			return
+		case p := <-a.snapshots:
+			a.snapshot(p)
+		}
+	}
+}
+
+// snapshot reads the inbound streams of p by protocol into its note, if
+// it still has a note without one.
+func (a *streamAttribution) snapshot(p libp2ppeer.ID) {
+	a.mu.Lock()
+	f := a.protocols
+	n, ok := a.peers[p]
+	a.mu.Unlock()
+	if f == nil || !ok {
+		return
+	}
+	counts := f(p)
+	a.mu.Lock()
+	if n.byProtocol == nil {
+		n.byProtocol = counts
 	}
 	a.mu.Unlock()
 }
 
-func (a *streamAttribution) take() map[libp2ppeer.ID]string {
+// take returns the notes since the previous call and marks each peer as
+// logged now, so it is not noted again for streamAttributionInterval.
+func (a *streamAttribution) take() map[libp2ppeer.ID]*streamNote {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	now := a.now()
+	for p, last := range a.logged {
+		if now.Sub(last) >= streamAttributionInterval {
+			delete(a.logged, p)
+		}
+	}
 	if len(a.peers) == 0 {
 		return nil
 	}
-	p := a.peers
-	a.peers = make(map[libp2ppeer.ID]string)
-	return p
+	notes := a.peers
+	a.peers = make(map[libp2ppeer.ID]*streamNote)
+	for p := range notes {
+		a.logged[p] = now
+	}
+	return notes
 }
 
 // Reasons in the attribution log besides the limit labels.
@@ -466,12 +563,12 @@ func (h *streamHighWater) ConsumeEvent(evt rcmgr.TraceEvt) {
 		h.mu.Unlock()
 		if evt.StreamsIn > streamLogThreshold {
 			if p, err := libp2ppeer.Decode(ps); err == nil {
-				h.attr.note(p, streamReasonAboveThreshold)
+				h.attr.note(p, streamReasonAboveThreshold, evt.StreamsIn)
 			}
 		}
 	case rcmgr.TraceBlockAddStreamEvt:
 		if p, err := libp2ppeer.Decode(ps); err == nil {
-			h.attr.note(p, streamReasonPeerLimit)
+			h.attr.note(p, streamReasonPeerLimit, evt.StreamsIn)
 		}
 	}
 }

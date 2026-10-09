@@ -305,7 +305,7 @@ func New(ctx context.Context, signer beecrypto.Signer, networkID uint64, overlay
 
 	perIP := buildPerIPLimits(o.MaxConnectionsPerIP, o.ConnectionRatePerIP, o.ConnectionBurstPerIP)
 
-	attribution := newStreamAttribution()
+	attribution := newStreamAttribution(o.now)
 	highWater := newStreamHighWater(str, attribution)
 
 	rm, err := rcmgr.NewResourceManager(limiter, append([]rcmgr.Option{rcmgr.WithTraceReporter(highWater)}, perIP.options()...)...)
@@ -590,12 +590,13 @@ func New(ctx context.Context, signer beecrypto.Signer, networkID uint64, overlay
 			now:      now,
 			logged:   make(map[libp2ppeer.ID]time.Time),
 
-			high:       highWater,
-			attr:       attribution,
-			limits:     inbound.streams,
-			protocols:  s.inboundStreamsByProtocol,
-			attributed: make(map[libp2ppeer.ID]time.Time),
+			high:      highWater,
+			attr:      attribution,
+			limits:    inbound.streams,
+			protocols: s.inboundStreamsByProtocol,
 		}
+		attribution.setProtocols(s.inboundStreamsByProtocol)
+		go attribution.run(s.knownFullQuit)
 		go s.streamWatchWorker(s.streams)
 	} else {
 		s.logger.Warning("resource manager does not report per-peer streams; inbound streams per peer are not measured")

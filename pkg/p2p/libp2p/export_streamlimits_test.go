@@ -111,7 +111,7 @@ func NewStreamLimitStack(o StreamLimitOptions, streamCap int, blocked ...protoco
 	if err != nil {
 		return nil, err
 	}
-	attr := newStreamAttribution()
+	attr := newStreamAttribution(time.Now)
 	high := newStreamHighWater(str, attr)
 	rm, err := rcmgr.NewResourceManager(rcmgr.NewFixedLimiter(cfg.Build(rcmgr.InfiniteLimits)), rcmgr.WithTraceReporter(high))
 	if err != nil {
@@ -131,16 +131,15 @@ func NewStreamLimitStack(o StreamLimitOptions, streamCap int, blocked ...protoco
 		attr:    attr,
 	}
 	s.watch = &streamWatch{
-		state:      s.State,
-		identify:   func(libp2ppeer.ID) (swarm.Address, []byte, bool, bool) { return swarm.ZeroAddress, nil, false, false },
-		logger:     log.Noop,
-		metrics:    m,
-		now:        time.Now,
-		logged:     make(map[libp2ppeer.ID]time.Time),
-		high:       high,
-		attr:       attr,
-		limits:     l.streams,
-		attributed: make(map[libp2ppeer.ID]time.Time),
+		state:    s.State,
+		identify: func(libp2ppeer.ID) (swarm.Address, []byte, bool, bool) { return swarm.ZeroAddress, nil, false, false },
+		logger:   log.Noop,
+		metrics:  m,
+		now:      time.Now,
+		logged:   make(map[libp2ppeer.ID]time.Time),
+		high:     high,
+		attr:     attr,
+		limits:   l.streams,
 	}
 	return s, nil
 }
@@ -173,8 +172,36 @@ func (s *StreamLimitStack) Scan() (peerHigh, transientHigh, unnegotiatedMax floa
 		gaugeValue(s.metrics.InboundStreamsUnnegotiatedPeerMax)
 }
 
+// AttributionNote is what the attribution log says about one peer.
+type AttributionNote struct {
+	Reason     string
+	MaxInbound int
+	ByProtocol map[string]int
+}
+
 // TakeAttribution returns the peers noted for the attribution log since
 // the previous call.
-func (s *StreamLimitStack) TakeAttribution() map[libp2ppeer.ID]string {
-	return s.attr.take()
+func (s *StreamLimitStack) TakeAttribution() map[libp2ppeer.ID]AttributionNote {
+	out := make(map[libp2ppeer.ID]AttributionNote)
+	for p, n := range s.attr.take() {
+		out[p] = AttributionNote{Reason: n.reason, MaxInbound: n.maxInbound, ByProtocol: n.byProtocol}
+	}
+	return out
+}
+
+// StartSnapshots sets the function that reads a peer's streams by
+// protocol, and starts the snapshot worker until quit is closed.
+func (s *StreamLimitStack) StartSnapshots(protocols func(libp2ppeer.ID) map[string]int, quit <-chan struct{}) {
+	s.attr.setProtocols(protocols)
+	s.watch.protocols = protocols
+	go s.attr.run(quit)
+}
+
+// SetLogger replaces the stream watch's logger.
+func (s *StreamLimitStack) SetLogger(l log.Logger) { s.watch.logger = l }
+
+// InboundStreamsByProtocol counts a peer's inbound streams by protocol on
+// a network, as the attribution line does.
+func InboundStreamsByProtocol(n network.Network, p libp2ppeer.ID) map[string]int {
+	return inboundStreamsByProtocol(n, p)
 }

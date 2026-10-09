@@ -73,11 +73,10 @@ type streamWatch struct {
 	// The parts below are optional. high and attr are set on a node,
 	// limits only while p2p-inbound-stream-limits is on. protocols
 	// counts a peer's inbound streams by protocol, from the host.
-	high       *streamHighWater
-	attr       *streamAttribution
-	limits     *streamLimits
-	protocols  func(libp2ppeer.ID) map[string]int
-	attributed map[libp2ppeer.ID]time.Time
+	high      *streamHighWater
+	attr      *streamAttribution
+	limits    *streamLimits
+	protocols func(libp2ppeer.ID) map[string]int
 }
 
 type peerStreams struct {
@@ -110,29 +109,22 @@ func (w *streamWatch) reportHighWater(stats map[libp2ppeer.ID]network.ScopeStat)
 	}
 }
 
-// attribute names each peer that passed the per-peer threshold or was
-// refused at a stream limit since the previous scan, at most once per
-// peer per streamAttributionInterval, with its inbound streams by
-// protocol.
+// attribute names each peer noted since the previous scan, with the
+// reason, the highest inbound stream count seen and its inbound streams
+// by protocol from when it was noted. A peer whose snapshot was not taken
+// (the queue was full) is read now.
 func (w *streamWatch) attribute(stats map[libp2ppeer.ID]network.ScopeStat) {
 	if w.attr == nil {
 		return
 	}
-	notes := w.attr.take()
-	now := w.now()
-	for p, last := range w.attributed {
-		if now.Sub(last) >= streamAttributionInterval {
-			delete(w.attributed, p)
+	for p, n := range w.attr.take() {
+		f := append(w.fields(peerStreams{peer: p, inbound: stats[p].NumStreamsInbound}), "reason", n.reason, "max_inbound_streams", n.maxInbound)
+		byProtocol := n.byProtocol
+		if byProtocol == nil && w.protocols != nil {
+			byProtocol = w.protocols(p)
 		}
-	}
-	for p, reason := range notes {
-		if _, ok := w.attributed[p]; ok {
-			continue
-		}
-		w.attributed[p] = now
-		f := append(w.fields(peerStreams{peer: p, inbound: stats[p].NumStreamsInbound}), "reason", reason)
-		if w.protocols != nil {
-			f = append(f, "inbound_by_protocol", w.protocols(p))
+		if byProtocol != nil {
+			f = append(f, "inbound_by_protocol", byProtocol)
 		}
 		w.logger.Info("peer passed an inbound stream threshold or limit", f...)
 	}
@@ -224,8 +216,12 @@ func (s *Service) streamWatchWorker(w *streamWatch) {
 // count by protocol. A stream that has not negotiated a protocol yet is
 // counted under "unnegotiated".
 func (s *Service) inboundStreamsByProtocol(p libp2ppeer.ID) map[string]int {
+	return inboundStreamsByProtocol(s.host.Network(), p)
+}
+
+func inboundStreamsByProtocol(n network.Network, p libp2ppeer.ID) map[string]int {
 	counts := make(map[string]int)
-	for _, c := range s.host.Network().ConnsToPeer(p) {
+	for _, c := range n.ConnsToPeer(p) {
 		for _, st := range c.GetStreams() {
 			if st.Stat().Direction != network.DirInbound {
 				continue
