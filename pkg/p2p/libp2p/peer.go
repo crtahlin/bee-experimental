@@ -21,6 +21,7 @@ type peerRegistry struct {
 	overlayToPeerID map[string]libp2ppeer.ID                    // map overlay address to underlay peer id
 	overlays        map[libp2ppeer.ID]swarm.Address             // map underlay peer id to overlay address
 	full            map[libp2ppeer.ID]bool                      // map to track whether a node is full or light node (true=full)
+	ethAddresses    map[libp2ppeer.ID][]byte                    // Ethereum address from the peer's signed bzz address
 	connections     map[libp2ppeer.ID]map[network.Conn]struct{} // list of connections for safe removal on Disconnect notification
 	streams         map[libp2ppeer.ID]map[network.Stream]context.CancelFunc
 	mu              sync.RWMutex
@@ -43,6 +44,7 @@ func newPeerRegistry() *peerRegistry {
 		overlayToPeerID: make(map[string]libp2ppeer.ID),
 		overlays:        make(map[libp2ppeer.ID]swarm.Address),
 		full:            make(map[libp2ppeer.ID]bool),
+		ethAddresses:    make(map[libp2ppeer.ID][]byte),
 		connections:     make(map[libp2ppeer.ID]map[network.Conn]struct{}),
 		streams:         make(map[libp2ppeer.ID]map[network.Stream]context.CancelFunc),
 
@@ -90,6 +92,7 @@ func (r *peerRegistry) Disconnected(_ network.Network, c network.Conn) {
 	}
 	delete(r.streams, peerID)
 	delete(r.full, peerID)
+	delete(r.ethAddresses, peerID)
 	r.mu.Unlock()
 	r.disconnecter.disconnected(overlay)
 }
@@ -164,7 +167,7 @@ func (r *peerRegistry) fullPeerConnAddrs() []ma.Multiaddr {
 	return addrs
 }
 
-func (r *peerRegistry) addIfNotExists(c network.Conn, overlay swarm.Address, full bool) (exists bool) {
+func (r *peerRegistry) addIfNotExists(c network.Conn, overlay swarm.Address, full bool, ethAddress []byte) (exists bool) {
 	peerID := c.RemotePeer()
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -184,6 +187,7 @@ func (r *peerRegistry) addIfNotExists(c network.Conn, overlay swarm.Address, ful
 	r.overlayToPeerID[overlay.ByteString()] = peerID
 	r.overlays[peerID] = overlay
 	r.full[peerID] = full
+	r.ethAddresses[peerID] = ethAddress
 	return false
 }
 
@@ -199,6 +203,19 @@ func (r *peerRegistry) overlay(peerID libp2ppeer.ID) (swarm.Address, bool) {
 	overlay, found := r.overlays[peerID]
 	r.mu.RUnlock()
 	return overlay, found
+}
+
+// peerIdentity returns the overlay, the Ethereum address and whether the
+// peer is a full node, read under one lock. found is false for a peer that
+// is not in the registry.
+func (r *peerRegistry) peerIdentity(peerID libp2ppeer.ID) (overlay swarm.Address, ethAddress []byte, full, found bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	overlay, found = r.overlays[peerID]
+	if !found {
+		return swarm.ZeroAddress, nil, false, false
+	}
+	return overlay, r.ethAddresses[peerID], r.full[peerID], true
 }
 
 func (r *peerRegistry) fullnode(peerID libp2ppeer.ID) (bool, bool) {
@@ -220,6 +237,7 @@ func (r *peerRegistry) remove(overlay swarm.Address) (found, full bool, peerID l
 	delete(r.streams, peerID)
 	full = r.full[peerID]
 	delete(r.full, peerID)
+	delete(r.ethAddresses, peerID)
 	r.mu.Unlock()
 
 	return found, full, peerID

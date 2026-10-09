@@ -115,6 +115,7 @@ type Service struct {
 	inbound            *inboundLimiter
 	knownFull          *knownFullPeers
 	knownFullQuit      chan struct{}
+	streams            *streamWatch
 	lastReachability   atomic.Int32
 	closeOnce          sync.Once
 	protocolsmu        sync.RWMutex
@@ -206,6 +207,9 @@ type Options struct {
 
 	// now replaces time.Now in tests.
 	now func() time.Time
+	// blockedInboundProtocols, in tests, are protocols whose inbound
+	// streams the resource manager refuses.
+	blockedInboundProtocols []protocol.ID
 	// inboundLimitLoopback applies the total inbound rate to loopback
 	// addresses, for tests.
 	inboundLimitLoopback bool
@@ -275,6 +279,13 @@ func New(ctx context.Context, signer beecrypto.Signer, networkID uint64, overlay
 			StreamsOutbound: OutgoingStreamCountLimit,
 			StreamsInbound:  IncomingStreamCountLimit,
 		},
+	}
+
+	for _, p := range o.blockedInboundProtocols {
+		if cfg.Protocol == nil {
+			cfg.Protocol = make(map[protocol.ID]rcmgr.ResourceLimits)
+		}
+		cfg.Protocol[p] = rcmgr.ResourceLimits{StreamsInbound: rcmgr.BlockAllLimit}
 	}
 
 	// Create our limits by using our cfg and replacing the default values with values from `scaledDefaultLimits`
@@ -560,6 +571,20 @@ func New(ctx context.Context, signer beecrypto.Signer, networkID uint64, overlay
 		go s.knownFullWorker()
 	}
 
+	if state, ok := rm.(rcmgr.ResourceManagerState); ok {
+		s.streams = &streamWatch{
+			state:    state,
+			identify: s.peers.peerIdentity,
+			logger:   s.logger,
+			metrics:  s.metrics,
+			now:      now,
+			logged:   make(map[libp2ppeer.ID]time.Time),
+		}
+		go s.streamWatchWorker(s.streams)
+	} else {
+		s.logger.Warning("resource manager does not report per-peer streams; inbound streams per peer are not measured")
+	}
+
 	connMetricNotify := newConnMetricNotify(s.metrics)
 	h.Network().Notify(peerRegistry) // update peer registry on network events
 	h.Network().Notify(connMetricNotify)
@@ -730,7 +755,7 @@ func (s *Service) handleIncoming(stream network.Stream) {
 		}()
 	}
 
-	if exists := s.peers.addIfNotExists(stream.Conn(), overlay, i.FullNode); exists {
+	if exists := s.peers.addIfNotExists(stream.Conn(), overlay, i.FullNode, i.BzzAddress.EthereumAddress); exists {
 		s.logger.Debug("stream handler: peer already exists", "peer_address", overlay)
 		if err = handshakeStream.FullClose(); err != nil {
 			s.logger.Debug("stream handler: could not close stream", "peer_address", overlay, "error", err)
@@ -1279,7 +1304,7 @@ func (s *Service) Connect(ctx context.Context, addrs []ma.Multiaddr) (address *b
 		return nil, p2p.ErrPeerBlocklisted
 	}
 
-	if exists := s.peers.addIfNotExists(stream.Conn(), overlay, i.FullNode); exists {
+	if exists := s.peers.addIfNotExists(stream.Conn(), overlay, i.FullNode, i.BzzAddress.EthereumAddress); exists {
 		if err := handshakeStream.FullClose(); err != nil {
 			// Only close the new (duplicate) connection; keep existing healthy sessions intact.
 			_ = stream.Conn().Close()
@@ -1464,6 +1489,7 @@ func (s *Service) NewStream(ctx context.Context, overlay swarm.Address, headers 
 
 	streamlibp2p, err := s.newStreamForPeerID(ctx, peerID, protocolName, protocolVersion, streamName)
 	if err != nil {
+		s.countRemoteStreamRefusal(err, overlay, protocolName, protocolVersion, streamName)
 		return nil, fmt.Errorf("new stream for peerid: %w", err)
 	}
 
@@ -1483,6 +1509,7 @@ func (s *Service) NewStream(ctx context.Context, overlay swarm.Address, headers 
 	defer cancel()
 	if err := sendHeaders(ctx, headers, stream); err != nil {
 		_ = stream.Reset()
+		s.countRemoteStreamRefusal(err, overlay, protocolName, protocolVersion, streamName)
 		return nil, fmt.Errorf("send headers: %w", err)
 	}
 
