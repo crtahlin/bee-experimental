@@ -333,6 +333,10 @@
 ## reserve capacity doubling
 # reserve-capacity-doubling: 0
 
+## most chunks per second reserve eviction deletes, raised to the rate chunks
+## arrive at; 0 means no limit, the previous behaviour
+# reserve-eviction-rate: 0
+
 ## reserve lookups pullsync may have in flight at once; 0 leaves them
 ## unbounded, which is the previous behaviour
 # reserve-has-concurrency: 0

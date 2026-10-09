@@ -44,6 +44,8 @@ type metrics struct {
 	HeldDropped                   prometheus.Counter
 	HeldValidationSeconds         prometheus.Gauge
 	HeldValidationErrors          prometheus.Counter
+	ReserveEvictionWorkers        prometheus.Gauge
+	ReserveArrivalRate            prometheus.Gauge
 }
 
 // newMetrics is a convenient constructor for creating new metrics.
@@ -292,6 +294,22 @@ func newMetrics() metrics {
 					0.000001, 0.00001, 0.0001, 0.001, 0.005,
 					0.01, 0.05, 0.1, 0.5, 1,
 				},
+			},
+		),
+		ReserveEvictionWorkers: prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Namespace: m.Namespace,
+				Subsystem: subsystem,
+				Name:      "reserve_eviction_workers",
+				Help:      "Goroutines a paced reserve eviction deletes with (wasp #623). 0 when eviction is not paced.",
+			},
+		),
+		ReserveArrivalRate: prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Namespace: m.Namespace,
+				Subsystem: subsystem,
+				Name:      "reserve_arrival_rate",
+				Help:      "Chunks per second added to the reserve over the last minute, as seen by a paced eviction (wasp #623). Updated only while a paced eviction runs; between evictions it keeps its last value.",
 			},
 		),
 	}
