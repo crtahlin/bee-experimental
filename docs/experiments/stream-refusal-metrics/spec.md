@@ -1,6 +1,6 @@
 # Stream refusal metrics
 
-Issue: #636. This spec covers **metrics only**, the first item of #636. It changes no behaviour: no limit, no stream and nothing on the wire.
+Issue: #636. This spec covers **metrics only**, the first item of #636, plus the per-peer view needed to size the limits in #638. It changes no behaviour: no limit, no stream and nothing on the wire.
 
 ## Terms
 
@@ -51,7 +51,24 @@ Optional, if cheap: a debug line `stream refused by peer` with the peer address 
 
 Streams that a peer resets later, after the headers, for example during a pull-sync exchange, are not counted: that is not where the sw-1 refusals happened, and other resets would mix in.
 
-### 3. Documentation
+### 3. Inbound streams per peer
+
+The two counters say that refusals happen, not who holds the streams. To tell a few peers holding many streams (a fault or misbehaviour on their side) from many peers holding the usual number (load), and to size the per-peer limit proposed in #638 from data (rule 8: measure first), the node also reports how inbound streams are spread over peers.
+
+Every 30 s a goroutine walks `host.Network().Conns()`, and for each connection `conn.GetStreams()` (go-libp2p v0.48.0 `p2p/net/swarm/swarm_conn.go:287`, a copy of the stream set under the connection's lock), counts the streams whose `Stat().Direction` is inbound, and sums them per remote peer (a peer can hold more than one connection). From the per-peer counts it sets gauges, with no peer ID as a label:
+
+- `bee_libp2p_inbound_streams_per_peer_max`: the largest count;
+- `bee_libp2p_inbound_streams_per_peer_p99`: the 99th percentile (with fewer than 100 peers, the second-largest count);
+- `bee_libp2p_inbound_stream_peers_over{threshold}`: the number of peers above 64, 256 and 1,000 inbound streams;
+- the same three for pull-sync streams only (`Protocol()` equal to the pull-sync protocol ID), with the suffix `_pullsync`. This costs one string comparison per stream, so it is included.
+
+When the largest count exceeds the highest threshold (1,000), a debug line `peer holds many inbound streams` names that peer, its count and its pull-sync count.
+
+**Cost.** One pass is proportional to the number of streams: about 150 connections and, on a busy node, up to the cap of about 5,000 inbound streams plus the outbound ones, so at most about 15,000 stream records per pass, each a read of `Stat()` and a map update. Each `GetStreams` call holds one connection's stream lock only while copying its set. That is well under a millisecond of work every 30 s.
+
+**Why 30 s.** Pull-sync streams live for minutes (a live sync request waits for new chunks), so a slower scan still sees the pattern, while a faster one adds lock traffic on every connection for no gain. A short burst between two scans is missed; the refusal counters above catch its effect.
+
+### 4. Documentation
 
 `docs/DIFFERENCES.md` gets the two metrics in the metrics table. Nothing else changes.
 
@@ -73,6 +90,7 @@ The change is accepted on tests plus one real-node check; the 24-hour measuremen
 2. Refused here, `protocol` stage: a scope whose `SetProtocol` fails is counted as `protocol`.
 3. Refused by a peer: a test peer whose resource manager refuses inbound streams (a stream cap of 0 on that peer) makes `NewStream` to it fail, and the counter for that protocol rises by one; a stream that fails for another reason (unknown protocol, peer gone) does not count.
 4. The wrapper still forwards every other `ResourceManager` method unchanged (the existing inbound-limit tests keep passing).
+5. Per-peer gauges: two test peers opening 3 and 70 inbound streams to the node give a maximum of 70, one peer over 64, none over 256, and the pull-sync gauges count only streams of that protocol; the debug line appears only above the highest threshold.
 
 Mutation checks: drop the `Remote` check (a local reset would then count), drop the code check (any reset would count), drop the `errors.As` (nothing counts); each must fail a test.
 
