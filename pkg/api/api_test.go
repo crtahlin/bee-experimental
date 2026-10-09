@@ -136,6 +136,7 @@ type testServerOptions struct {
 	BeeMode             api.BeeNodeMode
 	RedistributionAgent *storageincentives.Agent
 	NodeStatus          *status.Service
+	PostageSyncHealth   postage.SyncHealth
 	PinIntegrity        api.PinIntegrity
 	WhitelistedAddr     string
 	FullAPIDisabled     bool
@@ -219,6 +220,7 @@ func newTestServer(t *testing.T, o testServerOptions) (*http.Client, *websocket.
 		Staking:            o.StakingContract,
 		LegacyStake:        o.LegacyStake,
 		NodeStatus:         o.NodeStatus,
+		PostageSyncHealth:  o.PostageSyncHealth,
 		PinIntegrity:       o.PinIntegrity,
 	}
 

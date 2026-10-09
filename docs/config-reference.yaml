@@ -444,6 +444,14 @@
 ## from blocks that are rolled back
 # postage-confirmation-depth: 4
 
+## stop the node once its batch store has been stale this long, counted from
+## when it became stale (10 minutes after the last postage page applied), with
+## exit status 75; 0 never stops: a stale node stays up, serves content, holds
+## chunks of batches it has not seen yet and sits out lottery rounds until it
+## catches up. A duration takes the node off the network while stale and adds
+## restart load to a host that may already be overloaded
+# postage-stall-shutdown: 0s
+
 ## postage stamp contract start block number
 # postage-stamp-start-block: 0
 

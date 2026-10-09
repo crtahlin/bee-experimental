@@ -15,6 +15,8 @@ import (
 	"github.com/ethersphere/bee/v2/pkg/log"
 	"github.com/ethersphere/bee/v2/pkg/storer/internal/events"
 	"github.com/ethersphere/bee/v2/pkg/storer/internal/reserve"
+	"github.com/ethersphere/bee/v2/pkg/storer/internal/transaction"
+	"github.com/ethersphere/bee/v2/pkg/swarm"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -195,4 +197,33 @@ func CacheLimiterCancelled(db *DB) bool {
 	default:
 		return false
 	}
+}
+
+// SetRadiusDecreaseHold replaces how long after the stale state the radius
+// decrease stays blocked, for a test, and returns a function that restores it.
+func SetRadiusDecreaseHold(d time.Duration) func() {
+	old := radiusDecreaseHold
+	radiusDecreaseHold = d
+	return func() { radiusDecreaseHold = old }
+}
+
+// SetHeldLimits replaces the held-area bound and the validation pacing for
+// a test, and returns a function that restores them.
+func SetHeldLimits(maxAddrs uint64, check time.Duration, round int, pause time.Duration) func() {
+	oldM, oldC, oldR, oldP := heldChunksMax, heldCheckInterval, heldRound, heldRoundPause
+	heldChunksMax, heldCheckInterval, heldRound, heldRoundPause = maxAddrs, check, round, pause
+	return func() { heldChunksMax, heldCheckInterval, heldRound, heldRoundPause = oldM, oldC, oldR, oldP }
+}
+
+// ValidateHeldPass runs one validation pass over the held index, as one tick
+// of the validation worker does.
+func (db *DB) ValidateHeldPass(ctx context.Context) error { return db.validateHeld(ctx) }
+
+// HeldCount returns the number of distinct held addresses.
+func (db *DB) HeldCount() uint64 { return db.held.count() }
+
+// DeleteChunkForTest removes one chunk-store reference, as a crash or a
+// recovery prune might leave a held entry without its chunk.
+func (db *DB) DeleteChunkForTest(ctx context.Context, addr swarm.Address) error {
+	return db.storage.Run(ctx, func(s transaction.Store) error { return s.ChunkStore().Delete(ctx, addr) })
 }

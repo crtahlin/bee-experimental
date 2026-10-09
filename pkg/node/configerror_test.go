@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ethersphere/bee/v2/pkg/log"
 	"github.com/ethersphere/bee/v2/pkg/node"
@@ -125,6 +126,24 @@ func TestPostageConfirmationDepthOutOfRangeIsAConfigError(t *testing.T) {
 	for _, depth := range []uint64{1, 4, 12, listener.MaxConfirmationDepth} {
 		if err := node.ValidatePostageConfirmationDepth(depth); err != nil {
 			t.Fatalf("depth %d: got %v, want accepted", depth, err)
+		}
+	}
+}
+
+// TestPostageStallShutdownValidation checks that a negative
+// postage-stall-shutdown is a configuration error and that 0 (never stop) and
+// positive durations are accepted (#583).
+func TestPostageStallShutdownValidation(t *testing.T) {
+	t.Parallel()
+
+	for _, d := range []time.Duration{-time.Nanosecond, -10 * time.Minute} {
+		if err := node.ValidatePostageStallShutdown(d); !errors.Is(err, node.ErrConfig) {
+			t.Fatalf("%s: got %v, want node.ErrConfig", d, err)
+		}
+	}
+	for _, d := range []time.Duration{0, time.Second, 10 * time.Minute} {
+		if err := node.ValidatePostageStallShutdown(d); err != nil {
+			t.Fatalf("%s: got %v, want accepted", d, err)
 		}
 	}
 }

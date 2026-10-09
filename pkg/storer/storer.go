@@ -732,6 +732,15 @@ type DB struct {
 	logger log.Logger
 	tracer *tracing.Tracer
 
+	// postageSyncHealth holds the postage listener's sync health, which
+	// blocks the radius decrease while the batch store is stale (#583).
+	postageSyncHealth atomic.Pointer[postage.SyncHealth]
+	// radiusHold is radiusDecreaseHold, copied when the store opens so a
+	// test that changes it does not race a running reserve worker.
+	radiusHold time.Duration
+	// held accounts for chunks held while the batch store is stale (#583).
+	held *heldState
+
 	metrics             metrics
 	storage             transaction.Storage
 	multex              *multex.Multex
@@ -924,11 +933,13 @@ func New(ctx context.Context, dirPath string, opts *Options) (*DB, error) {
 
 	clCtx, clCancel := context.WithCancel(ctx)
 	db := &DB{
-		metrics:  metrics,
-		storage:  st,
-		logger:   logger,
-		tracer:   opts.Tracer,
-		baseAddr: opts.Address,
+		held:       newHeldState(),
+		radiusHold: radiusDecreaseHold,
+		metrics:    metrics,
+		storage:    st,
+		logger:     logger,
+		tracer:     opts.Tracer,
+		baseAddr:   opts.Address,
 		shutdownTimeout: func() time.Duration {
 			if opts.ShutdownTimeout > 0 {
 				return opts.ShutdownTimeout
@@ -1015,6 +1026,11 @@ func New(ctx context.Context, dirPath string, opts *Options) (*DB, error) {
 	db.localIngest.limit = opts.LocalIngestLimit
 	db.localIngest.gauge = db.metrics.LocalIngestChunks
 	db.rebuildLocalIngestTotal(ctx)
+
+	// Held chunks survive a restart; their count is rebuilt here, after
+	// recovery, and they are validated once the listener is caught up
+	// (#583).
+	db.rebuildHeldCount()
 
 	db.inFlight.Add(1)
 	go db.cacheWorker(ctx)

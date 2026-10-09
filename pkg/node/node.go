@@ -154,7 +154,11 @@ type Options struct {
 	BlockTimeSet bool
 	// PostageConfirmationDepth is how many blocks behind the chain head postage
 	// events must be before they are applied (#545). At least 1.
-	PostageConfirmationDepth        uint64
+	PostageConfirmationDepth uint64
+	// PostageStallShutdown stops the node once its batch store has been
+	// stale this long (#583). Zero, the default, never stops it: a stale node
+	// stays up in a degraded state.
+	PostageStallShutdown            time.Duration
 	BlockSyncInterval               uint64
 	BootnodeMode                    bool
 	Bootnodes                       []string
@@ -326,6 +330,28 @@ func validatePostageConfirmationDepth(depth uint64) error {
 	return nil
 }
 
+// postageReadyForLottery reports whether the postage state allows playing the
+// storage lottery: the batch store is not stale (#583). A sample taken on a
+// stale batch store can disagree with the neighbourhood and freeze a staked
+// node, so the agent skips the round instead.
+func postageReadyForLottery(l postage.Listener) bool {
+	if h, ok := l.(postage.SyncHealth); ok && h.Stale() {
+		return false
+	}
+	return true
+}
+
+// validatePostageStallShutdown refuses a negative postage-stall-shutdown (#583).
+// Zero means never stop; a positive duration stops the node once its batch
+// store has been stale that long.
+func validatePostageStallShutdown(d time.Duration) error {
+	if d < 0 {
+		return fmt.Errorf("%w: postage-stall-shutdown %s: must be 0 (never stop) or a positive duration",
+			ErrConfig, d)
+	}
+	return nil
+}
+
 // runStakeRecoveryOnStartup optionally recovers stake left in retired staking
 // contracts when the node starts (issue #256). The mode is off (the default,
 // nothing happens), withdraw (recover to the wallet), or migrate (recover into
@@ -478,6 +504,10 @@ func NewBee(
 	}
 
 	if err := validatePostageConfirmationDepth(o.PostageConfirmationDepth); err != nil {
+		return nil, err
+	}
+
+	if err := validatePostageStallShutdown(o.PostageStallShutdown); err != nil {
 		return nil, err
 	}
 
@@ -1062,7 +1092,7 @@ func NewBee(
 		contractGasLimit,
 	)
 
-	eventListener = listener.New(b.syncingStopped, logger, chainBackend, postageStampContractAddress, postageStampContractABI, blockTime, o.PostageConfirmationDepth, postageSyncingStallingTimeout, postageSyncingBackoffTimeout)
+	eventListener = listener.New(b.syncingStopped, logger, chainBackend, postageStampContractAddress, postageStampContractABI, blockTime, o.PostageConfirmationDepth, postageSyncingStallingTimeout, postageSyncingBackoffTimeout, listener.WithStallShutdown(o.PostageStallShutdown))
 	b.listenerCloser = eventListener
 
 	// Construct protocols.
@@ -1222,7 +1252,9 @@ func NewBee(
 		}
 
 		if paused {
-			return nil, errors.New("postage contract is paused")
+			// The same sentinel as a pause seen at runtime, so both stop
+			// with the same exit status (#583).
+			return nil, fmt.Errorf("check postage contract: %w", listener.ErrPostagePaused)
 		}
 
 		// Refuse to start if the last-synced postage block sits ahead of the
@@ -1281,7 +1313,7 @@ func NewBee(
 				if err != nil {
 					syncErr.Store(err)
 					logger.Error(err, "unable to sync batches")
-					b.syncingStopped.Signal() // trigger shutdown in start.go
+					b.syncingStopped.SignalWithError(err) // trigger shutdown in start.go
 				}
 			}()
 		}
@@ -1491,6 +1523,14 @@ func NewBee(
 	pullSyncProtocol := pullsync.New(p2ps, localStore, pssService.TryUnwrap, gsocService.Handle, validStamp, logger, pullsync.DefaultMaxPage, o.PullSyncMaxChunksPerSecond)
 	b.pullSyncCloser = pullSyncProtocol
 
+	// A full node keeps chunks of batches it has not seen yet while its batch
+	// store is stale, so it keeps accepting and serving them (#583). Set
+	// before the protocols are added, so no stream sees the field change.
+	if o.FullNodeMode && !o.BootnodeMode {
+		pushSyncProtocol.SetChunkHolder(localStore)
+		pullSyncProtocol.SetChunkHolder(localStore)
+	}
+
 	retrieveProtocolSpec := retrieval.Protocol()
 	pushSyncProtocolSpec := pushSyncProtocol.Protocol()
 	pullSyncProtocolSpec := pullSyncProtocol.Protocol()
@@ -1603,6 +1643,11 @@ func NewBee(
 		})
 		b.pullerCloser = pullerService
 
+		// While the batch store is stale the reserve worker does not lower the
+		// storage radius (#583).
+		if h, ok := eventListener.(postage.SyncHealth); ok {
+			localStore.SetPostageSyncHealth(h)
+		}
 		// we pass an empty channel since startup synchronization is not needed for production code, only tests.
 		localStore.StartReserveWorker(ctx, pullerService, waitNetworkRFunc, nil)
 		nodeStatus.SetSync(pullerService)
@@ -1653,7 +1698,10 @@ func NewBee(
 			isFullySynced := func() bool {
 				reserveThreshold := reserveCapacity * 5 / 10
 				logger.Debug("Sync status check evaluated", "stabilized", detector.IsStabilized())
-				return localStore.ReserveSize() >= reserveThreshold && syncedWithinThreshold(pullerService.SyncRate(), o.RedistributionSyncRateThreshold, o.ReserveCapacityDoubling) && detector.IsStabilized()
+				// Held chunks are not in the reserve yet, so a sample taken
+				// before they are validated would miss them (#583).
+				return localStore.ReserveSize() >= reserveThreshold && syncedWithinThreshold(pullerService.SyncRate(), o.RedistributionSyncRateThreshold, o.ReserveCapacityDoubling) && detector.IsStabilized() &&
+					postageReadyForLottery(eventListener) && !localStore.HeldPending()
 			}
 
 			agent, err = storageincentives.New(
@@ -1735,8 +1783,14 @@ func NewBee(
 		Steward:         steward,
 		Providers:       providersAPI,
 		SyncStatus:      syncStatusFn,
-		NodeStatus:      nodeStatus,
-		PinIntegrity:    localStore.PinIntegrity(),
+		PostageSyncHealth: func() postage.SyncHealth {
+			if h, ok := eventListener.(postage.SyncHealth); ok {
+				return h
+			}
+			return nil
+		}(),
+		NodeStatus:   nodeStatus,
+		PinIntegrity: localStore.PinIntegrity(),
 	}
 
 	if o.APIAddr != "" {
@@ -1815,6 +1869,12 @@ func NewBee(
 	}
 
 	return b, nil
+}
+
+// StopCause returns why the node stopped on its own, after SyncingStopped
+// fired, or nil when it carried no cause (#583).
+func (b *Bee) StopCause() error {
+	return b.syncingStopped.Err()
 }
 
 func (b *Bee) SyncingStopped() chan struct{} {

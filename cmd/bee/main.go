@@ -11,6 +11,7 @@ import (
 
 	"github.com/ethersphere/bee/v2/cmd/bee/cmd"
 	"github.com/ethersphere/bee/v2/pkg/node"
+	"github.com/ethersphere/bee/v2/pkg/postage/listener"
 )
 
 // exitConfig is the status for a configuration error, EX_CONFIG from
@@ -22,6 +23,13 @@ import (
 // for every other failure so nothing that restarts today stops restarting.
 const exitConfig = 78
 
+// exitTempFail is the status for a stop whose cause may pass, EX_TEMPFAIL from
+// sysexits.h: postage-stall-shutdown reached, or a paused postage contract
+// (#583). Non-zero, so a service manager that restarts on failure restarts the
+// node, and distinct from 1, so an operator can tell a chain-side cause from a
+// crash.
+const exitTempFail = 75
+
 // exitCode maps an error from the command to a process status. Split out from
 // main so it can be tested: the whole point of the status is what systemd does
 // with it, and running the binary to find out is not a unit test.
@@ -31,6 +39,9 @@ func exitCode(err error) int {
 		return 0
 	case errors.Is(err, node.ErrConfig):
 		return exitConfig
+	case errors.Is(err, listener.ErrPostageSyncingStalled),
+		errors.Is(err, listener.ErrPostagePaused):
+		return exitTempFail
 	default:
 		return 1
 	}

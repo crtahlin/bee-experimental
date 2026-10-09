@@ -21,6 +21,7 @@ type metrics struct {
 	Sent                 prometheus.Counter     // number of chunks sent
 	DuplicateRuid        prometheus.Counter     // number of duplicate RUID requests we got
 	LastReceived         *prometheus.CounterVec // last timestamp of the received chunks per bin
+	Held                 prometheus.Counter     // chunks held while the batch store is stale (#583)
 }
 
 func newMetrics() metrics {
@@ -50,6 +51,12 @@ func newMetrics() metrics {
 			Subsystem: subsystem,
 			Name:      "received_zero_address",
 			Help:      "Total chunks delivered with zero address and no chunk data.",
+		}),
+		Held: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "chunks_held",
+			Help:      "Delivered chunks held, not dropped, because their stamp names a batch not seen yet while the batch store is stale (#583).",
 		}),
 		ReceivedInvalidChunk: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: m.Namespace,

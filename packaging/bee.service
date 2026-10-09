@@ -17,7 +17,9 @@ RestartSec=5s
 # naming the bad value under a fresh shutdown sequence each time. Measured on a
 # real node before this: NRestarts reached 11 from one unquoted YAML value.
 # With this, the unit goes to failed and systemctl status says why.
-# Every other failure keeps exiting 1 and keeps restarting (issue #490).
+# Every other failure keeps exiting non-zero and keeps restarting (issue #490):
+# 1 for a fault, 75 for a paused postage contract or postage-stall-shutdown
+# (issue #583).
 RestartPreventExitStatus=78
 
 [Install]

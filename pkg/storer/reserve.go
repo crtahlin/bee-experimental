@@ -58,6 +58,11 @@ func (db *DB) startReserveWorkers(
 	db.inFlight.Add(1)
 	go db.reserveWorker(ctx, ready)
 
+	// Held chunks are validated only with the reserve worker running and
+	// after storer recovery, which New has finished by now (#583).
+	db.inFlight.Add(1)
+	go db.heldValidator(ctx)
+
 	sub, unsubscribe := db.reserveOptions.startupStabilizer.Subscribe()
 	defer unsubscribe()
 
@@ -291,6 +296,15 @@ func (db *DB) reserveWorker(ctx context.Context, ready chan<- struct{}) {
 					return
 				}
 				db.logger.Warning("reserve worker count within radius", "error", err)
+				continue
+			}
+
+			// While the batch store is stale, and for one sync-rate window
+			// after, the radius does not drop: the reserve size is not
+			// reliable while chunks are held, and neither is the sync rate
+			// (#583). A radius increase stays possible.
+			if db.radiusDecreaseBlocked() {
+				db.logger.Debug("reserve radius decrease skipped while the batch store is stale or just recovered", "radius", radius)
 				continue
 			}
 

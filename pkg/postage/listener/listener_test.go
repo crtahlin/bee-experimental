@@ -17,8 +17,10 @@ import (
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+
 	chaincfg "github.com/ethersphere/bee/v2/pkg/config"
 	"github.com/ethersphere/bee/v2/pkg/log"
+	"github.com/ethersphere/bee/v2/pkg/postage"
 	"github.com/ethersphere/bee/v2/pkg/postage/listener"
 	"github.com/ethersphere/bee/v2/pkg/util/abiutil"
 	"github.com/ethersphere/bee/v2/pkg/util/syncutil"
@@ -362,7 +364,9 @@ func TestListener(t *testing.T) {
 		}
 	})
 
-	t.Run("shutdown on stalling", func(t *testing.T) {
+	t.Run("stall marks stale instead of stopping", func(t *testing.T) {
+		defer listener.SetStaleTimings(5*time.Millisecond, time.Hour)()
+
 		ev := newEventUpdaterMock()
 		mf := newMockFilterer(
 			WithBlockNumberError(errors.New("dummy error")),
@@ -381,12 +385,25 @@ func TestListener(t *testing.T) {
 			0,
 		)
 		testutil.CleanupCloser(t, l)
-		<-l.Listen(context.Background(), 0, ev)
 
+		// The startup wait ends when the batch store goes stale, with no
+		// error: the node comes up degraded (#583).
+		select {
+		case err := <-l.Listen(context.Background(), 0, ev):
+			if err != nil {
+				t.Fatalf("startup wait ended with %v, want nil for a stale store", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("startup wait did not end when the batch store went stale")
+		}
+
+		if !l.(postage.SyncHealth).Stale() {
+			t.Fatal("batch store not reported stale after the stall timeout")
+		}
 		select {
 		case <-c.C:
-		case <-time.After(5 * time.Second):
-			t.Fatal("expected shutdown call by now")
+			t.Fatal("a stall stopped the node")
+		case <-time.After(200 * time.Millisecond):
 		}
 	})
 
@@ -422,6 +439,9 @@ func TestListener(t *testing.T) {
 		case <-c.C:
 		case <-time.After(time.Second * 5):
 			t.Fatal("expected shutdown call by now")
+		}
+		if c.Err() == nil {
+			t.Fatal("the stop carries no cause")
 		}
 	})
 }

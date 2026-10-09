@@ -61,6 +61,10 @@ var (
 	ErrOutOfDepthStoring = errors.New("storing outside of the neighborhood")
 	ErrWarmup            = errors.New("node warmup time not complete")
 	ErrShallowReceipt    = errors.New("shallow receipt")
+	// ErrChunkHeld answers a pushed chunk this node holds pending stamp
+	// validation while its batch store is stale. No receipt is sent: the
+	// chunk may turn out to be invalid (#583).
+	ErrChunkHeld = errors.New("pushsync: batch not known yet, chunk held")
 )
 
 type PushSyncer interface {
@@ -94,10 +98,13 @@ type PushSync struct {
 	metrics        metrics
 	tracer         *tracing.Tracer
 	validStamp     postage.ValidStampFn
-	signer         crypto.Signer
-	fullNode       bool
-	errSkip        *skippeers.List
-	stabilizer     stabilization.Subscriber
+	// holder keeps chunks of batches not seen yet while the batch store is
+	// stale (#583). Nil refuses them as before.
+	holder     postage.ChunkHolder
+	signer     crypto.Signer
+	fullNode   bool
+	errSkip    *skippeers.List
+	stabilizer stabilization.Subscriber
 
 	shallowReceiptTolerance uint8
 	capacityDoubling        uint8
@@ -109,6 +116,12 @@ type receiptResult struct {
 	peer     swarm.Address
 	receipt  *pb.Receipt
 	err      error
+}
+
+// SetChunkHolder lets push-sync hold chunks of batches the node has not seen
+// yet while its batch store is stale (#583).
+func (ps *PushSync) SetChunkHolder(h postage.ChunkHolder) {
+	ps.holder = h
 }
 
 func New(
@@ -272,6 +285,20 @@ func (ps *PushSync) handler(ctx context.Context, p p2p.Peer, stream p2p.Stream) 
 
 		chunkToPut, err := ps.validStamp(chunk)
 		if err != nil {
+			// While the batch store is stale, a chunk of a batch this node
+			// has not seen yet is held and served, but never receipted: a
+			// receipt promises storage and the chunk may be invalid. The
+			// error sends the uploader on to another storer (#583).
+			if ps.holder != nil && postage.HoldsUnvalidated(err) {
+				res, herr := ps.holder.HoldUnvalidated(ctx, chunk, err)
+				if res.Held() {
+					ps.metrics.Held.Inc()
+					return ErrChunkHeld
+				}
+				if herr != nil {
+					err = errors.Join(err, herr)
+				}
+			}
 			return fmt.Errorf("invalid stamp: %w", err)
 		}
 

@@ -186,6 +186,14 @@ func (c *command) initStartCmd() (err error) {
 				return err
 			}
 
+			// A node that stopped on its own carries the cause, so the exit
+			// status says why instead of reporting success (#583).
+			if val := beeNode.Load(); val != nil {
+				if cause := val.(*node.Bee).StopCause(); cause != nil {
+					return fmt.Errorf("node stopped: %w", cause)
+				}
+			}
+
 			return nil
 		},
 		PreRunE: func(cmd *cobra.Command, args []string) error {
@@ -386,6 +394,7 @@ func buildBeeNode(ctx context.Context, c *command, cmd *cobra.Command, logger lo
 		BlockTime:                       networkConfig.blockTime,
 		BlockTimeSet:                    c.config.IsSet(optionNameBlockTime) && blockTime != 0,
 		PostageConfirmationDepth:        c.config.GetUint64(optionNamePostageConfirmationDepth),
+		PostageStallShutdown:            c.config.GetDuration(optionNamePostageStallShutdown),
 		BlockSyncInterval:               c.config.GetUint64(optionNameBlockSyncInterval),
 		BootnodeMode:                    bootNode,
 		Bootnodes:                       networkConfig.bootNodes,

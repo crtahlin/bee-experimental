@@ -8,6 +8,7 @@ import (
 	"context"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/ethersphere/bee/v2/pkg/api"
 	"github.com/ethersphere/bee/v2/pkg/jsonhttp/jsonhttptest"
@@ -74,7 +75,6 @@ func TestGetStatus(t *testing.T) {
 			jsonhttptest.WithExpectedJSONResponse(ssr),
 		)
 	})
-
 }
 
 // TestGetStatusPeersIncludesBootnodes is a regression test for
@@ -149,3 +149,61 @@ func (m *statusSnapshotMock) NeighborhoodsStat(ctx context.Context) ([]*storer.N
 	return m.neighborhoods, nil
 }
 func (m *statusSnapshotMock) CommittedDepth() uint8 { return m.committedDepth }
+
+// staleHealthMock reports a stale batch store.
+type staleHealthMock struct{}
+
+func (staleHealthMock) Stale() bool                  { return true }
+func (staleHealthMock) SinceProgress() time.Duration { return 90 * time.Second }
+func (staleHealthMock) StaleEndedAt() time.Time      { return time.Time{} }
+func (staleHealthMock) CaughtUp() bool               { return false }
+
+// TestGetStatusPostageSyncStale checks that /status reports a stale batch
+// store for the local node, and leaves the fields out when nothing reports
+// sync health (#583).
+func TestGetStatusPostageSyncStale(t *testing.T) {
+	t.Parallel()
+
+	newStatus := func() *status.Service {
+		ssMock := &statusSnapshotMock{chainState: &postage.ChainState{}}
+		svc := status.NewService(log.Noop, nil, new(topologyPeersIterNoopMock), api.FullMode.String(), ssMock, ssMock, nil)
+		svc.SetSync(ssMock)
+		return svc
+	}
+
+	t.Run("stale", func(t *testing.T) {
+		t.Parallel()
+
+		client, _, _, _ := newTestServer(t, testServerOptions{
+			BeeMode:           api.FullMode,
+			NodeStatus:        newStatus(),
+			PostageSyncHealth: staleHealthMock{},
+		})
+		var got api.StatusSnapshotResponse
+		jsonhttptest.Request(t, client, http.MethodGet, "/status", http.StatusOK,
+			jsonhttptest.WithUnmarshalJSONResponse(&got),
+		)
+		if got.PostageSyncStale == nil || !*got.PostageSyncStale {
+			t.Fatalf("postageSyncStale %v, want true", got.PostageSyncStale)
+		}
+		if got.PostageSecondsSinceProgress == nil || *got.PostageSecondsSinceProgress != 90 {
+			t.Fatalf("postageSecondsSinceProgress %v, want 90", got.PostageSecondsSinceProgress)
+		}
+	})
+
+	t.Run("no sync health", func(t *testing.T) {
+		t.Parallel()
+
+		client, _, _, _ := newTestServer(t, testServerOptions{
+			BeeMode:    api.FullMode,
+			NodeStatus: newStatus(),
+		})
+		var got api.StatusSnapshotResponse
+		jsonhttptest.Request(t, client, http.MethodGet, "/status", http.StatusOK,
+			jsonhttptest.WithUnmarshalJSONResponse(&got),
+		)
+		if got.PostageSyncStale != nil || got.PostageSecondsSinceProgress != nil {
+			t.Fatal("postage sync fields reported without a sync health source")
+		}
+	})
+}

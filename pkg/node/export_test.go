@@ -16,6 +16,8 @@ var (
 	ErrNetworkRadiusUnknown          = errNetworkRadiusUnknown
 	RunStakeRecoveryOnStartup        = runStakeRecoveryOnStartup
 	ValidatePostageConfirmationDepth = validatePostageConfirmationDepth
+	ValidatePostageStallShutdown     = validatePostageStallShutdown
+	PostageReadyForLottery           = postageReadyForLottery
 )
 
 // NewTestBeeWithClosers builds a Bee with only the push-sync and retrieval
