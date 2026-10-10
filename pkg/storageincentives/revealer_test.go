@@ -212,10 +212,20 @@ func (c *fakeContract) counts() (commits, reveals int) {
 	return c.commits, c.reveals
 }
 
-// failingSyncStore fails synced writes.
-type failingSyncStore struct{ storage.StateStorer }
+// failingSyncStore fails the first synced write only, so a commit that
+// ignored the failed key write would get through its later writes.
+type failingSyncStore struct {
+	storage.StateStorer
+	failed bool
+}
 
-func (failingSyncStore) PutSync(string, any) error { return errors.New("disk full") }
+func (s *failingSyncStore) PutSync(key string, obj any) error {
+	if !s.failed {
+		s.failed = true
+		return errors.New("disk full")
+	}
+	return s.StateStorer.PutSync(key, obj)
+}
 
 type revealFixture struct {
 	store    storage.StateStorer
@@ -314,7 +324,7 @@ func TestCommitKeyStoredBeforeSend(t *testing.T) {
 func TestCommitKeyWriteFails(t *testing.T) {
 	t.Parallel()
 
-	f := newRevealFixture(t, failingSyncStore{mock.NewStateStore()}, newFakeChain(13), newFakeTxs())
+	f := newRevealFixture(t, &failingSyncStore{StateStorer: mock.NewStateStore()}, newFakeChain(13), newFakeTxs())
 	const round = 1
 	f.setSample(round)
 	sample, _ := f.state().SampleData(round - 1)
@@ -891,4 +901,85 @@ func TestEarlyRevealGivesUp(t *testing.T) {
 		}
 		_ = f.revealer.Close()
 	})
+}
+
+// A revealed round sends nothing more, even with no listed reveal hash
+// (a reveal recorded before the hashes were kept).
+func TestRevealSkipsWhenRevealed(t *testing.T) {
+	t.Parallel()
+
+	f := revealFixtureInRevealPhase(t)
+	f.state().SetHasRevealed(1)
+	if done, err := f.revealer.Reveal(context.Background(), 1); !done || err != nil {
+		t.Fatalf("done %v err %v", done, err)
+	}
+	if _, reveals := f.contract.counts(); reveals != 0 {
+		t.Fatal("revealed twice")
+	}
+}
+
+// A stop during an early reveal waits for it instead of cancelling it
+// (test 11).
+func TestWaitCoversEarlyReveal(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		f := revealFixtureInRevealPhase(t)
+		f.state().SetCurrentBlock(f.chain.block())
+		f.restart(t)
+		release := make(chan struct{})
+		f.contract.revealResult = func(context.Context, common.Hash) error { <-release; return nil }
+
+		f.revealer.StartEarlyReveal()
+		synctest.Wait() // the early reveal is sending
+
+		waited := make(chan error, 1)
+		go func() { waited <- f.revealer.Wait(context.Background()) }()
+		synctest.Wait()
+		select {
+		case <-waited:
+			t.Fatal("the stop did not wait for the early reveal")
+		default:
+		}
+		close(release)
+		if err := <-waited; err != nil {
+			t.Fatal(err)
+		}
+		if _, reveals := f.contract.counts(); reveals != 1 || !f.state().HasRevealed(1) {
+			t.Fatalf("reveals %d, revealed %v", reveals, f.state().HasRevealed(1))
+		}
+		if st, _ := f.state().Status(); st.RevealMissedOnStop != 0 {
+			t.Fatal("counted as missed")
+		}
+		_ = f.revealer.Close()
+	})
+}
+
+// Pending is read by the API at any time, while the agent commits: it
+// takes commitGate, so the race detector sees no unguarded access.
+func TestPendingConcurrentWithCommits(t *testing.T) {
+	t.Parallel()
+
+	f := newRevealFixture(t, mock.NewStateStore(), newFakeChain(13), newFakeTxs())
+	f.state().SetCurrentBlock(13)
+	f.contract.commitResult = func(context.Context, common.Hash) error {
+		return fmt.Errorf("x: %w", transaction.ErrNotBroadcast) // clears the mark
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for round := uint64(1); round <= 200; round++ {
+			_ = f.revealer.beginCommit(round, []byte("key"))
+			f.revealer.endCommit(round, transaction.ErrNotBroadcast)
+		}
+	}()
+	for {
+		select {
+		case <-done:
+			return
+		default:
+			_, _, _ = f.revealer.Pending()
+		}
+	}
 }
