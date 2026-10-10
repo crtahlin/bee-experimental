@@ -23,7 +23,7 @@ What wasp does today (verified by reading `origin/main`, 55f72b44c):
 
 1. **The key is stored only after the commit receipt.** `commit()` (`agent.go:610-633`) makes the key in memory, sends the commit and waits for its receipt, and only then calls `SetCommitKey`. A stop or crash between sending and storing loses the key; the commit can still be mined, and then the node can never reveal: a certain 9-day freeze. The receipt wait is typically one to a few blocks.
 2. **Shutdown cuts the reveal's dependencies before the agent.** In `Bee.Shutdown` (`pkg/node/node.go:1917-2025`):
-   - `b.ctxCancel()` (`:1987`) cancels the node context first; it stops chain-endpoint failover recovery and the block-time watcher (`watchBlockTime`, `:757`), both of which run on it.
+   - The node context is already cancelled when `Shutdown` runs: the first signal cancels it in `lifecycle.stop` (`l.cancel()`). That stops chain-endpoint failover recovery and the block-time watcher (`watchBlockTime`, `:757`); for a wait of a few minutes this is harmless (the chain client keeps its current endpoint, and the block time is the last value read), so `b.ctxCancel()` (`:1987`) is left where it is.
    - The transaction monitor is closed at `:1996`; a receipt wait then fails with `ErrMonitorClosed`.
    - The chain client is closed at `:2011` (`ethClientCloser`).
    - Only then the agent (`:2017`) and the localstore (`:2020`).
@@ -33,7 +33,7 @@ What wasp does today (verified by reading `origin/main`, 55f72b44c):
 4. **After a restart the reveal can still be sent, but only if the node is back in time.** The key and sample are persisted with the redistribution state in the state store (`redistributionstate.go:113-118`, `SetCommitKey` `:271-280`). On start the agent runs `phaseCheck` at once (`agent.go:253`) and, if the round is in its reveal phase, `handleReveal` uses the stored key; `handleReveal` checks no sync or health gate. But the agent is created late in the build (`node.go` around `:1711`), after the chain sync wait (`:850`), the store open and the postage catch-up (`batchSvc.Start`, `:1305`). A restart longer than the remaining reveal phase (at most about 190 s, about 76 s after #540) misses it.
 5. **systemd stops the process after 90 s.** `packaging/bee.service` sets no `TimeoutStopSec`, so systemd's default applies, then SIGKILL. systemd sends one SIGTERM, so the lifecycle's "second signal exits" (`lifecycle.go:129-133`) helps only at a terminal.
 
-6. **A late commit can lose its key with no stop at all.** The reveal phase cancels the commit handler's context (`agent.go:157`, `phaseEvents.Cancel(commit, sample)`). A commit sent near the end of the commit phase whose receipt has not arrived returns an error (`:179-183`); the key, kept only in memory, is dropped, and the mined commit can never be revealed.
+6. **A late commit can lose its key with no stop at all.** The reveal phase cancels the commit handler's context (`agent.go:153`, `phaseEvents.Cancel(commit, sample)` in the reveal handler). A commit sent near the end of the commit phase whose receipt has not arrived returns an error (`:179-183`); the key, kept only in memory, is dropped, and the mined commit can never be revealed.
 
 The same code is on upstream `master` (`agent.go:556` stores the key after the receipt; `node.go:1573-1593` closes the monitor and the chain client before the agent), so this likely affects upstream; the label waits for a reproduction test on the upstream tree.
 
@@ -42,32 +42,35 @@ The same code is on upstream `master` (`agent.go:556` stores the key after the r
 ### 0. One state, one reveal (needed by everything below)
 
 - **One `RedistributionState` per node.** Today the agent builds its own (`agent.go:115`). Two instances would each write the whole status blob (`redistributionstate.go:113-118`) and overwrite each other: for example `SetCurrentBlock` (`agent.go:203`) would erase another instance's `HasRevealed`, and `handleClaim` would then skip a won claim (`:360-363`). The node builds the state once, early (section 3), and injects it into the agent (`storageincentives.New` takes it as a parameter).
-- **One reveal at a time.** A per-round single-flight `revealOnce(round)` on the shared state, taken by `handleReveal`, the stop wait and the early-reveal path. Under it, `HasRevealed(round)` is re-checked first, and a reveal whose transaction is still pending is not sent again (section 1, pending store check).
+- **One revealer.** A `Revealer` object built with the shared state owns every reveal: `handleReveal`, the stop wait and the early-reveal path all call `Revealer.Reveal(ctx, round)`, a per-round single-flight. Under it, `HasRevealed(round)` is re-checked first, then `RevealTx` (section 1): a reveal that was broadcast is never sent again, only its receipt is awaited.
+- **`RevealGuard` lives on the `Revealer`, not on the agent,** so it exists from the moment the shared state is built (section 3), before the agent; `Shutdown` uses it whether or not the agent was ever created.
 
 ### 1. The commit key: stored before the send, with an explicit state
 
-Per round, `RoundData` gains `CommitTx` (the commit transaction hash, empty until known) next to `CommitKey`.
+Per round, `RoundData` gains `CommitTx` and `RevealTx` (the transaction hashes, empty until known) next to `CommitKey` and `HasRevealed`.
 
-1. `commit()` stores the key with `CommitTx` empty **before** `contract.Commit`. The store write must succeed: `SetCommitKey` returns its error instead of only logging it (today `save()` logs, `redistributionstate.go:113-118`), and on error the commit is not sent. The write is synced to disk (a synced `Put`, or a sync of the state store after it), so a power loss after the send cannot lose it.
+1. `commit()` stores the key with `CommitTx` empty **before** `contract.Commit`. The store write must succeed: `SetCommitKey` returns its error instead of only logging it (today `save()` logs, `redistributionstate.go:113-118`), and on error the commit is not sent. The write is synced to disk, so a power loss after the send cannot lose it. Plumbing: the state store is the leveldb store wrapped in a cache (`cache.Wrap`, in the node's state-store construction); `storage.StateStorer` gains a `PutSync(key, value)` (leveldb `WriteOptions{Sync: true}`; the cache writes through), implemented by the mock state store as a plain `Put`.
 2. After `Send` returns a hash, `CommitTx` is stored.
 3. **Errors:**
-   - `Send` failed **before broadcast** (signing, gas estimation, nonce, balance, the `SendTransaction` RPC returning a definite rejection): the key is removed; nothing was broadcast.
-   - `Send` failed in a way that may have broadcast (a timeout or a lost connection on `SendTransaction`; `sendAndWait` returns a zero hash for every `Send` error, `redistribution.go:229-231`): the key is **kept** with `CommitTx` empty.
+   - `Send` failed **before broadcast** (signing, gas estimation, nonce, balance, or a `SendTransaction` error the node knows was not delivered): the key is removed. `sendAndWait` returns a zero hash for every `Send` error (`redistribution.go:229-231`), so the transaction service returns a typed `ErrNotBroadcast` for errors raised before `SendTransaction` and for `SendTransaction` errors that `isTransportFailure` (`pkg/transaction/failover/classify.go:25`) does not classify as "may have reached the endpoint"; only `ErrNotBroadcast` removes the key.
+   - Any other `Send` error may have broadcast: the key is **kept** with `CommitTx` empty.
    - The commit was mined and **reverted** (`:238`): the key is removed and the round is not played.
    - The receipt wait failed (context cancelled at the reveal phase, monitor closed): the key and `CommitTx` are kept.
-4. **The transaction service records a transaction as pending only after `SendTransaction` returns** (`pkg/transaction/transaction.go:200-224`). So a key with an empty `CommitTx` cannot be checked against the pending store; it is treated as "possibly committed": the reveal is attempted, and if the commit never landed the contract reverts the reveal (gas only, no freeze). A key with a `CommitTx` is checked against its receipt after a restart: reverted or not found after the reveal phase starts means no reveal.
-5. `handleCommit`'s `exists` check (`agent.go:277`) now also sees a key stored before the send, so a second commit in the same round is never sent, also after a restart.
+4. **The transaction service records a transaction as pending only after `SendTransaction` returns** (`pkg/transaction/transaction.go:200-224`). So a key with an empty `CommitTx` cannot be checked against the pending store; it is treated as "possibly committed": the reveal is attempted, and if the commit never landed the contract reverts the reveal (gas only, no freeze).
+5. **After a restart, a key with a `CommitTx` is checked against its receipt, and the reveal is skipped only on a definite answer:** a mined receipt with status reverted, or "not found" from a backend that `transaction.IsSynced` reports synced, after the reveal phase has started. Any lookup error, or an unsynced backend, means "reveal": a wasted reveal costs gas, a skipped one costs a freeze.
+6. **The reveal transaction:** `RevealTx` is stored as soon as `Send` returns its hash (synced write). A reveal is re-sent only if `RevealTx` is empty (never broadcast, or `ErrNotBroadcast`); otherwise the `Revealer` waits on the stored hash's receipt. `HasRevealed` is set on its successful receipt, as today.
+7. `handleCommit`'s `exists` check (`agent.go:277`) now also sees a key stored before the send, so a second commit in the same round is never sent, also after a restart.
 
 ### 2. A stop waits for a pending reveal
 
-**Interface.** The agent exposes `RevealGuard`: `Pending() (round, deadlineBlock uint64, ok bool)` and `Wait(ctx) error`. `Bee.Shutdown` gets a context (section 2b) and calls `Wait` at the point below. Nothing else in shutdown depends on the agent.
+**Interface.** The `Revealer` (section 0) exposes `RevealGuard`: `Pending() (round, deadlineBlock uint64, ok bool)` and `Wait(ctx) error`. `Bee.Shutdown` changes to `Shutdown(ctx context.Context) error`; `runningNode` and its callers follow, and the deferred `Shutdown` on a build error (`node.go:566`) passes a context with a bound (the reveal-phase deadline, if a reveal is pending). Nothing else in shutdown depends on the agent.
 
 **Order in `Bee.Shutdown`** (pulled out into a function that takes the steps as values, so the order is testable, like `shutdownClosers()`):
 
-1. **Refuse new commits** (`commitLock` taken; `shuttingDown` set). A commit already sending is allowed to finish its send and store `CommitTx`; no new commit starts.
+1. **Refuse new commits:** an atomic `shuttingDown` flag is set. `handleCommit` checks it under its own `commitLock` before storing a key, so a commit already past that check finishes its send and stores `CommitTx`, and no new commit starts. `Shutdown` takes no agent lock.
 2. API, then the closers that run today in parallel, then p2p and the price oracle, as today.
 3. **The localstore, closed concurrently with the wait**, not after it: the reveal and the phase checks read only the state store and values in memory (verified: `reserve.go:703`, `held.go:255`, `salud.go:257`), so the clean stop of #710 runs alongside.
-4. **The wait**, if `Pending` is ok. Kept alive until it ends: the agent goroutine, the transaction service and its monitor, the chain client, the wallet signer, the state store, and a **wait context** derived from the shutdown context, not from `b.ctx`. Because `ctxCancel` (`:1987`) also stops chain-endpoint failover recovery and the block-time watcher, `ctxCancel` moves after the wait; the other closers already cancel their own work.
+4. **The wait**, if `Pending` is ok. Kept alive until it ends: the `Revealer`, the transaction service and its monitor, the chain client, the wallet signer and the state store. The wait runs on the shutdown context, not on `b.ctx` (already cancelled, see Problem 2). **An early reveal in progress (section 3) is waited for, not cancelled:** it is the `Revealer`'s reveal, and `Wait` covers it.
 5. Then, as today: transaction monitor, chain client, listener and postage service, the rest, the state store last.
 
 **The wait.**
@@ -76,7 +79,9 @@ Per round, `RoundData` gains `CommitTx` (the commit transaction hash, empty unti
 - **Bound:** the agent's own claim-phase cancel (`agent.go:163`), which ends `WaitForReceipt` (it waits on its context only, `transaction.go:415-430`). So the wait ends at the receipt or at the start of the claim phase, whichever comes first; there is no separate receipt timeout.
 - A Warning when the wait starts ("stop waits for the storage-lottery reveal of round R; up to block B"), and an Info line when it ends (revealed, or the reveal was missed).
 
-**2b. The second signal.** `lifecycle.stop` returns on the second interrupt (`lifecycle.go:130-132`) while `Shutdown` still runs, so today the state store is never closed. The second signal now cancels the shutdown context: the wait returns at once, and `Shutdown` continues to close everything, the state store included, before the process exits.
+**2b. Signals.** `lifecycle.stop` returns on the second interrupt (`lifecycle.go:130-132`) while `Shutdown` still runs, so today the state store is never closed. New behaviour:
+- **Second signal:** cancels the shutdown context. The wait returns at once and `Shutdown` continues to close everything, the state store included.
+- **Third signal, or the remaining close running longer than 30 s after the second:** `stop` returns and the process exits at once, keeping #710's escape for a close that hangs (for example a commit stuck in a pebble write stall).
 
 **Windows service and containers.**
 - The Windows service manager has its own stop timeout (to check on a Windows build); there the wait is best effort.
@@ -86,7 +91,8 @@ Per round, `RoundData` gains `CommitTx` (the commit transaction hash, empty unti
 
 - Built right after the chain client, transaction service and state store exist (around `node.go:729-760`). It needs the redistribution contract's address and ABI, which move up from where they are read today (`chainCfg`, around `:860`).
 - **Check that the chain backend is synced** (`transaction.IsSynced`, as `:842-857` does) before trusting the block number for the phase; if not synced, wait for it within the reveal phase.
-- Runs in its own goroutine with its own context, cancelled by `Shutdown`, and is **registered in `b` before any later error return** in the build, so the deferred `Shutdown` on a build error (`node.go:566`) still waits for it or cancels it.
+- Runs in its own goroutine on its own context, as part of the `Revealer`, which is **registered in `b` before any later error return** in the build, so the deferred `Shutdown` on a build error (`node.go:566`) waits for it through `RevealGuard`.
+- **While the backend is not synced,** the phase is estimated from the persisted last block (`Status.Block`) plus the elapsed time divided by the last known block time; the path keeps polling `IsSynced` and gives up once that estimate is past the reveal phase. Only a synced block number is used to send.
 - Uses the shared state (section 0) and `revealOnce`; the agent, when it starts, sees `HasRevealed` and does not reveal again.
 - Never commits.
 
@@ -112,17 +118,19 @@ No wire change: the contract calls are the same; only their timing and persisten
 3. **Key write fails:** the commit is not sent.
 4. **Pre-broadcast error removes the key; a possibly-broadcast error keeps it; a reverted commit removes it.**
 5. **No second commit** in a round with a stored key, also after a restart.
-6. **Shutdown order** (on the extracted ordering function): new commits refused first; the localstore closes concurrently with the wait; the monitor, chain client and `ctxCancel` come after the wait; the state store last. On unmodified code the monitor and chain client close before any wait (reproduction).
+6. **Shutdown order** (on the extracted ordering function): new commits refused first; the localstore closes concurrently with the wait; the monitor and chain client come after the wait; the state store last. On unmodified code the monitor and chain client close before any wait (reproduction).
 7. **The wait:** commit at block 2, stop at block 3; the reveal is sent at block 38; a reveal failing once is retried at the next block; the wait ends at the claim phase with `revealMissedOnStop` persisted as 1.
 8. **No pending reveal, no wait.**
-9. **Second signal:** the wait returns at once and the state store is closed (asserted).
+9. **Signals:** the second signal ends the wait and the state store is closed (asserted); a third signal, or a hung close 30 s after the second, exits at once.
 10. **Shutdown during a commit's send:** the send completes and its `CommitTx` is stored; no new commit starts.
-11. **One reveal:** the early path and the agent race on the same round; exactly one reveal is sent and `HasRevealed` survives the agent's `SetCurrentBlock`.
+11. **One reveal:** the early path and the agent race on the same round; exactly one reveal is sent and `HasRevealed` survives the agent's `SetCurrentBlock`. A stop during the early reveal waits for it.
+15. **Reveal not re-sent:** a stored `RevealTx` with no receipt yet; after a restart the `Revealer` waits on it and sends nothing.
+16. **Skip only on a definite answer:** reverted commit receipt, and not-found from a synced backend, skip; a lookup error and an unsynced backend reveal.
 12. **Early reveal:** backend not synced at first, then synced; the reveal is sent before the postage catch-up; a build error after it is registered does not leak the goroutine.
 13. **API:** the two fields and the persisted counts; old fields unchanged.
 14. **Setting off:** no wait; sections 0, 1 and 3 still apply.
 
-Mutation checks (each must fail a test): key stored after the receipt again; key removed on a possibly-broadcast error; key-write error ignored; `exists` ignored after a restart; wait removed; monitor or chain client closed before the wait; `ctxCancel` before the wait; localstore closed after the wait; reveal not retried; second signal not reaching `Shutdown`; commits not refused after shutdown starts; `revealOnce` not re-checking `HasRevealed`; two state instances; early reveal without the sync check; `revealPending` always false.
+Mutation checks (each must fail a test): key stored after the receipt again; key removed on a possibly-broadcast error; key-write error ignored; `exists` ignored after a restart; wait removed; monitor or chain client closed before the wait; localstore closed after the wait; early reveal cancelled instead of awaited on stop; a broadcast reveal re-sent; skip on a lookup error; reveal not retried; second signal not reaching `Shutdown`; third signal not exiting; commits not refused after shutdown starts; `revealOnce` not re-checking `HasRevealed`; two state instances; early reveal without the sync check; `revealPending` always false.
 
 ## Measurement
 
