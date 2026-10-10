@@ -513,15 +513,24 @@ func (a *Agent) handleSample(ctx context.Context, round uint64) (bool, error) {
 	return true, nil
 }
 
+// sampleFlightKey keys the sample singleflight by anchor, depth and kind:
+// a lottery sample and an /rchash call with the round's salt must not
+// merge, because they pause eviction differently (wasp #659).
+func sampleFlightKey(ctx context.Context, anchor []byte, depth uint8) string {
+	return fmt.Sprintf("%x_%d_%t", anchor, depth, storer.IsLotterySample(ctx))
+}
+
 type sampleResult struct {
 	Items []storer.SampleItem
 	Hash  swarm.Address
 }
 
 // reserveSampleAndHash runs getPreviousRoundTime, ReserveSample, and sampleHash
-// as a singleflight keyed by anchor and depth to deduplicate concurrent calls.
+// as a singleflight keyed by anchor, depth and kind to deduplicate concurrent
+// calls. The kind keeps a lottery sample from merging with an /rchash call
+// that uses the round's salt: they pause eviction differently (wasp #659).
 func (a *Agent) reserveSampleAndHash(ctx context.Context, anchor []byte, depth uint8) (sampleResult, error) {
-	key := fmt.Sprintf("%x_%d", anchor, depth)
+	key := sampleFlightKey(ctx, anchor, depth)
 
 	res, _, err := a.sampleFlight.Do(ctx, key, func(ctx context.Context) (sampleResult, error) {
 		timeLimiter, err := a.getPreviousRoundTime(ctx)
@@ -561,7 +570,9 @@ func (a *Agent) makeSample(ctx context.Context, committedDepth uint8) (SampleDat
 		return SampleData{}, err
 	}
 
-	res, err := a.reserveSampleAndHash(ctx, salt, committedDepth)
+	// The lottery's sample pauses eviction for its whole duration; other
+	// samples, such as /rchash, share a bounded budget (wasp #659).
+	res, err := a.reserveSampleAndHash(storer.WithLotterySample(ctx), salt, committedDepth)
 	if err != nil {
 		return SampleData{}, err
 	}

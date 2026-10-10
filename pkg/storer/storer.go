@@ -812,6 +812,14 @@ type DB struct {
 	samplingCount     int
 	samplingSince     time.Time // when samplingCount last went from 0 to 1
 	samplingCapWarned bool      // the cap Warning was logged this stretch
+	// otherSamplingCount and pauseBudget are the samples other than the
+	// lottery's and the waited time they used (#659); samplingCount
+	// and samplingSince above count lottery samples only.
+	otherSamplingCount int
+	pauseBudget        pauseBudget
+	// progress is the eviction run in progress, for the progress line and
+	// gauges (#626).
+	progress evictionRunProgress
 	// evictionMu is held across one eviction round and one radius step, so
 	// a sample can wait for the one in progress (#649).
 	evictionMu sync.Mutex

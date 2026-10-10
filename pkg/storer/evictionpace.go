@@ -243,6 +243,7 @@ func (db *DB) evictionHooks(ctx context.Context, expired bool, expiry <-chan str
 		After: func(n int, took time.Duration) {
 			counter.Add(float64(n))
 			db.metrics.ReserveSize.Set(float64(db.reserve.Size()))
+			db.progressRound(n)
 			if db.evictionPacer != nil {
 				db.evictionPacer.observe(n, took)
 			}
