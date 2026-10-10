@@ -142,6 +142,12 @@ func New(
 	snapshotLoaded := false
 	if snapshot != nil {
 		if err := bs.loadSnapshot(ctx, snapshot); err != nil {
+			// A stop during the replay is not a failed snapshot: keep what was
+			// replayed (the chain state marks where the next start resumes) and
+			// let the build take its error path, which closes the store (#759).
+			if ctx.Err() != nil {
+				return nil, false, err
+			}
 			logger.Error(err, "failed to start batch service from snapshot, continuing outside snapshot block...")
 			// A partial replay may have written to (and dirtied) the store, so
 			// reset it again to rebuild cleanly from the chain during live sync.
