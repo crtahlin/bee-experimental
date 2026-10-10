@@ -37,28 +37,28 @@ The stuck run was the **first** one after the restart. There `prevRadius` is 0 a
    - `bee_puller_on_change_duration_seconds`, a histogram of completed runs (buckets 0.1 s to 3,600 s);
    - `bee_puller_cursor_requests_failed_total{reason="timeout"|"error"}`, both labels created at start. A timeout is `cctx.Err() == context.DeadlineExceeded` on the request's own context; when the puller's context has ended (shutdown) the failure is counted as neither;
    - an **info** line naming the peer (overlay) whose cursors request timed out, with the timeout, at most once per peer per 10 minutes;
-   - **a goroutine dump** written to the log at warning level when a run has been in progress for more than 2 minutes, once per run, so a blocked run shows where it waits (path 2 or path 3 above).
+   - **a goroutine dump** when a run has been in progress for more than 2 minutes, once per run, so a blocked run shows where it waits (path 2 or path 3 above). The check runs in a separate watcher goroutine started with the puller, which reads the start gauge's value every 10 seconds, because `onChange` itself is the code that is blocked. The dump is the pprof goroutine profile with `debug=1` (stacks grouped by count), written to a file in the node's data directory (`puller-blocked-<unix time>.txt`, at most 3 kept), and the warning line gives its path; the log does not carry the dump itself.
 5. **No wire change** (rule 6) and no setting: `cursorsTimeout` and the 2-minute dump threshold are constants, like `recalcPeersDur`. Tests lower them through package variables.
 
 ## Tests
 
-1. **Reproduction, `TestRecalcNotBlockedBySilentPeer`, portable to upstream.** It uses only what upstream has: the kademlia mock with `WithEachPeerRevCalls` and `Trigger()` to drive recalculations, and a test-local `pullsync.Interface` stub. The stub's `GetCursors` blocks until its context ends for peer A and answers at once for peer B, and counts its calls per peer with atomics. The test triggers a recalculation, waits for B's first `GetCursors`, triggers a second one, and asserts **lock-free** that B's `GetCursors` count reaches at least 2 (a second recalculation ran) within a generous deadline, polling. No assertion takes `syncPeersMtx`: on unmodified code the first run holds it forever, so a test that took it would hang instead of failing. The timeout is set through a per-tree shim in the test's own file: on wasp a package variable, on the upstream tree (where none exists) the shim is absent and the test fails on the deadline with "second recalculation did not run", which is the reproduction.
+1. **Reproduction, `TestRecalcNotBlockedBySilentPeer`, portable to upstream.** It uses only what upstream has: the kademlia mock with `WithEachPeerRevCalls` and `Trigger()` to drive recalculations, and a test-local `pullsync.Interface` stub. The stub's `GetCursors` blocks until its context ends for peer A and answers at once for peer B, and counts its calls per peer with atomics. The test triggers a recalculation, waits for A's first `GetCursors`, then triggers further recalculations, and asserts **lock-free** on **peer A's** call count: B gets its cursors in the first run and is never asked again, so only A's count shows whether a later recalculation ran. On fixed code A's count reaches **at least 2** within a generous deadline, polling; on unmodified code it stays **exactly 1**, because the first run never returns. No assertion takes `syncPeersMtx`: on unmodified code the first run holds it forever, so a test that took it would hang instead of failing. The timeout is set through a per-tree shim in the test's own file: on wasp a package variable, on the upstream tree (where none exists) the shim is absent and the test fails on its deadline with "peer A asked 1 time, want at least 2", which is the reproduction.
 2. **`pullsync` level, `TestGetCursorsDeadline`:** with `streamtest` and a cursors handler that never answers, `GetCursors` with a context carrying a deadline returns at that deadline with `context.DeadlineExceeded`. This is what kills the mutation "deadline applied only to the stream open", which no puller-level test can, since those stub `pullsync`.
 3. **Timeout counted and logged:** one recalculation with peer A silent gives `cursor_requests_failed_total{reason="timeout"}` 1, `{reason="error"}` 0, and one info line naming A; an error answer counts as `error`; a shutdown during the request counts as neither.
 4. **Retry:** when A starts answering, the next recalculation gets its cursors and starts its bins.
 5. **Gauge and histogram:** the start gauge is set while a run is in progress and 0 after; one histogram observation per completed run.
-6. **Dump:** with the threshold lowered, a blocked run writes one warning with a goroutine dump, not one per check.
-7. **Radius change acted on:** with peer A silent, a radius decrease is followed by syncing the newly opened bins from B within one trigger plus `cursorsTimeout`.
+6. **Dump:** with the threshold lowered, a blocked run writes one profile file and one warning naming its path, not one per watcher tick; at most 3 files are kept.
+7. **Radius change acted on:** with peer A silent, a radius decrease is followed by syncing the newly opened bins from B, checked by polling until it eventually holds, within a generous deadline (at least one trigger plus `cursorsTimeout`).
 
 Real-time tests use periods in tens of milliseconds, assert "at least" counts, and poll with generous deadlines; they do not use `synctest`, because on unmodified code every goroutine is durably blocked and `synctest` would panic instead of failing.
 
-**Mutation checks** (each must make a test fail): deadline removed (tests 1, 7); deadline applied only to the stream open (test 2); timeout counted as `error` (test 3); shutdown counted as a failure (test 3); failed request not counted or not logged (test 3); start gauge not cleared (test 5); dump written on every check (test 6).
+**Mutation checks** (each must make a test fail): deadline removed (tests 1, 7); deadline applied only to the stream open (test 2); timeout counted as `error` (test 3); shutdown counted as a failure (test 3); failed request not counted or not logged (test 3); start gauge not cleared (test 5); dump written on every watcher tick (test 6); dump check moved into `onChange` (test 6, which blocks `onChange`).
 
 Race detector on `pkg/puller` and `pkg/pullsync`; check the exit status directly.
 
 ## Upstream
 
-Expected to affect upstream: the same code is on `master` at the lines above. Check: run test 1 on an unmodified `upstream/master` worktree (cc5c4706e or newer); if it fails there with "second recalculation did not run", add `affects-upstream` to #695 with what was checked, and a row in `docs/UPSTREAM.md`.
+Expected to affect upstream: the same code is on `master` at the lines above. Check: run test 1 on an unmodified `upstream/master` worktree (cc5c4706e or newer); if peer A's `GetCursors` count stays at exactly 1 there ("peer A asked 1 time, want at least 2"), add `affects-upstream` to #695 with what was checked, and a row in `docs/UPSTREAM.md`.
 
 ## Measurement
 
@@ -68,7 +68,7 @@ On the dense host (ten nodes, by role), with the build carrying this change and 
 - Per node, for 2 hours after each restart:
   - the largest `now − bee_puller_on_change_started_timestamp_seconds` while a run is in progress, sampled every 15 s (pass: under 60 s, against about 30 minutes on two nodes on 2026-10-09);
   - `cursor_requests_failed_total` by reason, and the peers named in the timeout lines (is one peer shared across nodes?);
-  - any goroutine dump: where the blocked run waited.
+  - any goroutine profile file: where the blocked run waited.
 - If runs stay long with no timeouts and the dump shows path 3, the hypothesis is refuted for that case and path 3 gets its own issue.
 
 Generated with help of AI.
