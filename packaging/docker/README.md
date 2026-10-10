@@ -49,6 +49,15 @@ Update services with
 docker-compose pull && docker-compose up -d
 ```
 
+## Stopping a staked node
+
+A stop waits for a pending storage-lottery reveal, up to about 200 s at
+5-second blocks (`stop-wait-for-reveal`). The compose file sets
+`stop_grace_period: 5m` so Docker does not kill the container first; a
+copied service needs the same line. On Kubernetes, set
+`terminationGracePeriodSeconds: 300` on the pod: the default of 30 s cuts
+the wait short, and a missed reveal freezes the stake for days.
+
 ## Running multiple Bee nodes
 
 It is easy to run multiple bee nodes with docker compose by adding more services to `docker-compose.yaml`

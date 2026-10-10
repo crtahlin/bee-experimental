@@ -21,6 +21,12 @@ RestartSec=5s
 # 1 for a fault, 75 for a paused postage contract or postage-stall-shutdown
 # (issue #583).
 RestartPreventExitStatus=78
+# A stop waits for a pending storage-lottery reveal (stop-wait-for-reveal):
+# at 5-second blocks a stop just after a commit can wait about 180 s for the
+# reveal phase, plus the reveal's receipt and up to 15 s of API shutdown.
+# systemd's default of 90 s would kill the node during that wait, and the
+# missed reveal freezes its stake for days (issue #725).
+TimeoutStopSec=300
 
 [Install]
 WantedBy=multi-user.target
