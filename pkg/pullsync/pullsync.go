@@ -214,9 +214,12 @@ func (s *Syncer) handler(streamCtx context.Context, p p2p.Peer, stream p2p.Strea
 	if watch == nil {
 		s.metrics.RequestsUnwatched.Inc()
 	}
-	// Let the ended requests leave the shared collection before this one
-	// joins it. They return as soon as they see the cancel; joining while
-	// one leaves races inside the singleflight package.
+	// Wait until the ended requests have unregistered; they return as soon
+	// as they see the cancel. This does not wait for their subscription to
+	// be released: that happens in the shared collection's own goroutine.
+	// When an ended request was the collection's only caller, this request
+	// starts a fresh subscription instead of joining it. Whether to keep the
+	// wait is #693.
 	for _, e := range ended {
 		select {
 		case <-e.done:
