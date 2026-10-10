@@ -223,7 +223,11 @@ func (s *Syncer) handler(streamCtx context.Context, p p2p.Peer, stream p2p.Strea
 		case <-reqCtx.Done():
 		}
 	}
-	offer, err := s.makeOffer(reqCtx, rn)
+	// A request ended while it waited above starts no collection (#648).
+	var offer *pb.Offer
+	if err = reqCtx.Err(); err == nil {
+		offer, err = s.makeOffer(reqCtx, rn)
+	}
 	afterMakeOffer()
 	watch.stop()
 	s.waiting.unregister(entry)
