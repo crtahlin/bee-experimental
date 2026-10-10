@@ -242,6 +242,14 @@ password-file: "/opt/homebrew/var/lib/swarm-bee/password"
 # statestore-cache-capacity: "100000"
 ## protect nodes from getting kicked out on bootnode
 # static-nodes: []
+## wait, on a stop, for a pending storage-lottery reveal (default true).
+##
+## A node that committed in a round and is stopped before it reveals is
+## frozen for twice as long as for a wrong reveal (about 9 days at depth 9).
+## With this on, a stop waits until the reveal is mined or the round's
+## reveal phase ends: up to about 200 s at 5-second blocks. A second signal
+## ends the wait. The packaged systemd unit allows 300 s for a stop.
+# stop-wait-for-reveal: true
 ## enable storage incentives feature
 # storage-incentives-enable: true
 ## enable swap

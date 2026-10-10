@@ -37,6 +37,12 @@ type metrics struct {
 	// RoundMismatch counts commits skipped because the round the node computed
 	// disagreed with the contract's (#540).
 	RoundMismatch prometheus.Counter
+
+	// Counts persisted in the state store across restarts (#725): a stop
+	// knows its outcome only after /metrics is gone.
+	StopWaitedForReveal prometheus.Gauge
+	RevealMissedOnStop  prometheus.Gauge
+	RevealAfterRestart  prometheus.Gauge
 }
 
 func newMetrics() metrics {
@@ -166,6 +172,24 @@ func newMetrics() metrics {
 			Subsystem: subsystem,
 			Name:      "is_playing_errors",
 			Help:      "total neighborhood selected errors while processing",
+		}),
+		StopWaitedForReveal: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "stop_waited_for_reveal",
+			Help:      "Stops that waited for a pending storage-lottery reveal, over the node's lifetime.",
+		}),
+		RevealMissedOnStop: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "reveal_missed_on_stop",
+			Help:      "Stops whose wait ended without the reveal mined, over the node's lifetime.",
+		}),
+		RevealAfterRestart: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "reveal_after_restart",
+			Help:      "Reveals mined for a commit made before the last start, over the node's lifetime.",
 		}),
 	}
 }

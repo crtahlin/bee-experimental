@@ -708,22 +708,26 @@ func createRedistributionAgentService(
 	}))
 	contract := &mockContract{}
 
+	state, err := storageincentives.NewRedistributionState(log.Noop, common.Address{}, storer, erc20Service, tranService)
+	if err != nil {
+		return nil, err
+	}
+	blockTime := func() time.Duration { return time.Millisecond * 10 }
+	revealer := storageincentives.NewRevealer(state, contract, tranService, backend, blockTime, blocksPerRound, blocksPerPhase, log.Noop)
+
 	return storageincentives.New(
 		addr,
-		common.Address{},
 		backend,
 		contract,
 		postageContract,
 		stakingContract,
 		mockstorer.NewReserve(),
 		func() bool { return true },
-		func() time.Duration { return time.Millisecond * 10 },
+		blockTime,
 		blocksPerRound,
 		blocksPerPhase,
-		storer,
+		revealer,
 		chainStateGetter,
-		erc20Service,
-		tranService,
 		&mockHealth{},
 		log.Noop,
 		"classic", // reserve-proof-mode (#273); classic is the default
@@ -788,14 +792,14 @@ func (m *mockContract) Claim(context.Context, redistribution.ChunkInclusionProof
 	return common.Hash{}, nil
 }
 
-func (m *mockContract) Commit(context.Context, []byte, uint64) (common.Hash, error) {
+func (m *mockContract) Commit(context.Context, []byte, uint64, transaction.BeforeBroadcastFunc) (common.Hash, error) {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 	m.callsList = append(m.callsList, commitCall)
 	return common.Hash{}, nil
 }
 
-func (m *mockContract) Reveal(context.Context, uint8, []byte, []byte) (common.Hash, error) {
+func (m *mockContract) Reveal(context.Context, uint8, []byte, []byte, transaction.BeforeBroadcastFunc) (common.Hash, error) {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 	m.callsList = append(m.callsList, revealCall)

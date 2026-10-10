@@ -56,6 +56,59 @@ func TestRedistributionStatus(t *testing.T) {
 		)
 	})
 
+	// The reveal fields and the persisted stop counts (#725); the old
+	// fields keep their values.
+	t.Run("reveal pending and stop counts", func(t *testing.T) {
+		t.Parallel()
+
+		store := statestore.NewStateStore()
+		err := store.Put("redistribution_state", storageincentives.Status{
+			Phase: storageincentives.PhaseType(2), // reveal
+			Round: 0,
+			Block: 5, // the reveal phase of round 0 is blocks 4-7
+			RoundData: map[uint64]storageincentives.RoundData{
+				0: {CommitKey: []byte("key")},
+			},
+			StopWaitedForReveal: 3,
+			RevealMissedOnStop:  1,
+			RevealAfterRestart:  2,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv, _, _, _ := newTestServer(t, testServerOptions{
+			StateStorer: store,
+			BackendOpts: []backendmock.Option{
+				backendmock.WithBalanceAt(func(ctx context.Context, address common.Address, block *big.Int) (*big.Int, error) {
+					return big.NewInt(100000000), nil
+				}),
+				backendmock.WithSuggestedFeeAndTipFunc(func(ctx context.Context, gasPrice *big.Int, boostPercent int) (*big.Int, *big.Int, error) {
+					return big.NewInt(1), big.NewInt(2), nil
+				}),
+			},
+		})
+
+		var got map[string]any
+		jsonhttptest.Request(t, srv, http.MethodGet, "/redistributionstate", http.StatusOK,
+			jsonhttptest.WithUnmarshalJSONResponse(&got),
+		)
+		for field, want := range map[string]any{
+			"revealPending":           true,
+			"safeToRestartAfterBlock": float64(7),
+			"stopWaitedForReveal":     float64(3),
+			"revealMissedOnStop":      float64(1),
+			"revealAfterRestart":      float64(2),
+			"phase":                   "reveal",
+			"round":                   float64(0),
+			"block":                   float64(5),
+			"hasSufficientFunds":      true,
+		} {
+			if got[field] != want {
+				t.Errorf("%s: got %v, want %v", field, got[field], want)
+			}
+		}
+	})
+
 	t.Run("bad request", func(t *testing.T) {
 		t.Parallel()
 

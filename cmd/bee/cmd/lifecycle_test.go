@@ -19,13 +19,18 @@ import (
 type fakeNode struct {
 	stopped  chan struct{}
 	shutdown atomic.Int32
+	// shutdownFn, if set, is the shutdown's work
+	shutdownFn func(ctx context.Context)
 }
 
 func newFakeNode() *fakeNode { return &fakeNode{stopped: make(chan struct{})} }
 
 func (n *fakeNode) SyncingStopped() chan struct{} { return n.stopped }
-func (n *fakeNode) Shutdown() error {
+func (n *fakeNode) Shutdown(ctx context.Context) error {
 	n.shutdown.Add(1)
+	if n.shutdownFn != nil {
+		n.shutdownFn(ctx)
+	}
 	return nil
 }
 
@@ -144,4 +149,104 @@ func TestLifecycleSecondSignalEndsTheWait(t *testing.T) {
 		sig <- syscall.SIGTERM
 	}()
 	runStartStop(t, l, -1)
+}
+
+// stopWithSignals runs stop on a built node and sends the given number of
+// extra signals, the first after the shutdown started. It returns how long
+// stop took.
+func stopWithSignals(t *testing.T, n *fakeNode, signals int, hardStop time.Duration) time.Duration {
+	t.Helper()
+	l, sig := newTestLifecycle(func(ctx context.Context) (runningNode, error) { return n, nil })
+	l.hardStop = hardStop
+	<-l.build.ready
+	l.node.Store(l.build.node)
+
+	started := make(chan struct{})
+	inner := n.shutdownFn
+	n.shutdownFn = func(ctx context.Context) {
+		close(started)
+		inner(ctx)
+	}
+
+	start := time.Now()
+	done := make(chan struct{})
+	go func() {
+		l.stop()
+		close(done)
+	}()
+	<-started
+	for range signals {
+		time.Sleep(20 * time.Millisecond)
+		sig <- syscall.SIGTERM
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stop did not return")
+	}
+	return time.Since(start)
+}
+
+// The second signal cancels the shutdown's context: the reveal wait ends
+// and the rest of the close, the state store included, still runs (#725).
+func TestLifecycleSecondSignalEndsTheRevealWait(t *testing.T) {
+	var stateStoreClosed atomic.Bool
+	n := newFakeNode()
+	n.shutdownFn = func(ctx context.Context) {
+		<-ctx.Done() // the reveal wait
+		time.Sleep(50 * time.Millisecond)
+		stateStoreClosed.Store(true)
+	}
+	stopWithSignals(t, n, 1, time.Minute)
+
+	if !stateStoreClosed.Load() {
+		t.Fatal("stop returned before the state store was closed")
+	}
+}
+
+// A third signal ends stop at once, for a close that hangs.
+func TestLifecycleThirdSignalExits(t *testing.T) {
+	hang := make(chan struct{})
+	t.Cleanup(func() { close(hang) })
+	n := newFakeNode()
+	n.shutdownFn = func(ctx context.Context) {
+		<-ctx.Done()
+		<-hang
+	}
+	if took := stopWithSignals(t, n, 2, time.Minute); took > 2*time.Second {
+		t.Fatalf("stop took %s after the third signal", took)
+	}
+}
+
+// A close still running hardStop after the second signal ends stop.
+func TestLifecycleHungCloseExitsAfterSecondSignal(t *testing.T) {
+	hang := make(chan struct{})
+	t.Cleanup(func() { close(hang) })
+	n := newFakeNode()
+	n.shutdownFn = func(ctx context.Context) {
+		<-ctx.Done()
+		<-hang
+	}
+	took := stopWithSignals(t, n, 1, 200*time.Millisecond)
+	if took < 200*time.Millisecond || took > 2*time.Second {
+		t.Fatalf("stop took %s, want about the hard-stop bound", took)
+	}
+}
+
+// Without a signal the shutdown is not cancelled: a pending reveal is
+// waited for.
+func TestLifecycleOneSignalDoesNotCancelTheWait(t *testing.T) {
+	n := newFakeNode()
+	var cancelled atomic.Bool
+	n.shutdownFn = func(ctx context.Context) {
+		select {
+		case <-ctx.Done():
+			cancelled.Store(true)
+		case <-time.After(200 * time.Millisecond): // the reveal mined
+		}
+	}
+	stopWithSignals(t, n, 0, time.Minute)
+	if cancelled.Load() {
+		t.Fatal("the shutdown context was cancelled without a second signal")
+	}
 }

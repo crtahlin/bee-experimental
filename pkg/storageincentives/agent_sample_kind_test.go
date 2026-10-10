@@ -12,11 +12,9 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethersphere/bee/v2/pkg/log"
 	"github.com/ethersphere/bee/v2/pkg/postage"
 	contractMock "github.com/ethersphere/bee/v2/pkg/postage/postagecontract/mock"
-	erc20mock "github.com/ethersphere/bee/v2/pkg/settlement/swap/erc20/mock"
 	statestore "github.com/ethersphere/bee/v2/pkg/statestore/mock"
 	"github.com/ethersphere/bee/v2/pkg/storageincentives"
 	stakingmock "github.com/ethersphere/bee/v2/pkg/storageincentives/staking/mock"
@@ -63,15 +61,19 @@ func TestAgentMarksTheLotterySample(t *testing.T) {
 			}),
 		)
 
+		revealer, err := newRevealer(statestore.NewStateStore(), mc, transactionmock.New(), backend, func() time.Duration { return 100 * time.Millisecond }, blocksPerRound, blocksPerPhase)
+		if err != nil {
+			t.Fatal(err)
+		}
 		agent, err := storageincentives.New(
-			swarm.RandAddress(t), common.Address{},
+			swarm.RandAddress(t),
 			backend, mc, contractMock.New(contractMock.WithExpiresBatchesFunc(func(context.Context) error { return nil })),
 			stakingmock.New(stakingmock.WithIsFrozen(func(context.Context, uint64) (bool, error) { return false, nil })),
 			reserve,
 			func() bool { return true },
 			func() time.Duration { return 100 * time.Millisecond },
 			blocksPerRound, blocksPerPhase,
-			statestore.NewStateStore(), &postage.NoOpBatchStore{}, erc20mock.New(), transactionmock.New(),
+			revealer, &postage.NoOpBatchStore{},
 			&mockHealth{}, log.Noop, storer.ReserveProofModeClassic,
 		)
 		if err != nil {

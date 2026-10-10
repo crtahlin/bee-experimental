@@ -1113,6 +1113,21 @@ components:
         fees:
           $ref: "#/components/schemas/BigInt"
           description: Total transaction fees the node has paid while participating.
+        revealPending:
+          type: boolean
+          description: "Wasp: whether the node has committed in the current round and its reveal is not mined yet, with the reveal phase still open. A stop now waits for the reveal (stop-wait-for-reveal)."
+        safeToRestartAfterBlock:
+          type: integer
+          description: "Wasp: when revealPending, the last block of the round's reveal phase: a restart after it cannot miss the reveal. 0 when nothing is pending."
+        stopWaitedForReveal:
+          type: integer
+          description: "Wasp: stops that waited for a pending reveal, kept across restarts."
+        revealMissedOnStop:
+          type: integer
+          description: "Wasp: stops whose wait ended without the reveal mined (claim phase reached or a second signal), kept across restarts."
+        revealAfterRestart:
+          type: integer
+          description: "Wasp: reveals mined for a commit made before the last start, kept across restarts."
 
     PendingTransactionsResponse:
       type: object

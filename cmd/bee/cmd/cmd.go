@@ -119,6 +119,7 @@ const (
 	optionNameAllowPrivateCIDRs            = "allow-private-cidrs"
 	optionNameSleepAfter                   = "sleep-after"
 	optionNameStorageIncentivesEnable      = "storage-incentives-enable"
+	optionNameStopWaitForReveal            = "stop-wait-for-reveal"
 	optionNameStateStoreCacheCapacity      = "statestore-cache-capacity"
 	optionNameTargetNeighborhood           = "target-neighborhood"
 	optionNameNeighborhoodSuggester        = "neighborhood-suggester"
@@ -487,6 +488,7 @@ func (c *command) setAllFlags(cmd *cobra.Command) {
 	cmd.Flags().StringSlice(optionNameStaticNodes, []string{}, "protect nodes from getting kicked out on bootnode")
 	cmd.Flags().Bool(optionNameAllowPrivateCIDRs, false, "allow to advertise private CIDRs to the public network")
 	cmd.Flags().Bool(optionNameStorageIncentivesEnable, true, "enable storage incentives feature")
+	cmd.Flags().Bool(optionNameStopWaitForReveal, true, "on a stop, wait for a pending storage-lottery reveal until it is mined or the round's reveal phase ends (up to about 200 s at 5-second blocks); a second signal ends the wait. Off, a stop right after a commit misses the reveal and the stake is frozen for twice as long as for a wrong reveal")
 	cmd.Flags().Uint64(optionNameStateStoreCacheCapacity, 100_000, "lru memory caching capacity in number of statestore entries")
 	cmd.Flags().String(optionNameTargetNeighborhood, "", "neighborhood to target in binary format (ex: 111111001) for mining the initial overlay")
 	cmd.Flags().String(optionNameNeighborhoodSuggester, "https://api.swarmscan.io/v1/network/neighborhoods/suggestion", "suggester for target neighborhood")

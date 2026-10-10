@@ -350,6 +350,10 @@ func (m *mockCorruptedStore) Put(key string, i any) error {
 	return nil
 }
 
+func (m *mockCorruptedStore) PutSync(key string, i any) error {
+	return nil
+}
+
 func (m *mockCorruptedStore) Delete(key string) error {
 	return nil
 }

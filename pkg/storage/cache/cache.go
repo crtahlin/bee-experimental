@@ -91,6 +91,13 @@ func (c *Cache) Put(i storage.Item) error {
 	return c.IndexStore.Put(i)
 }
 
+// PutSync implements storage.SyncWriter: it writes through to the wrapped
+// store's synced write and caches the item, as Put does.
+func (c *Cache) PutSync(i storage.Item) error {
+	c.add(i)
+	return c.IndexStore.PutSync(i)
+}
+
 // Delete implements storage.Store interface.
 // On a call it also removes the item from the cache.
 func (c *Cache) Delete(i storage.Item) error {

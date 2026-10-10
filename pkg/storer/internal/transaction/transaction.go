@@ -423,8 +423,12 @@ func (s *indexTrx) CountContext(ctx context.Context, k storage.Key) (int, error)
 	defer leave()
 	return storage.CountContext(ctx, s.store, k)
 }
-func (s *indexTrx) Put(i storage.Item) error    { return s.batch.Put(i) }
-func (s *indexTrx) Delete(i storage.Item) error { return s.batch.Delete(i) }
+func (s *indexTrx) Put(i storage.Item) error { return s.batch.Put(i) }
+
+// PutSync puts into the transaction's batch: the batch is committed as a
+// whole, so a synced write of one item is not meaningful here.
+func (s *indexTrx) PutSync(i storage.Item) error { return s.batch.Put(i) }
+func (s *indexTrx) Delete(i storage.Item) error  { return s.batch.Delete(i) }
 
 type sharkyTrx struct {
 	sharky       *sharky.Store

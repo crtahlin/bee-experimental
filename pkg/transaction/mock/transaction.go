@@ -27,6 +27,49 @@ type transactionServiceMock struct {
 	storedTransaction    func(txHash common.Hash) (*transaction.StoredTransaction, error)
 	cancelTransaction    func(ctx context.Context, originalTxHash common.Hash) (common.Hash, error)
 	transactionFee       func(ctx context.Context, txHash common.Hash) (*big.Int, error)
+	sendWithHook         func(ctx context.Context, request *transaction.TxRequest, boost int, beforeBroadcast transaction.BeforeBroadcastFunc) (common.Hash, error)
+	rebroadcast          func(ctx context.Context, txHash common.Hash) error
+	replace              func(ctx context.Context, txHash common.Hash, beforeBroadcast transaction.BeforeBroadcastFunc) (common.Hash, error)
+	transactionStatus    func(ctx context.Context, txHash common.Hash) (transaction.TxState, error)
+}
+
+// SendWithHook calls the function set with WithSendWithHookFunc. Without
+// one it calls the send function and then the hook with the returned hash.
+func (m *transactionServiceMock) SendWithHook(ctx context.Context, request *transaction.TxRequest, boostPercent int, beforeBroadcast transaction.BeforeBroadcastFunc) (common.Hash, error) {
+	if m.sendWithHook != nil {
+		return m.sendWithHook(ctx, request, boostPercent, beforeBroadcast)
+	}
+	txHash, err := m.Send(ctx, request, boostPercent)
+	if err != nil {
+		return txHash, err
+	}
+	if beforeBroadcast != nil {
+		if err := beforeBroadcast(txHash); err != nil {
+			return common.Hash{}, err
+		}
+	}
+	return txHash, nil
+}
+
+func (m *transactionServiceMock) RebroadcastTransaction(ctx context.Context, txHash common.Hash) error {
+	if m.rebroadcast != nil {
+		return m.rebroadcast(ctx, txHash)
+	}
+	return errors.New("not implemented")
+}
+
+func (m *transactionServiceMock) ReplaceTransaction(ctx context.Context, txHash common.Hash, beforeBroadcast transaction.BeforeBroadcastFunc) (common.Hash, error) {
+	if m.replace != nil {
+		return m.replace(ctx, txHash, beforeBroadcast)
+	}
+	return common.Hash{}, errors.New("not implemented")
+}
+
+func (m *transactionServiceMock) TransactionStatus(ctx context.Context, txHash common.Hash) (transaction.TxState, error) {
+	if m.transactionStatus != nil {
+		return m.transactionStatus(ctx, txHash)
+	}
+	return 0, errors.New("not implemented")
 }
 
 func (m *transactionServiceMock) Send(ctx context.Context, request *transaction.TxRequest, boostPercent int) (txHash common.Hash, err error) {
@@ -155,6 +198,30 @@ func WithCancelTransactionFunc(f func(ctx context.Context, originalTxHash common
 func WithTransactionFeeFunc(f func(ctx context.Context, txHash common.Hash) (*big.Int, error)) Option {
 	return optionFunc(func(s *transactionServiceMock) {
 		s.transactionFee = f
+	})
+}
+
+func WithSendWithHookFunc(f func(ctx context.Context, request *transaction.TxRequest, boost int, beforeBroadcast transaction.BeforeBroadcastFunc) (common.Hash, error)) Option {
+	return optionFunc(func(s *transactionServiceMock) {
+		s.sendWithHook = f
+	})
+}
+
+func WithRebroadcastTransactionFunc(f func(ctx context.Context, txHash common.Hash) error) Option {
+	return optionFunc(func(s *transactionServiceMock) {
+		s.rebroadcast = f
+	})
+}
+
+func WithReplaceTransactionFunc(f func(ctx context.Context, txHash common.Hash, beforeBroadcast transaction.BeforeBroadcastFunc) (common.Hash, error)) Option {
+	return optionFunc(func(s *transactionServiceMock) {
+		s.replace = f
+	})
+}
+
+func WithTransactionStatusFunc(f func(ctx context.Context, txHash common.Hash) (transaction.TxState, error)) Option {
+	return optionFunc(func(s *transactionServiceMock) {
+		s.transactionStatus = f
 	})
 }
 

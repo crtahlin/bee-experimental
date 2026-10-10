@@ -21,6 +21,10 @@ type StateStorer interface {
 	// Put inserts or updates the given obj stored under the given key.
 	Put(key string, obj any) error
 
+	// PutSync is Put, written to stable storage before it returns, so the
+	// value survives a power loss once PutSync has returned (wasp #725).
+	PutSync(key string, obj any) error
+
 	// Delete removes object form the store stored under the given key.
 	Delete(key string) error
 

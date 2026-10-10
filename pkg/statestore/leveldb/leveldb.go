@@ -16,6 +16,7 @@ import (
 	ldberr "github.com/syndtr/goleveldb/leveldb/errors"
 
 	"github.com/syndtr/goleveldb/leveldb"
+	"github.com/syndtr/goleveldb/leveldb/opt"
 	ldbs "github.com/syndtr/goleveldb/leveldb/storage"
 
 	"github.com/syndtr/goleveldb/leveldb/util"
@@ -104,6 +105,20 @@ func (s *Store) Put(key string, i any) (err error) {
 	}
 
 	return s.db.Put([]byte(key), bytes, nil)
+}
+
+// PutSync is Put with the write synced to disk before it returns.
+func (s *Store) PutSync(key string, i any) (err error) {
+	var bytes []byte
+	if marshaler, ok := i.(encoding.BinaryMarshaler); ok {
+		if bytes, err = marshaler.MarshalBinary(); err != nil {
+			return err
+		}
+	} else if bytes, err = json.Marshal(i); err != nil {
+		return err
+	}
+
+	return s.db.Put([]byte(key), bytes, &opt.WriteOptions{Sync: true})
 }
 
 // Delete removes entries stored under a specific key.

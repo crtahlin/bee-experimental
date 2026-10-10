@@ -55,12 +55,30 @@ type Status struct {
 	RoundData         map[uint64]RoundData
 	SampleDuration    time.Duration
 	IsHealthy         bool
+	// BlockSeenAt is the wall-clock time (unix seconds) at which Block was
+	// read, so the phase can be estimated after a restart while the chain
+	// backend is not synced yet.
+	BlockSeenAt int64
+	// Counts kept across restarts: /metrics is gone by the time a stop
+	// knows its outcome.
+	StopWaitedForReveal uint64
+	RevealMissedOnStop  uint64
+	RevealAfterRestart  uint64
 }
 
 type RoundData struct {
 	CommitKey   []byte
 	SampleData  *SampleData
 	HasRevealed bool
+	// CommitTx is the commit's signed transaction hash, stored before the
+	// transaction is sent; zero while not known.
+	CommitTx common.Hash
+	// RevealTxs lists every reveal transaction hash sent in the round, each
+	// stored before its send.
+	RevealTxs []common.Hash
+	// RevealSentBlock is the block at which the newest of RevealTxs was
+	// listed.
+	RevealSentBlock uint64
 }
 
 type SampleData struct {
@@ -117,11 +135,32 @@ func (r *RedistributionState) save() {
 	}
 }
 
+// saveSync writes the status with a synced write and returns its error.
+func (r *RedistributionState) saveSync() error {
+	return r.stateStore.PutSync(redistributionStatusKey, r.status)
+}
+
+// SetERC20Service sets the token service, which the node creates after the
+// state (it needs the chain sync wait).
+func (r *RedistributionState) SetERC20Service(erc20Service erc20.Service) {
+	r.mtx.Lock()
+	defer r.mtx.Unlock()
+	r.erc20Service = erc20Service
+}
+
 func (r *RedistributionState) SetCurrentBlock(block uint64) {
 	r.mtx.Lock()
 	defer r.mtx.Unlock()
 	r.status.Block = block
+	r.status.BlockSeenAt = time.Now().Unix()
 	r.save()
+}
+
+// lastBlock returns the last block read and when it was read.
+func (r *RedistributionState) lastBlock() (uint64, time.Time) {
+	r.mtx.Lock()
+	defer r.mtx.Unlock()
+	return r.status.Block, time.Unix(r.status.BlockSeenAt, 0)
 }
 
 func (r *RedistributionState) SetCurrentEvent(phase PhaseType, round uint64) {
@@ -268,15 +307,87 @@ func (r *RedistributionState) CommitKey(round uint64) ([]byte, bool) {
 	return rd.CommitKey, true
 }
 
-func (r *RedistributionState) SetCommitKey(round uint64, commitKey []byte) {
+// SetCommitKey stores the round's commit key with a synced write. On error
+// nothing is changed and the commit must not be sent.
+func (r *RedistributionState) SetCommitKey(round uint64, commitKey []byte) error {
+	return r.updateRoundSync(round, func(rd *RoundData) {
+		rd.CommitKey = commitKey
+		rd.CommitTx = common.Hash{}
+	})
+}
+
+// SetCommitTx stores the commit's signed hash with a synced write.
+func (r *RedistributionState) SetCommitTx(round uint64, txHash common.Hash) error {
+	return r.updateRoundSync(round, func(rd *RoundData) {
+		rd.CommitTx = txHash
+	})
+}
+
+// RemoveCommitKey removes the round's commit key and commit hash: the commit
+// was not broadcast, or it reverted.
+func (r *RedistributionState) RemoveCommitKey(round uint64) error {
+	return r.updateRoundSync(round, func(rd *RoundData) {
+		rd.CommitKey = nil
+		rd.CommitTx = common.Hash{}
+	})
+}
+
+// AddRevealTx lists a reveal hash with a synced write, before its send.
+func (r *RedistributionState) AddRevealTx(round uint64, txHash common.Hash, block uint64) error {
+	return r.updateRoundSync(round, func(rd *RoundData) {
+		rd.RevealTxs = append(append([]common.Hash(nil), rd.RevealTxs...), txHash)
+		rd.RevealSentBlock = block
+	})
+}
+
+// CommitTx returns the commit's signed hash; zero when not known.
+func (r *RedistributionState) CommitTx(round uint64) common.Hash {
+	r.mtx.Lock()
+	defer r.mtx.Unlock()
+	return r.status.RoundData[round].CommitTx
+}
+
+// RevealTxs returns the listed reveal hashes, oldest first, and the block
+// at which the newest was listed.
+func (r *RedistributionState) RevealTxs(round uint64) ([]common.Hash, uint64) {
+	r.mtx.Lock()
+	defer r.mtx.Unlock()
+	rd := r.status.RoundData[round]
+	return append([]common.Hash(nil), rd.RevealTxs...), rd.RevealSentBlock
+}
+
+// updateRoundSync applies f to the round's data and writes the status with
+// a synced write; on a write error the change is undone.
+func (r *RedistributionState) updateRoundSync(round uint64, f func(*RoundData)) error {
 	r.mtx.Lock()
 	defer r.mtx.Unlock()
 
-	rd := r.status.RoundData[round]
-	rd.CommitKey = commitKey
+	prev, existed := r.status.RoundData[round]
+	rd := prev
+	f(&rd)
 	r.status.RoundData[round] = rd
 
-	r.save()
+	if err := r.saveSync(); err != nil {
+		if existed {
+			r.status.RoundData[round] = prev
+		} else {
+			delete(r.status.RoundData, round)
+		}
+		return err
+	}
+	return nil
+}
+
+// countStop adds to the persisted stop counts.
+func (r *RedistributionState) countStop(waited, missed, afterRestart uint64) {
+	r.mtx.Lock()
+	defer r.mtx.Unlock()
+	r.status.StopWaitedForReveal += waited
+	r.status.RevealMissedOnStop += missed
+	r.status.RevealAfterRestart += afterRestart
+	if err := r.saveSync(); err != nil {
+		r.logger.Error(err, "saving redistribution status")
+	}
 }
 
 func (r *RedistributionState) HasRevealed(round uint64) bool {

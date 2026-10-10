@@ -79,6 +79,10 @@ func TestState(t *testing.T) {
 	if err != nil {
 		t.Fatal("failed to get state")
 	}
+	if got.BlockSeenAt == 0 {
+		t.Fatal("SetCurrentBlock did not record when the block was seen")
+	}
+	got.BlockSeenAt = 0
 
 	opt := []cmp.Option{
 		cmp.AllowUnexported(big.Int{}),
@@ -128,7 +132,9 @@ func TestStateRoundData(t *testing.T) {
 		}
 
 		savedKey := testutil.RandBytes(t, swarm.HashSize)
-		state.SetCommitKey(1, savedKey)
+		if err := state.SetCommitKey(1, savedKey); err != nil {
+			t.Fatal(err)
+		}
 
 		key, exists := state.CommitKey(1)
 		if !exists {
@@ -170,7 +176,9 @@ func TestPurgeRoundData(t *testing.T) {
 		commitKey := testutil.RandBytes(t, swarm.HashSize)
 
 		state.SetSampleData(round, savedSample, 0)
-		state.SetCommitKey(round, commitKey)
+		if err := state.SetCommitKey(round, commitKey); err != nil {
+			t.Fatal(err)
+		}
 		state.SetHasRevealed(round)
 	}
 

@@ -8,6 +8,7 @@ import (
 	"context"
 	"os"
 	"sync/atomic"
+	"time"
 
 	"github.com/ethersphere/bee/v2/pkg/log"
 )
@@ -16,8 +17,12 @@ import (
 // implements it; tests use a fake.
 type runningNode interface {
 	SyncingStopped() chan struct{}
-	Shutdown() error
+	Shutdown(ctx context.Context) error
 }
+
+// defaultHardStop is how long the close may run after the second signal
+// before the process exits anyway.
+const defaultHardStop = 30 * time.Second
 
 // buildResult owns the single value the background build sends. A
 // goroutine receives it once and publishes it, so start and stop can both
@@ -52,6 +57,9 @@ type lifecycle struct {
 	build      *buildResult
 	interrupts <-chan os.Signal
 	logger     log.Logger
+	// hardStop is how long the close may run after the second signal;
+	// defaultHardStop when zero.
+	hardStop time.Duration
 
 	node     atomic.Value // runningNode, once built
 	buildErr atomic.Value // error of a build that failed before any stop
@@ -88,7 +96,12 @@ func (l *lifecycle) start() {
 // build then closes what it opened, or returns a node that is shut down
 // here. Without the wait the process exited with the store open and its
 // dirty marker in place, and the next start ran a full recovery (wasp
-// #635). A second signal ends any wait at once.
+// #635). A second signal during the build ends the wait at once.
+//
+// Once the node is built, the second signal cancels the shutdown's
+// context: a wait for a storage-lottery reveal ends and the rest still
+// closes, the state store included. A third signal, or a close still
+// running hardStop after the second, ends stop at once (#725).
 func (l *lifecycle) stop() {
 	l.cancel()
 
@@ -117,21 +130,36 @@ func (l *lifecycle) stop() {
 	}
 
 	n := l.node.Load().(runningNode)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		if err := n.Shutdown(); err != nil {
+		if err := n.Shutdown(ctx); err != nil {
 			l.logger.Error(err, "shutdown failed")
 		}
 	}()
 
-	// If shutdown function is blocking too long,
-	// allow process termination by receiving another signal.
 	select {
-	case <-l.interrupts:
-		l.logger.Info("node shutdown terminated")
 	case <-done:
 		l.logger.Info("node shutdown")
+		return
+	case <-l.interrupts:
+		l.logger.Info("second signal: not waiting for a storage-lottery reveal; closing the rest")
+		cancel()
+	}
+
+	hardStop := l.hardStop
+	if hardStop == 0 {
+		hardStop = defaultHardStop
+	}
+	select {
+	case <-done:
+		l.logger.Info("node shutdown")
+	case <-l.interrupts:
+		l.logger.Info("node shutdown terminated")
+	case <-time.After(hardStop):
+		l.logger.Info("node shutdown terminated: the close is still running", "after", hardStop)
 	}
 }
 

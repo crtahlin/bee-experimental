@@ -4,6 +4,9 @@ services:
   bee-1:
     image: ethersphere/bee:stable
     restart: unless-stopped
+    # a stop waits for a pending storage-lottery reveal, up to about 200 s;
+    # Docker's default kills the container 10 s after SIGTERM (issue #725)
+    stop_grace_period: 5m
     environment:
       - BEE_ALLOW_PRIVATE_CIDRS
       - BEE_API_ADDR
@@ -61,6 +64,7 @@ services:
       - BEE_STAKING_ADDRESS
       - BEE_STATIC_NODES
       - BEE_STATESTORE_CACHE_CAPACITY
+      - BEE_STOP_WAIT_FOR_REVEAL
       - BEE_STORAGE_INCENTIVES_ENABLE
       - BEE_SWAP_ENABLE
       - BEE_SWAP_FACTORY_ADDRESS

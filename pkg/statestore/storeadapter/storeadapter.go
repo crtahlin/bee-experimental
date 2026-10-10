@@ -155,6 +155,12 @@ func (s *StateStorerAdapter) Put(key string, obj any) (err error) {
 	return s.storage.Put(newProxyItem(key, obj))
 }
 
+// PutSync implements StateStorer interface: it passes the synced write to
+// the store below.
+func (s *StateStorerAdapter) PutSync(key string, obj any) (err error) {
+	return s.storage.PutSync(newProxyItem(key, obj))
+}
+
 // Delete implements StateStorer interface.
 func (s *StateStorerAdapter) Delete(key string) (err error) {
 	return s.storage.Delete(newProxyItem(key, nil))

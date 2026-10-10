@@ -115,6 +115,8 @@
 # BEE_STATIC_NODES=[]
 ## lru memory caching capacity in number of statestore entries (default 100000)
 # BEE_STATESTORE_CACHE_CAPACITY=100000
+## wait, on a stop, for a pending storage-lottery reveal (default true)
+# BEE_STOP_WAIT_FOR_REVEAL=true
 ## enable storage incentives feature (default true)
 # BEE_STORAGE_INCENTIVES_ENABLE=true
 ## enable swap (default false)
