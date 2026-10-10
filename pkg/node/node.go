@@ -1358,6 +1358,11 @@ func NewBee(
 				logger.Info("started postage contract data sync in the background...")
 				err := batchSvc.Start(ctx, postageSyncStart)
 				syncStatus.Store(true)
+				if errors.Is(err, context.Canceled) {
+					// A stop, not a sync failure (#757).
+					logger.Debug("postage contract data sync stopped", "error", err)
+					return
+				}
 				if err != nil {
 					syncErr.Store(err)
 					logger.Error(err, "unable to sync batches")
