@@ -142,3 +142,18 @@ func (db *DB) ExpiredBatchesRemainingForTest() float64 {
 // RefreshEvictionProgressForTest refreshes the progress gauges as a round
 // does.
 func (db *DB) RefreshEvictionProgressForTest() { db.progressLine(false) }
+
+// HoldEvictionBarrierForTest takes the eviction barrier, so a sample that
+// starts blocks inside sampleStarted after it registered; the returned
+// function releases it.
+func (db *DB) HoldEvictionBarrierForTest() func() {
+	db.evictionMu.Lock()
+	return db.evictionMu.Unlock
+}
+
+// SamplingCountsForTest returns the lottery and other samples registered.
+func (db *DB) SamplingCountsForTest() (lottery, other int) {
+	db.samplingMu.Lock()
+	defer db.samplingMu.Unlock()
+	return db.samplingCount, db.otherSamplingCount
+}

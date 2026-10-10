@@ -12,6 +12,7 @@ import (
 	batchstore "github.com/ethersphere/bee/v2/pkg/postage/batchstore/mock"
 	postagetesting "github.com/ethersphere/bee/v2/pkg/postage/testing"
 	chunk "github.com/ethersphere/bee/v2/pkg/storage/testing"
+	"github.com/ethersphere/bee/v2/pkg/storer"
 	"github.com/ethersphere/bee/v2/pkg/swarm"
 )
 
@@ -81,5 +82,44 @@ func TestEvictionExpiredBatchesGauge(t *testing.T) {
 	}
 	if got := st.ExpiredBatchesRemainingForTest(); got != 0 {
 		t.Fatalf("expired batches remaining %v after the run, want 0", got)
+	}
+}
+
+// ReserveSample registers a sample by the kind its context carries: the
+// lottery's when marked, another kind otherwise (#659).
+func TestReserveSampleRegistersItsKind(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		ctx     context.Context
+		lottery bool
+	}{
+		{"lottery", storer.WithLotterySample(context.Background()), true},
+		{"rchash", context.Background(), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			st, err := memStorer(t, dbTestOps(swarm.RandAddress(t), 1000, batchstore.New(), nil, time.Minute))()
+			if err != nil {
+				t.Fatal(err)
+			}
+			release := st.HoldEvictionBarrierForTest()
+			done := make(chan error, 1)
+			go func() {
+				_, err := st.ReserveSample(tc.ctx, make([]byte, 32), 0, uint64(time.Now().UnixNano()), nil)
+				done <- err
+			}()
+			waitUntil(t, "the sample to register", func() bool {
+				l, o := st.SamplingCountsForTest()
+				return l+o == 1
+			})
+			l, o := st.SamplingCountsForTest()
+			release()
+			<-done
+			if (l == 1) != tc.lottery || (o == 1) == tc.lottery {
+				t.Fatalf("registered lottery=%d other=%d, want the %s kind", l, o, tc.name)
+			}
+		})
 	}
 }

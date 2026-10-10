@@ -6,6 +6,8 @@ package storer
 
 import (
 	"bytes"
+	"context"
+	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -43,7 +45,7 @@ func useFakeClock(t *testing.T) *budgetClock {
 	return c
 }
 
-func newBudgetDB(buf *bytes.Buffer) *DB {
+func newBudgetDB(buf io.Writer) *DB {
 	logger := log.Noop
 	if buf != nil {
 		logger = log.NewLogger("test", log.WithSink(buf), log.WithVerbosity(log.VerbosityInfo))
@@ -265,4 +267,51 @@ func TestPauseBudgetSplitPerPoll(t *testing.T) {
 	if got := db.pauseBudget.waited(c.Now()); got != 2*time.Minute {
 		t.Fatalf("charged %v, want 2m (only the /rchash part)", got)
 	}
+}
+
+// The wait for a sample writes the progress line with the run's state, so
+// a long pause still shows in the journal (#626).
+func TestProgressLineFromTheWait(t *testing.T) {
+	c := useFakeClock(t)
+	oldPoll, oldLine := samplingPausePollVar, progressLineInterval
+	samplingPausePollVar, progressLineInterval = time.Millisecond, time.Minute
+	t.Cleanup(func() { samplingPausePollVar, progressLineInterval = oldPoll, oldLine })
+
+	buf := &lockedBuffer{}
+	db := newBudgetDB(buf)
+	db.progressStart(progressKindUnreserve, 0)
+	db.sampleStarted(true)
+
+	done := make(chan error, 1)
+	go func() { done <- db.waitWhileSampling(context.Background(), nil) }()
+	c.advance(2 * time.Minute) // the line is due while eviction waits
+	deadline := time.Now().Add(10 * time.Second)
+	for !strings.Contains(buf.String(), `"paused"=true`) {
+		if time.Now().After(deadline) {
+			t.Fatalf("no progress line from the wait: %s", buf.String())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	db.sampleDone(true)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// lockedBuffer is a log sink safe to read while another goroutine logs.
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
 }
