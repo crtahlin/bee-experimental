@@ -7,7 +7,8 @@ Issue: #696. Companion: #695 (one peer blocks the puller's recalculation).
 - **Reserve worker check:** the `thresholdTicker` case of `reserveWorker` (`pkg/storer/reserve.go:290-320`), every `reserve-wakeup-duration` (15 minutes by default, `DefaultReserveWakeUpDuration`, `pkg/node/node.go:272`).
 - **Sync rate:** `Syncer.SyncRate()` (`pkg/storer/reserve.go:39-43`), the puller's rate of historical chunks over `DefaultHistRateWindow`, 15 minutes (`pkg/puller/puller.go`).
 - **Recalculation:** `onChange` in the puller (`pkg/puller/puller.go:245-283`), at start, on topology changes and every 5 minutes.
-- **Acted on radius r:** a completed recalculation that read r and, in that run, got cursors from and started bins for **at least one peer with proximity order `po >= r`** (a neighbour, which is where the content within the radius comes from). A recalculation in which every neighbour's cursors request failed (#695), or with no neighbour at all, has **not** acted on r.
+- **Acted on radius r:** a completed recalculation that read r and after which **at least one peer with proximity order `po >= r`** (a neighbour, which is where the content within the radius comes from) has its cursors and **every bin `>= r` syncing**, whether those bins were started in that run or in an earlier one. So both a decrease (new bins opened, started in that run) and an increase (bins below the new radius cancelled, the rest already syncing) are acted on as soon as a run has read the new radius with such a neighbour. A recalculation in which no neighbour has cursors (every cursors request failed, #695) or with no neighbour at all has **not** acted on r.
+- **Residual gap:** "acted on" means bins were started, not that their `Sync` calls succeed. A neighbour whose cursors answer but whose every `Sync` fails would let the settle window pass with nothing pulled. This spec does not close that gap; the measurement watches for it (a node whose rate stays 0 through a settle window while `worker_errors` rise).
 
 ## Problem
 
@@ -25,7 +26,7 @@ The same condition is on upstream `master` (cc5c4706e), `pkg/storer/reserve.go:1
 
 1. **The puller reports since when it has acted on the current radius.** It keeps, guarded by a mutex:
    - `actedRadius`, the radius of the recalculation that last acted on a radius (definition above);
-   - `actedSince`, the completion time of the **first** recalculation that acted on `actedRadius`. It is set when a recalculation acts on a radius different from `actedRadius` (or the first time), and is **not** updated by later recalculations at the same radius, which run every 5 minutes and on every topology change. A recalculation that does not act leaves both unchanged.
+   - `actedSince`, the completion time of the **first** recalculation that acted on `actedRadius`. It is set when a recalculation acts on a radius different from `actedRadius`, whether the radius went down or up (or the first time), and is **not** updated by later recalculations at the same radius, which run every 5 minutes and on every topology change. A recalculation that does not act leaves both unchanged.
 
    It exposes this through a new optional interface in `pkg/storer`:
 
@@ -77,11 +78,12 @@ Unchanged and checked first: while the batch store is stale or just recovered, n
 8. **Puller side:**
    - after an acting recalculation the puller reports that radius and a fresh `since`;
    - **a later recalculation at the same radius does not move `since`**;
-   - a recalculation at a new radius sets a new `since`;
+   - a recalculation at a lower radius sets a new `since` once a neighbour has every bin at or above the new radius syncing;
+   - **a recalculation at a higher radius (an increase) also sets a new `since`,** with the neighbour's remaining bins already syncing from earlier runs;
    - a recalculation in which every neighbour's `GetCursors` fails, or with no neighbour, does not act: before any acting run `ok` is false, afterwards the previous values stay;
    - with a `GetCursors` stub that blocks until released, the reported radius does not change while the run is in progress (kills "recorded before `recalcPeers`").
 
-**Mutation checks** (each must make a test fail): reporter check removed (test 1); `ok` ignored (tests 1, 5); `>=` instead of `==` on the radius (test 4); settle window ignored (test 3); `since` updated on every recalculation (test 8); acting counted without a neighbour (test 8); recorded before `recalcPeers` (test 8); deferral not counted (tests 3 to 5).
+**Mutation checks** (each must make a test fail): reporter check removed (test 1); `ok` ignored (tests 1, 5); `>=` instead of `==` on the radius (test 4); settle window ignored (test 3); `since` updated on every recalculation (test 8); acting counted without a neighbour (test 8); acting required to start bins in the same run, so an increase never acts (test 8); `since` set only on a decrease (test 8); recorded before `recalcPeers` (test 8); deferral not counted (tests 3 to 5).
 
 Race detector on `pkg/storer` and `pkg/puller`; check the exit status directly.
 
@@ -95,6 +97,7 @@ On the dense host (ten nodes, by role), with the build carrying this change and 
 
 - per node, the radius timeline and `bee_puller_acted_radius` (pass: no node goes below the radius its neighbours hold, 6 in the earlier runs; on 2026-10-09 one node reached 5, in the run before three);
 - out-of-radius chunks at the end, `reserveSize - reserveSizeWithinRadius` (pass: under 1 % of capacity, against 5.0 M on one node);
-- `radius_decrease_deferred_total` by reason, and the time each node needed to reach its final radius (the cost above).
+- `radius_decrease_deferred_total` by reason, and the time each node needed to reach its final radius (the cost above);
+- the residual gap: any node whose sync rate stays 0 through a whole settle window while `bee_puller_worker_errors` rises.
 
 Generated with help of AI.
