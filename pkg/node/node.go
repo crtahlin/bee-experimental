@@ -192,6 +192,7 @@ type Options struct {
 	P2PInboundConnectionRate        float64
 	P2PInboundConnectionBurst       int
 	P2PInboundConnectionLimitSet    bool
+	P2PStreamLimits                 libp2p.StreamLimitOptions
 	GasLimitFallback                uint64
 	Logger                          log.Logger
 	MinimumGasTipCap                uint64
@@ -1021,6 +1022,7 @@ func NewBee(
 		InboundConnectionRate:       o.P2PInboundConnectionRate,
 		InboundConnectionBurst:      o.P2PInboundConnectionBurst,
 		InboundConnectionLimitSet:   o.P2PInboundConnectionLimitSet,
+		StreamLimits:                o.P2PStreamLimits,
 		Nonce:                       nonce,
 		AllowPrivateCIDRs:           o.AllowPrivateCIDRs,
 		Registry:                    registry,

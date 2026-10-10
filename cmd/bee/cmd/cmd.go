@@ -16,6 +16,7 @@ import (
 	chaincfg "github.com/ethersphere/bee/v2/pkg/config"
 	"github.com/ethersphere/bee/v2/pkg/log"
 	"github.com/ethersphere/bee/v2/pkg/node"
+	"github.com/ethersphere/bee/v2/pkg/p2p/libp2p"
 	"github.com/ethersphere/bee/v2/pkg/postage/listener"
 	"github.com/ethersphere/bee/v2/pkg/swarm"
 	p2pforge "github.com/ipshipyard/p2p-forge/client"
@@ -87,6 +88,12 @@ const (
 	optionNameP2PConnectionBurstPerIP      = "p2p-connection-burst-per-ip"
 	optionNameP2PInboundConnectionRate     = "p2p-inbound-connection-rate"
 	optionNameP2PInboundConnectionBurst    = "p2p-inbound-connection-burst"
+	optionNameP2PInboundStreamLimits       = "p2p-inbound-stream-limits"
+	optionNameP2PInboundStreamsPerPeer     = "p2p-inbound-streams-per-peer"
+	optionNameP2PInboundStreamReservePull  = "p2p-inbound-stream-reserve-pullsync"
+	optionNameP2PInboundStreamReserveOther = "p2p-inbound-stream-reserve-other"
+	optionNameP2PInboundStreamsTransient   = "p2p-inbound-streams-transient"
+	optionNameP2PInboundStreamsUnnegPeer   = "p2p-inbound-streams-unnegotiated-per-peer"
 	optionNamePostageContractAddress       = "postage-stamp-address"
 	optionNamePostageContractStartBlock    = "postage-stamp-start-block"
 	optionNamePriceOracleAddress           = "price-oracle-address"
@@ -362,6 +369,19 @@ func reserveEvictionRate(config *viper.Viper) int {
 	return config.GetInt(optionNameReserveEvictionRate)
 }
 
+// inboundStreamLimits reads the inbound stream limit settings, as start
+// passes them to the node.
+func inboundStreamLimits(config *viper.Viper) libp2p.StreamLimitOptions {
+	return libp2p.StreamLimitOptions{
+		Enabled:             config.GetBool(optionNameP2PInboundStreamLimits),
+		PerPeer:             config.GetInt(optionNameP2PInboundStreamsPerPeer),
+		ReservePullSync:     config.GetInt(optionNameP2PInboundStreamReservePull),
+		ReserveOther:        config.GetInt(optionNameP2PInboundStreamReserveOther),
+		Transient:           config.GetInt(optionNameP2PInboundStreamsTransient),
+		UnnegotiatedPerPeer: config.GetInt(optionNameP2PInboundStreamsUnnegPeer),
+	}
+}
+
 func (c *command) setAllFlags(cmd *cobra.Command) {
 	cmd.Flags().String(optionNameDataDir, filepath.Join(c.homeDir, ".bee"), "data directory")
 	cmd.Flags().Uint64(optionNameCacheCapacity, 1_000_000, fmt.Sprintf("cache capacity in chunks, multiply by %d to get approximate capacity in bytes", swarm.ChunkSize))
@@ -436,6 +456,12 @@ func (c *command) setAllFlags(cmd *cobra.Command) {
 	cmd.Flags().Int(optionNameP2PConnectionBurstPerIP, 40, "new connections accepted at once from one IPv4 address or one IPv6 /56 subnet above the per-second rate; 0 uses the default of 40. Raising it lets one address open more connections at once; lowering it can refuse the reconnects of a restarting peer, or of users behind a shared carrier NAT, who then wait or try other nodes")
 	cmd.Flags().Float64(optionNameP2PInboundConnectionRate, 30, "new inbound connections per second the node accepts in total, checked after the per-IP limits and before the security handshake, in each of two buckets: full peers that completed a handshake with this node, and every other address; 0 uses the default of 30, -1 turns the limit off, other negative values are refused; off on a bootnode unless set. Raising it lets more connection setups through under a flood, which costs this node CPU and takes it from its reserve samples; lowering it makes new light clients wait or go to other nodes, can make new full peers drop this node from their address books after 4 refused dials, and can make other nodes, and this node itself, judge it unreachable")
 	cmd.Flags().Int(optionNameP2PInboundConnectionBurst, 200, "new inbound connections the node accepts at once above p2p-inbound-connection-rate, per bucket; 0 uses the default of 200, -1 turns the limit off, other negative values are refused. Raising it lets a larger flood through before the rate applies; lowering it can refuse the peers that reconnect at once after a restart, who then wait or go to other nodes")
+	cmd.Flags().Bool(optionNameP2PInboundStreamLimits, false, "apply the inbound stream limits per peer and per protocol group set by the p2p-inbound-stream* settings; off by default until they are measured on real nodes. With it on, a peer or protocol group that reaches its limit has new inbound streams refused (stream reset 0x1002), which keeps one peer or protocol from taking the node-wide stream cap; a refused neighbour cannot sync from or retrieve through this node while it is at the limit, and an upstream neighbour may retry at once in a loop that costs both nodes CPU")
+	cmd.Flags().Int(optionNameP2PInboundStreamsPerPeer, 0, "inbound streams one peer may hold at once across all protocols, when p2p-inbound-stream-limits is on; 0 uses the default of 256, -1 turns this limit off, other negative values are refused. Raising it lets one peer take more of this node's stream cap; lowering it can refuse a legitimate neighbour, which then cannot sync from or retrieve through this node, and an upstream neighbour may retry in a tight loop that costs both nodes CPU")
+	cmd.Flags().Int(optionNameP2PInboundStreamReservePull, 0, "inbound streams kept free for pull-sync, which other protocols and un-negotiated streams cannot use, when p2p-inbound-stream-limits is on; 0 uses the default of 2000, -1 turns this reserve off, other negative values are refused. Raising it leaves less of the node-wide cap for retrieval, push-sync and new connections from other peers; lowering it lets those take more of the room neighbours need to sync from this node")
+	cmd.Flags().Int(optionNameP2PInboundStreamReserveOther, 0, "inbound streams kept free for every protocol other than pull-sync, when p2p-inbound-stream-limits is on; 0 uses the default of 1000, -1 turns this reserve off, other negative values are refused. Raising it leaves less room for neighbours to sync from this node; lowering it lets pull-sync take room that retrieval, push-sync and new connections need")
+	cmd.Flags().Int(optionNameP2PInboundStreamsTransient, 0, "inbound streams the node holds at once before their protocol is negotiated, when p2p-inbound-stream-limits is on; 0 uses the default of 1024, -1 turns this limit off (refused while a reserve is on), other negative values are refused. Raising it leaves less room in the cap for negotiated streams; lowering it can refuse streams of peers that open many at once, such as a neighbour reconnecting after a restart")
+	cmd.Flags().Int(optionNameP2PInboundStreamsUnnegPeer, 0, "inbound streams one peer may hold at once before their protocol is negotiated, when p2p-inbound-stream-limits is on; 0 uses the default of 64, -1 turns this limit off, other negative values are refused. Raising it lets one peer hold more silent streams that count against the node-wide limit; lowering it can refuse a neighbour that opens its pull-sync streams at once on connect (about 52 at radius 6)")
 	cmd.Flags().Int(optionNameUltraLightNodeLimit, 0, "light-node slots that ultra-light peers (light peers without a chequebook) may take; 0 means the same as light-node-limit, and a larger value is reduced to it. Raising it lets clients that cannot pay take more of the node's free bandwidth and handshakes; lowering it refuses such clients sooner and sends them to other nodes, while paying light peers keep their slots")
 	cmd.Flags().String(optionNamePostageContractAddress, "", "postage stamp contract address")
 	cmd.Flags().Uint64(optionNamePostageContractStartBlock, 0, "postage stamp contract start block number")

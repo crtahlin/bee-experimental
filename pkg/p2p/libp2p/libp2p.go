@@ -205,6 +205,10 @@ type Options struct {
 	InboundConnectionBurst    int
 	InboundConnectionLimitSet bool
 
+	// StreamLimits are the inbound stream limits per peer and per
+	// protocol group. They apply only when StreamLimits.Enabled is set.
+	StreamLimits StreamLimitOptions
+
 	// now replaces time.Now in tests.
 	now func() time.Time
 	// blockedInboundProtocols, in tests, are protocols whose inbound
@@ -273,13 +277,7 @@ func New(ctx context.Context, signer beecrypto.Signer, networkID uint64, overlay
 	}
 
 	// Tweak certain settings
-	cfg := rcmgr.PartialLimitConfig{
-		System: rcmgr.ResourceLimits{
-			Streams:         IncomingStreamCountLimit + OutgoingStreamCountLimit,
-			StreamsOutbound: OutgoingStreamCountLimit,
-			StreamsInbound:  IncomingStreamCountLimit,
-		},
-	}
+	cfg := baseLimitConfig()
 
 	for _, p := range o.blockedInboundProtocols {
 		if cfg.Protocol == nil {
@@ -287,6 +285,12 @@ func New(ctx context.Context, signer beecrypto.Signer, networkID uint64, overlay
 		}
 		cfg.Protocol[p] = rcmgr.ResourceLimits{StreamsInbound: rcmgr.BlockAllLimit}
 	}
+
+	streamLimitsCfg, err := buildStreamLimits(o.StreamLimits, IncomingStreamCountLimit)
+	if err != nil {
+		return nil, err
+	}
+	streamLimitsCfg.apply(&cfg)
 
 	// Create our limits by using our cfg and replacing the default values with values from `scaledDefaultLimits`
 	limits := cfg.Build(rcmgr.InfiniteLimits)
@@ -301,7 +305,10 @@ func New(ctx context.Context, signer beecrypto.Signer, networkID uint64, overlay
 
 	perIP := buildPerIPLimits(o.MaxConnectionsPerIP, o.ConnectionRatePerIP, o.ConnectionBurstPerIP)
 
-	rm, err := rcmgr.NewResourceManager(limiter, append([]rcmgr.Option{rcmgr.WithTraceReporter(str)}, perIP.options()...)...)
+	attribution := newStreamAttribution(o.now)
+	highWater := newStreamHighWater(str, attribution)
+
+	rm, err := rcmgr.NewResourceManager(limiter, append([]rcmgr.Option{rcmgr.WithTraceReporter(highWater)}, perIP.options()...)...)
 	if err != nil {
 		return nil, err
 	}
@@ -318,6 +325,9 @@ func New(ctx context.Context, signer beecrypto.Signer, networkID uint64, overlay
 	knownFull := newKnownFullPeers(knownFullPeersMax, knownFullPeerTTL, now)
 	inbound := newInboundLimiter(rm, inboundCfg, knownFull, svcMetrics, now)
 	inbound.limitLoopback = o.inboundLimitLoopback
+	if streamLimitsCfg.wrapperNeeded() {
+		inbound.streams = newStreamLimits(streamLimitsCfg, svcMetrics, attribution)
+	}
 
 	var natManager basichost.NATManager
 
@@ -579,7 +589,14 @@ func New(ctx context.Context, signer beecrypto.Signer, networkID uint64, overlay
 			metrics:  s.metrics,
 			now:      now,
 			logged:   make(map[libp2ppeer.ID]time.Time),
+
+			high:      highWater,
+			attr:      attribution,
+			limits:    inbound.streams,
+			protocols: s.inboundStreamsByProtocol,
 		}
+		attribution.setProtocols(s.inboundStreamsByProtocol)
+		go attribution.run(s.knownFullQuit)
 		go s.streamWatchWorker(s.streams)
 	} else {
 		s.logger.Warning("resource manager does not report per-peer streams; inbound streams per peer are not measured")
@@ -590,6 +607,18 @@ func New(ctx context.Context, signer beecrypto.Signer, networkID uint64, overlay
 	h.Network().Notify(connMetricNotify)
 
 	return s, nil
+}
+
+// baseLimitConfig returns the resource-manager limits the node sets
+// before any optional limit: the node-wide stream counts only.
+func baseLimitConfig() rcmgr.PartialLimitConfig {
+	return rcmgr.PartialLimitConfig{
+		System: rcmgr.ResourceLimits{
+			Streams:         IncomingStreamCountLimit + OutgoingStreamCountLimit,
+			StreamsOutbound: OutgoingStreamCountLimit,
+			StreamsInbound:  IncomingStreamCountLimit,
+		},
+	}
 }
 
 type parsedAddress struct {

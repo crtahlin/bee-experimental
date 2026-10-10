@@ -429,6 +429,7 @@ func buildBeeNode(ctx context.Context, c *command, cmd *cobra.Command, logger lo
 		P2PInboundConnectionRate:        c.config.GetFloat64(optionNameP2PInboundConnectionRate),
 		P2PInboundConnectionBurst:       c.config.GetInt(optionNameP2PInboundConnectionBurst),
 		P2PInboundConnectionLimitSet:    c.config.IsSet(optionNameP2PInboundConnectionRate) || c.config.IsSet(optionNameP2PInboundConnectionBurst),
+		P2PStreamLimits:                 inboundStreamLimits(c.config),
 		Logger:                          logger,
 		MinimumGasTipCap:                c.config.GetUint64(optionNameMinimumGasTipCap),
 		GasLimitFallback:                c.config.GetUint64(optionNameGasLimitFallback),
