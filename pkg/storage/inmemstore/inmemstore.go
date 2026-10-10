@@ -78,6 +78,10 @@ func (s *Store) Put(i storage.Item) error {
 	return s.put(i)
 }
 
+// PutSync implements the storage.SyncWriter interface. The store has no
+// stable storage, so it writes as Put.
+func (s *Store) PutSync(i storage.Item) error { return s.Put(i) }
+
 func (s *Store) put(i storage.Item) error {
 	val, err := i.Marshal()
 	if err != nil {

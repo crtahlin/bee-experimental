@@ -422,6 +422,17 @@ func (s *Store) Put(item storage.Item) error {
 	return s.db.Put(key(item), value, nil)
 }
 
+// PutSync implements the storage.SyncWriter interface: the write is synced
+// to disk before it returns.
+func (s *Store) PutSync(item storage.Item) error {
+	value, err := item.Marshal()
+	if err != nil {
+		return fmt.Errorf("failed serializing: %w", err)
+	}
+
+	return s.db.Put(key(item), value, &opt.WriteOptions{Sync: true})
+}
+
 // Delete implements the storage.Store interface.
 func (s *Store) Delete(item storage.Item) error {
 	// this is a small hack to make the deletion of old entries work. As they

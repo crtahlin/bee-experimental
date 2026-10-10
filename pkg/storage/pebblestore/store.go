@@ -188,6 +188,16 @@ func (s *Store) Put(item storage.Item) error {
 	return s.db.Set(key(item), value, pebble.NoSync)
 }
 
+// PutSync implements the storage.SyncWriter interface: the write is synced
+// to disk before it returns.
+func (s *Store) PutSync(item storage.Item) error {
+	value, err := item.Marshal()
+	if err != nil {
+		return fmt.Errorf("failed serializing: %w", err)
+	}
+	return s.db.Set(key(item), value, pebble.Sync)
+}
+
 func (s *Store) Delete(item storage.Item) error {
 	// Entries written before namespaces existed have no namespace, and their
 	// key is the bare ID with no separator. Carried over from leveldbstore

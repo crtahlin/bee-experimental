@@ -61,6 +61,9 @@ func (s *store) Put(key string, i any) (err error) {
 	return nil
 }
 
+// PutSync writes as Put: the mock has no stable storage.
+func (s *store) PutSync(key string, i any) (err error) { return s.Put(key, i) }
+
 func (s *store) Delete(key string) (err error) {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()

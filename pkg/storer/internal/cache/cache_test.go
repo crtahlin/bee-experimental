@@ -605,6 +605,10 @@ func (s *customIndexStore) Put(i storage.Item) error {
 	return s.IndexStore.Put(i)
 }
 
+func (s *customIndexStore) PutSync(i storage.Item) error {
+	return s.Put(i)
+}
+
 func (t *inmemStorage) NewTransaction(ctx context.Context) (transaction.Transaction, func()) {
 	return &inmemTrx{t.indexStore, t.chunkStore}, func() {}
 }

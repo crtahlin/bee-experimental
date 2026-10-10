@@ -159,6 +159,7 @@ type Store interface {
 
 	Reader
 	Writer
+	SyncWriter
 }
 
 // Reader groups methods that read from the store.
@@ -208,6 +209,13 @@ type Writer interface {
 	Delete(Item) error
 }
 
+// SyncWriter writes an item to stable storage before it returns, so it
+// survives a power loss once PutSync has returned (wasp #725). A store
+// without stable storage (in memory, a batch committed later) writes as Put.
+type SyncWriter interface {
+	PutSync(Item) error
+}
+
 // BatchStore is a store that supports batching of Writer method calls.
 type BatchStore interface {
 	Store
@@ -223,6 +231,7 @@ type Recoverer interface {
 type IndexStore interface {
 	Reader
 	Writer
+	SyncWriter
 }
 
 type Sharky interface {

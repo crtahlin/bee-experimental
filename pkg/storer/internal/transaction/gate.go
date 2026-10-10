@@ -105,6 +105,7 @@ func (closedIndexStore) GetSize(storage.Key) (int, error)               { return
 func (closedIndexStore) Iterate(storage.Query, storage.IterateFn) error { return ErrClosed }
 func (closedIndexStore) Count(storage.Key) (int, error)                 { return 0, ErrClosed }
 func (closedIndexStore) Put(storage.Item) error                         { return ErrClosed }
+func (closedIndexStore) PutSync(storage.Item) error                     { return ErrClosed }
 func (closedIndexStore) Delete(storage.Item) error                      { return ErrClosed }
 
 type closedChunkStore struct{}
