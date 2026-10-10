@@ -1276,3 +1276,47 @@ func TestWaitEndsWhenTheCommitIsGone(t *testing.T) {
 		}
 	})
 }
+
+// A reveal step whose caller left (a second signal ended the wait) keeps
+// running in the background; Close waits for it, so the transaction
+// service and the state store do not close under it (#731). Real time:
+// a goroutine blocked on a mutex is not durably blocked for synctest.
+func TestCloseWaitsForAbandonedStep(t *testing.T) {
+	t.Parallel()
+
+	f := revealFixtureInRevealPhase(t)
+	sending := make(chan struct{})
+	release := make(chan struct{})
+	f.contract.revealResult = func(context.Context, common.Hash) error {
+		close(sending)
+		<-release
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stepped := make(chan struct{})
+	go func() {
+		defer close(stepped)
+		_, _ = f.revealer.Reveal(ctx, 1)
+	}()
+	<-sending
+	cancel()
+	<-stepped // the caller left; the step still runs
+
+	closed := make(chan struct{})
+	go func() {
+		_ = f.revealer.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+		t.Fatal("Close returned while a reveal step was still running")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close did not return after the step ended")
+	}
+}

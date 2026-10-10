@@ -286,10 +286,15 @@ func (r *Revealer) hasCommit(round uint64) bool {
 	return hasKey || inProgress
 }
 
-// Close stops the early reveal and waits for it.
+// Close stops the early reveal and waits for it, and for a reveal step
+// that singleflight gave up on: its context is cancelled once its last
+// caller leaves, so it ends soon, and the transaction service and the
+// state store, which close after the Revealer, are not used after Close.
 func (r *Revealer) Close() error {
 	r.earlyCancel()
 	r.wg.Wait()
+	r.stepMu.Lock()
+	defer r.stepMu.Unlock()
 	return nil
 }
 
