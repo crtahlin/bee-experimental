@@ -133,6 +133,7 @@ whether upstream has the problem. See
 | [#607](https://github.com/crtahlin/wasp/issues/607) | kademlia: a peer that drops us right after connecting is re-dialled forever, because each brief success resets the failed-attempt count | open | - | - |
 | [#640](https://github.com/crtahlin/wasp/issues/640) | pull-sync: a peer that asks again for a bin leaves its older waiting request open, and these fill the inbound stream cap | done | `feat/640-pullsync-duplicate-requests` | [`bb05949a`](https://github.com/crtahlin/wasp/commit/bb05949a) |
 | [#643](https://github.com/crtahlin/wasp/issues/643) | pull-sync: the requested bin is not checked against the number of bins, so a request for a bin that cannot exist waits forever | done | `feat/643-pullsync-bin-check` | [`e379e428`](https://github.com/crtahlin/wasp/commit/e379e428) |
+| [#647](https://github.com/crtahlin/wasp/issues/647) | pull-sync: data race inside the singleflight library when a caller leaves while another joins the same key | open | - | - |
 
 #301 and #302 are done, and they settle only half of what #300 says. Its per
 peer half stands: the three chain calls were confirmed directly, and the rate at
