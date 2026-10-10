@@ -371,6 +371,8 @@ func (db *DB) evictExpiredBatches(ctx context.Context) error {
 	if len(batches) > 0 {
 		rate, workers := db.evictionRateAndWorkers()
 		db.logger.Info("evict expired batches start", "batches", len(batches), "rate", rate, "workers", workers)
+		db.progressStart(progressKindExpired, len(batches))
+		defer db.progressEnd()
 	}
 	// Expired batches use the same rounds and limiter as unreserve (#623).
 	// A batch expiry does not interrupt this eviction, as before.
@@ -401,6 +403,7 @@ func (db *DB) evictExpiredBatches(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		db.progressBatchDone()
 	}
 
 	return nil
@@ -563,6 +566,8 @@ func (db *DB) unreserve(ctx context.Context) (err error) {
 
 	rate, workers := db.evictionRateAndWorkers()
 	db.logger.Info("unreserve start", "target", target, "radius", radius, "rate", rate, "workers", workers)
+	db.progressStart(progressKindUnreserve, 0)
+	defer db.progressEnd()
 
 	batchExpiry, unsub := db.events.Subscribe(batchExpiry)
 	defer unsub()

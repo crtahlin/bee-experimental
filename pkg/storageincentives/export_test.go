@@ -8,4 +8,5 @@ var (
 	NewEvents           = newEvents
 	SampleChunk         = sampleChunk
 	MakeInclusionProofs = makeInclusionProofs
+	SampleFlightKey     = sampleFlightKey
 )

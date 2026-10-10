@@ -50,13 +50,17 @@ var maxEvictionPause = 15 * time.Minute
 // sampleStarted registers a running sample and waits for the eviction round
 // or radius step in progress, if any. It must be called before the sample
 // reads the radius; sampleDone undoes it.
-func (db *DB) sampleStarted() {
+func (db *DB) sampleStarted(lottery bool) {
 	db.samplingMu.Lock()
-	if db.samplingCount == 0 {
-		db.samplingSince = time.Now()
-		db.samplingCapWarned = false
+	if !lottery {
+		db.otherSamplingCount++
+	} else {
+		if db.samplingCount == 0 {
+			db.samplingSince = clock()
+			db.samplingCapWarned = false
+		}
+		db.samplingCount++
 	}
-	db.samplingCount++
 	db.samplingMu.Unlock()
 	db.samplingActive.Add(1)
 
@@ -64,31 +68,37 @@ func (db *DB) sampleStarted() {
 	db.evictionMu.Unlock() //nolint:staticcheck // a barrier: wait for the round in progress
 }
 
-func (db *DB) sampleDone() {
+func (db *DB) sampleDone(lottery bool) {
 	db.samplingMu.Lock()
-	db.samplingCount--
+	if lottery {
+		db.samplingCount--
+	} else {
+		db.otherSamplingCount--
+	}
 	db.samplingMu.Unlock()
 	db.samplingActive.Add(-1)
 }
 
-// evictionShouldWait reports whether eviction must wait for a sample: one
-// runs and the current stretch of sampling has not reached the cap. The
-// first check past the cap in a stretch logs a Warning.
+// evictionShouldWait reports whether eviction must wait for a sample: a
+// lottery sample within its stretch cap, or another sample within the
+// shared budget (#659, pausebudget.go).
 func (db *DB) evictionShouldWait() bool {
+	return db.evictionPause() != pauseNone
+}
+
+func (db *DB) evictionPause() samplePause {
 	db.samplingMu.Lock()
 	defer db.samplingMu.Unlock()
-	if db.samplingCount == 0 {
-		return false
-	}
-	if time.Since(db.samplingSince) < maxEvictionPause {
-		return true
-	}
-	if !db.samplingCapWarned {
-		db.samplingCapWarned = true
-		db.metrics.EvictionPauseCapped.Inc()
-		db.logger.Warning("reserve eviction resumed after a sample ran for too long", "sampling_for", time.Since(db.samplingSince).Round(time.Second), "cap", maxEvictionPause)
-	}
-	return false
+	return db.evictionPauseReasonLocked(clock())
+}
+
+// countWait starts or ends the waited time charged to the budget: only a
+// wait for other samples alone is charged, so it is decided again at every
+// poll (one wait can span a lottery sample and a following /rchash).
+func (db *DB) countWait(reason samplePause) {
+	db.samplingMu.Lock()
+	db.pauseBudget.setOpen(reason == pauseForOther, clock())
+	db.samplingMu.Unlock()
 }
 
 // waitWhileSampling waits until eviction may proceed. A shutdown, a batch
@@ -96,9 +106,12 @@ func (db *DB) evictionShouldWait() bool {
 // never fires. The paused time is counted and left out of the eviction
 // episode's active time and of the pacer's headroom.
 func (db *DB) waitWhileSampling(ctx context.Context, expiry <-chan struct{}) error {
-	if !db.evictionShouldWait() {
+	reason := db.evictionPause()
+	if reason == pauseNone {
 		return nil
 	}
+	db.countWait(reason)
+	defer db.countWait(pauseNone)
 	start := time.Now()
 	db.episode.pauseStarted(start)
 	db.logger.Debug("reserve eviction paused while a sample runs")
@@ -111,9 +124,15 @@ func (db *DB) waitWhileSampling(ctx context.Context, expiry <-chan struct{}) err
 		}
 		db.logger.Debug("reserve eviction resumed after a sample", "paused", d)
 	}()
-	t := time.NewTicker(samplingPausePoll)
+	t := time.NewTicker(samplingPausePollVar)
 	defer t.Stop()
-	for db.evictionShouldWait() {
+	for {
+		reason = db.evictionPause()
+		db.countWait(reason)
+		if reason == pauseNone {
+			break
+		}
+		db.progressLine(true)
 		select {
 		case <-db.quit:
 			return ErrDBQuit

@@ -196,8 +196,9 @@ func (db *DB) reserveSample(
 	// pulling or eviction paused. See issues #23 and #649. sampleStarted
 	// also waits for an eviction round or radius step in progress, so the
 	// radius read below is the one the whole sample sees.
-	db.sampleStarted()
-	defer db.sampleDone()
+	lottery := isLotterySample(ctx)
+	db.sampleStarted(lottery)
+	defer db.sampleDone(lottery)
 
 	g, ctx := errgroup.WithContext(ctx)
 

@@ -79,12 +79,19 @@ func ResetReserveSizeWithinRadiusForTest() {
 // eviction with.
 func IsEvictionExpiry(err error) bool { return errors.Is(err, errEvictionExpiry) }
 
-// SampleStartedForTest registers a running sample as reserveSample does,
-// including the wait at the eviction barrier (#649).
-func (db *DB) SampleStartedForTest() { db.sampleStarted() }
+// SampleStartedForTest registers a running lottery sample as reserveSample
+// does, including the wait at the eviction barrier (#649).
+func (db *DB) SampleStartedForTest() { db.sampleStarted(true) }
 
 // SampleDoneForTest ends a sample SampleStartedForTest registered.
-func (db *DB) SampleDoneForTest() { db.sampleDone() }
+func (db *DB) SampleDoneForTest() { db.sampleDone(true) }
+
+// OtherSampleStartedForTest registers a running sample that is not the
+// lottery's, such as /rchash (#659).
+func (db *DB) OtherSampleStartedForTest() { db.sampleStarted(false) }
+
+// OtherSampleDoneForTest ends a sample OtherSampleStartedForTest registered.
+func (db *DB) OtherSampleDoneForTest() { db.sampleDone(false) }
 
 // SetMaxEvictionPauseForTest sets the cap on how long eviction waits for one
 // stretch of sampling and returns a function that restores it.
@@ -120,3 +127,18 @@ func (db *DB) EvictionExpirySecondsForTest() float64 {
 
 // EpisodeWorkLeftForTest reports what keeps an eviction episode open (#663).
 func (db *DB) EpisodeWorkLeftForTest() bool { return db.episodeWorkLeft() }
+
+// EvictionRemainingForTest reads the remaining gauge (#626).
+func (db *DB) EvictionRemainingForTest() float64 { return metricValue(db.metrics.EvictionRemaining) }
+
+// EvictionTargetForTest is the reserve's eviction target.
+func (db *DB) EvictionTargetForTest() int { return db.reserve.EvictionTarget() }
+
+// ExpiredBatchesRemainingForTest reads the expired-batches gauge (#626).
+func (db *DB) ExpiredBatchesRemainingForTest() float64 {
+	return metricValue(db.metrics.EvictionExpiredBatchesRemaining)
+}
+
+// RefreshEvictionProgressForTest refreshes the progress gauges as a round
+// does.
+func (db *DB) RefreshEvictionProgressForTest() { db.progressLine(false) }

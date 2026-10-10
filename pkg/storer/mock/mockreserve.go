@@ -104,6 +104,14 @@ func WithEvictingFor(d time.Duration) Option {
 	})
 }
 
+// WithSampleContextHook sets a function ReserveSample calls with its
+// context, so a test can see what the caller marked on it (wasp #659).
+func WithSampleContextHook(f func(context.Context)) Option {
+	return optionFunc(func(p *ReserveStore) {
+		p.sampleCtxHook = f
+	})
+}
+
 // WithSampleHook sets a function ReserveSample calls before it returns, so a
 // test can change the store while a sample runs (#649).
 func WithSampleHook(f func()) Option {
@@ -151,6 +159,7 @@ type ReserveStore struct {
 	windowedSample    storer.Sample
 	windowedSampleSet bool
 	sampleHook        func()
+	sampleCtxHook     func(context.Context)
 }
 
 // NewReserve returns a new Reserve mock.
@@ -382,7 +391,10 @@ func (s *ReserveStore) ReserveHas(addr swarm.Address, batchID []byte, stampHash 
 	return true, nil
 }
 
-func (s *ReserveStore) ReserveSample(context.Context, []byte, uint8, uint64, *big.Int) (storer.Sample, error) {
+func (s *ReserveStore) ReserveSample(ctx context.Context, _ []byte, _ uint8, _ uint64, _ *big.Int) (storer.Sample, error) {
+	if s.sampleCtxHook != nil {
+		s.sampleCtxHook(ctx)
+	}
 	if s.sampleHook != nil {
 		s.sampleHook()
 	}
