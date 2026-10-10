@@ -1174,7 +1174,8 @@ func TestCommitMissingOnceIsNotGone(t *testing.T) {
 
 // One signal never cancels the stop's context. When block number reads
 // keep failing, the wait still ends within WaitBudget plus the margin,
-// and the stop goes on (the miss is counted).
+// and the stop goes on. The miss is counted; the wait is not, because no
+// block read confirmed that the reveal phase was still open (#729).
 func TestWaitBoundedWhenBlockReadsFail(t *testing.T) {
 	t.Parallel()
 
@@ -1206,8 +1207,8 @@ func TestWaitBoundedWhenBlockReadsFail(t *testing.T) {
 			t.Fatalf("wait took %v, limit %v", took, limit)
 		}
 		st, _ := f.state().Status()
-		if st.StopWaitedForReveal != 1 || st.RevealMissedOnStop != 1 {
-			t.Fatalf("counts waited %d missed %d, want 1 and 1", st.StopWaitedForReveal, st.RevealMissedOnStop)
+		if st.StopWaitedForReveal != 0 || st.RevealMissedOnStop != 1 {
+			t.Fatalf("counts waited %d missed %d, want 0 and 1", st.StopWaitedForReveal, st.RevealMissedOnStop)
 		}
 	})
 }
@@ -1241,4 +1242,37 @@ func TestRevealRevertedRechecksListed(t *testing.T) {
 	if !f.state().HasRevealed(1) {
 		t.Fatal("round not revealed although an older listed reveal was mined")
 	}
+}
+
+// A commit in progress when the stop starts ends without a key (it was
+// not broadcast): the wait returns within a block instead of waiting for
+// the reveal phase, and no missed reveal is counted (#728).
+func TestWaitEndsWhenTheCommitIsGone(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		f := newRevealFixture(t, mock.NewStateStore(), newFakeChain(testBlocksPerRound+1), newFakeTxs())
+		const round = 1
+		f.setSample(round)
+		f.state().SetCurrentBlock(f.chain.block())
+		if err := f.revealer.beginCommit(round, []byte("key")); err != nil {
+			t.Fatal(err)
+		}
+
+		go func() {
+			time.Sleep(testBlockTime / 2)
+			f.revealer.endCommit(round, transaction.ErrNotBroadcast)
+		}()
+		start := time.Now()
+		if err := f.revealer.Wait(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if took := time.Since(start); took > 2*testBlockTime {
+			t.Fatalf("wait took %v after the commit was gone, want at most two blocks", took)
+		}
+		st, _ := f.state().Status()
+		if st.StopWaitedForReveal != 1 || st.RevealMissedOnStop != 0 {
+			t.Fatalf("counts waited %d missed %d, want 1 and 0", st.StopWaitedForReveal, st.RevealMissedOnStop)
+		}
+	})
 }

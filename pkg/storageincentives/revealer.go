@@ -243,9 +243,15 @@ func (r *Revealer) Wait(ctx context.Context) error {
 	waitCtx, cancel := context.WithTimeout(ctx, limit)
 	defer cancel()
 
-	if block, err := r.backend.BlockNumber(waitCtx); err == nil && block >= deadline {
-		// the last block seen is stale: the phase is over already
-		return nil
+	// A wait counts only when a block read confirms that the reveal
+	// phase has not ended; a failed read still waits, uncounted.
+	var waited uint64
+	if block, err := r.backend.BlockNumber(waitCtx); err == nil {
+		if block >= deadline {
+			// the last block seen is stale: the phase is over already
+			return nil
+		}
+		waited = 1
 	}
 
 	r.logger.Warning("stop waits for the storage-lottery reveal", "round", round, "up_to_block", deadline, "at_most", limit)
@@ -254,14 +260,30 @@ func (r *Revealer) Wait(ctx context.Context) error {
 	if !revealed && ctx.Err() == nil && errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
 		r.logger.Warning("stop: the storage-lottery reveal wait reached its time limit", "round", round, "limit", limit)
 	}
-	if revealed {
+	switch {
+	case revealed:
 		r.logger.Info("stop: storage-lottery reveal mined, stopping", "round", round)
-		r.state.countStop(1, 0, 0)
-	} else {
+		r.state.countStop(waited, 0, 0)
+	case !r.hasCommit(round):
+		// the commit was not broadcast, reverted or never landed: no
+		// reveal is owed, so none is missed
+		r.logger.Info("stop: no storage-lottery commit to reveal, stopping", "round", round)
+		r.state.countStop(waited, 0, 0)
+	default:
 		r.logger.Info("stop: storage-lottery reveal missed, stopping", "round", round)
-		r.state.countStop(1, 1, 0)
+		r.state.countStop(waited, 1, 0)
 	}
 	return ctx.Err()
+}
+
+// hasCommit reports whether the round has a stored commit key or a commit
+// in progress.
+func (r *Revealer) hasCommit(round uint64) bool {
+	r.commitGate.Lock()
+	defer r.commitGate.Unlock()
+	_, inProgress := r.inProgress[round]
+	_, hasKey := r.state.CommitKey(round)
+	return hasKey || inProgress
 }
 
 // Close stops the early reveal and waits for it.
@@ -278,6 +300,11 @@ func (r *Revealer) revealUntil(ctx context.Context, round uint64) bool {
 	for {
 		if r.state.HasRevealed(round) {
 			return true
+		}
+		if !r.hasCommit(round) {
+			// the commit's key is gone (not broadcast, reverted, never
+			// landed) and no commit is in progress: nothing to reveal
+			return false
 		}
 
 		block, err := r.backend.BlockNumber(ctx)
