@@ -12,6 +12,7 @@ import (
 	"errors"
 	"hash"
 	"math/big"
+	"strings"
 	"testing"
 	"time"
 
@@ -1129,5 +1130,51 @@ func TestStartReturnsOnCancel(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Start still waiting 5 s after the cancel")
+	}
+}
+
+// TestNewSnapshotReplayCancelled checks that a stop during the snapshot replay
+// is returned as a cancellation and logged at info level, not as an error.
+// The store is still reset once, so the next start replays the snapshot
+// again. Before, New treated the stop as a failed snapshot and returned nil,
+// so the build went on with a cancelled context (#759).
+func TestNewSnapshotReplayCancelled(t *testing.T) {
+	t.Parallel()
+
+	buf := new(bytes.Buffer)
+	logger := log.NewLogger(t.Name(), log.WithSink(buf), log.WithVerbosity(log.VerbosityAll)).Build()
+	store := mock.New()
+	snapshot := &batchservice.Snapshot{Listener: silentListener{}, StartBlock: 100}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	type result struct {
+		loaded bool
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		_, loaded, err := batchservice.New(ctx, mocks.NewStateStore(), store, logger, newMockListener(), nil, nil, nil, snapshot, false)
+		done <- result{loaded, err}
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	var r result
+	select {
+	case r = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("New still waiting 5 s after the cancel")
+	}
+	if !errors.Is(r.err, context.Canceled) {
+		t.Fatalf("New returned %v, want an error wrapping context.Canceled", r.err)
+	}
+	if r.loaded {
+		t.Fatal("snapshot reported as loaded after a cancelled replay")
+	}
+	if c := store.ResetCalls(); c != 1 {
+		t.Fatalf("batch store reset %d times after a cancelled replay, want 1", c)
+	}
+	if strings.Contains(buf.String(), `"level"="error"`) {
+		t.Fatalf("cancelled replay logged at error level:\n%s", buf.String())
 	}
 }
