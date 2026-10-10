@@ -142,16 +142,22 @@ func New(
 	snapshotLoaded := false
 	if snapshot != nil {
 		if err := bs.loadSnapshot(ctx, snapshot); err != nil {
-			// A stop during the replay is not a failed snapshot: keep what was
-			// replayed (the chain state marks where the next start resumes) and
-			// let the build take its error path, which closes the store (#759).
-			if ctx.Err() != nil {
+			// A stop during the replay is not a failed snapshot (#759).
+			stopped := ctx.Err() != nil
+			if stopped {
+				logger.Info("postage snapshot replay stopped; it is replayed again at the next start")
+			} else {
+				logger.Error(err, "failed to start batch service from snapshot, continuing outside snapshot block...")
+			}
+			// A partial replay may have written to (and dirtied) the store, so
+			// reset it again. After a failure live sync rebuilds it from the
+			// chain. After a stop the empty store makes the next start replay
+			// the snapshot again, which it skips when any batch is stored.
+			if err := bs.reset(); err != nil {
 				return nil, false, err
 			}
-			logger.Error(err, "failed to start batch service from snapshot, continuing outside snapshot block...")
-			// A partial replay may have written to (and dirtied) the store, so
-			// reset it again to rebuild cleanly from the chain during live sync.
-			if err := bs.reset(); err != nil {
+			if stopped {
+				// The build takes its error path, which closes the store.
 				return nil, false, err
 			}
 		} else {

@@ -1134,9 +1134,10 @@ func TestStartReturnsOnCancel(t *testing.T) {
 }
 
 // TestNewSnapshotReplayCancelled checks that a stop during the snapshot replay
-// is returned as a cancellation: the batch store is not reset and no error is
-// logged. Before, New treated it as a failed snapshot, reset the store and
-// returned nil, so the build went on with a cancelled context (#759).
+// is returned as a cancellation and logged at info level, not as an error.
+// The store is still reset once, so the next start replays the snapshot
+// again. Before, New treated the stop as a failed snapshot and returned nil,
+// so the build went on with a cancelled context (#759).
 func TestNewSnapshotReplayCancelled(t *testing.T) {
 	t.Parallel()
 
@@ -1170,8 +1171,8 @@ func TestNewSnapshotReplayCancelled(t *testing.T) {
 	if r.loaded {
 		t.Fatal("snapshot reported as loaded after a cancelled replay")
 	}
-	if c := store.ResetCalls(); c != 0 {
-		t.Fatalf("batch store reset %d times after a cancelled replay, want 0", c)
+	if c := store.ResetCalls(); c != 1 {
+		t.Fatalf("batch store reset %d times after a cancelled replay, want 1", c)
 	}
 	if strings.Contains(buf.String(), `"level"="error"`) {
 		t.Fatalf("cancelled replay logged at error level:\n%s", buf.String())
