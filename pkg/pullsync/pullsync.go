@@ -240,6 +240,20 @@ func (s *Syncer) handler(streamCtx context.Context, p p2p.Peer, stream p2p.Strea
 		s.metrics.RequestsAbandoned.WithLabelValues(watch.reason).Inc()
 		return fmt.Errorf("make offer: %w (%s)", cause, watch.reason)
 	}
+	// The connection ended (libp2p cancels the stream's handler context on a
+	// disconnect) and that cancel reached the request before the watcher's,
+	// or the request had no watcher. It is abandoned all the same; count it,
+	// unless the node is stopping or the same peer replaced it. A request
+	// whose offer was built just as the connection ended is counted here and
+	// not written; the write would fail. See #672.
+	if streamCtx.Err() != nil && !s.stopping() && !errors.Is(cause, errRequestReplaced) {
+		reason := reasonDisconnect
+		if watch != nil && watch.reason != "" {
+			reason = watch.reason
+		}
+		s.metrics.RequestsAbandoned.WithLabelValues(reason).Inc()
+		return fmt.Errorf("make offer: %w (%s)", errRequesterGone, reason)
+	}
 	if err != nil {
 		if errors.Is(cause, errRequestReplaced) {
 			err = cause
@@ -737,6 +751,16 @@ func (s *Syncer) Close() error {
 		s.logger.Warning("pull syncer shutting down with running goroutines")
 	}
 	return nil
+}
+
+// stopping reports whether the syncer is shutting down.
+func (s *Syncer) stopping() bool {
+	select {
+	case <-s.quit:
+		return true
+	default:
+		return false
+	}
 }
 
 // afterMakeOffer runs between makeOffer and unregistering the request. It
