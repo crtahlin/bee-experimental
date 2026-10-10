@@ -341,11 +341,8 @@ func (r *Revealer) revealStep(ctx context.Context, round uint64) (bool, error) {
 	txs, sentBlock := r.state.RevealTxs(round)
 
 	// any listed reveal mined: done, whichever it is
-	for _, txHash := range txs {
-		if st, err := r.txService.TransactionStatus(ctx, txHash); err == nil && st == transaction.TxMined {
-			r.revealed(ctx, round, txHash)
-			return true, nil
-		}
+	if r.listedRevealMined(ctx, round) {
+		return true, nil
 	}
 
 	listRevealTx := func(txHash common.Hash) error {
@@ -406,12 +403,31 @@ func (r *Revealer) revealStep(ctx context.Context, round uint64) (bool, error) {
 	txHash, err := r.contract.Reveal(ctx, sample.StorageRadius, sample.ReserveSampleHash.Bytes(), key, listRevealTx)
 	if err != nil {
 		if errors.Is(err, transaction.ErrTransactionReverted) {
+			// An earlier listed reveal can have been mined after its
+			// status was read; the fresh reveal then reverts because the
+			// round is revealed already.
+			if r.listedRevealMined(ctx, round) {
+				return true, nil
+			}
 			return true, err
 		}
 		return false, err
 	}
 	r.revealed(ctx, round, txHash)
 	return true, nil
+}
+
+// listedRevealMined marks the round revealed when any of its listed reveal
+// hashes is mined, and reports whether one is.
+func (r *Revealer) listedRevealMined(ctx context.Context, round uint64) bool {
+	txs, _ := r.state.RevealTxs(round)
+	for _, txHash := range txs {
+		if st, err := r.txService.TransactionStatus(ctx, txHash); err == nil && st == transaction.TxMined {
+			r.revealed(ctx, round, txHash)
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Revealer) revealed(ctx context.Context, round uint64, txHash common.Hash) {

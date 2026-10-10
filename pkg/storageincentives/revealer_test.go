@@ -1211,3 +1211,34 @@ func TestWaitBoundedWhenBlockReadsFail(t *testing.T) {
 		}
 	})
 }
+
+// The newest listed reveal reads as cancelled because an older listed one
+// was mined between the status reads; the fresh reveal then reverts. The
+// listed hashes are checked again, so the round counts as revealed and its
+// claim is not skipped (#730).
+func TestRevealRevertedRechecksListed(t *testing.T) {
+	t.Parallel()
+
+	f := revealFixtureInRevealPhase(t)
+	older, newer := f.txs.newHash(), f.txs.newHash()
+	f.txs.set(older, transaction.TxPending)
+	f.txs.set(newer, transaction.TxCancelled)
+	if err := f.state().AddRevealTx(1, older, 17); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.state().AddRevealTx(1, newer, 17); err != nil {
+		t.Fatal(err)
+	}
+	f.contract.revealResult = func(context.Context, common.Hash) error {
+		f.txs.set(older, transaction.TxMined)
+		return fmt.Errorf("reveal: %w", transaction.ErrTransactionReverted)
+	}
+
+	done, err := f.revealer.Reveal(context.Background(), 1)
+	if !done || err != nil {
+		t.Fatalf("done %v err %v; want done with no error", done, err)
+	}
+	if !f.state().HasRevealed(1) {
+		t.Fatal("round not revealed although an older listed reveal was mined")
+	}
+}
