@@ -138,6 +138,7 @@ whether upstream has the problem. See
 | [#696](https://github.com/crtahlin/wasp/issues/696) | storer: the radius drops a second step while the puller has not synced at the current radius, because a sync rate of 0 counts as synced | done | `feat/696-radius-decrease-after-sync` | [`a724fe45`](https://github.com/crtahlin/wasp/commit/a724fe45) |
 | [#576](https://github.com/crtahlin/wasp/issues/576) | Puller: a peer that keeps answering with an empty offer is still retried with no pause | done | `feat/576-puller-no-progress-and-epoch` | [`366f0a53`](https://github.com/crtahlin/wasp/commit/366f0a53) |
 | [#590](https://github.com/crtahlin/wasp/issues/590) | puller: a failed epoch read or write after GetCursors skips the peer's epoch reset for good | done | `feat/576-puller-no-progress-and-epoch` | [`366f0a53`](https://github.com/crtahlin/wasp/commit/366f0a53) |
+| [#725](https://github.com/crtahlin/wasp/issues/725) | storage incentives: a stop between commit and reveal freezes the node for twice as long; wait for the reveal before stopping | open | `feat/725-reveal-before-stop` | - |
 
 #301 and #302 are done, and they settle only half of what #300 says. Its per
 peer half stands: the three chain calls were confirmed directly, and the rate at
