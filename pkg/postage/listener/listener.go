@@ -417,7 +417,9 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 		l.logger.Debug("using standard page size", "page_size", pageSize)
 	}
 
-	synced := make(chan error)
+	// Buffered: sendSynced sends at most once, so the send never blocks, also
+	// when the reader stopped waiting because its context ended (#757).
+	synced := make(chan error, 1)
 	closeOnce := new(sync.Once)
 	// sendSynced reports to the one reader of synced, at most once. It gives
 	// up when the listener closes, so a send nobody reads cannot block
@@ -512,8 +514,13 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 			to, err := l.ev.BlockNumber(callCtx)
 			cancelCall()
 			if err != nil {
+				// A cancelled sync is not a synced one: returning nil here
+				// reported a stop as "synced" (#757).
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
 				if errors.Is(err, context.Canceled) {
-					return nil
+					return err
 				}
 				if errors.Is(err, ErrParseSnapshot) {
 					return err
@@ -564,6 +571,9 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 			events, err := l.ev.FilterLogs(callCtx, l.filterQuery(big.NewInt(int64(from)), big.NewInt(int64(to))))
 			cancelCall()
 			if err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
 				if errors.Is(err, ErrParseSnapshot) {
 					return err
 				}
@@ -624,8 +634,12 @@ func (l *listener) Listen(ctx context.Context, from uint64, updater postage.Even
 		err := listenf()
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
-				// Context cancelled is returned on shutdown, therefore we do nothing here.
+				// Context cancelled is returned on shutdown. It is not a
+				// sync failure, so syncingStopped is not signalled, but a
+				// caller still waiting for the startup sync must hear of it:
+				// returning without a send left it waiting forever (#757).
 				l.logger.Debug("shutting down event listener")
+				sendSynced(err)
 				return
 			}
 			// Only faults that waiting cannot fix end the loop: a failure to

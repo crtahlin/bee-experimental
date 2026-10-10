@@ -185,7 +185,7 @@ func (svc *batchService) loadSnapshot(ctx context.Context, snapshot *Snapshot) e
 		startBlock = cs.Block
 	}
 
-	return <-snapshot.Listener.Listen(ctx, startBlock+1, svc)
+	return awaitSynced(ctx, snapshot.Listener.Listen(ctx, startBlock+1, svc))
 }
 
 // Create will create a new batch with the given ID, owner value and depth and
@@ -340,9 +340,20 @@ func (svc *batchService) Start(ctx context.Context, startBlock uint64) (err erro
 		startBlock = cs.Block
 	}
 
-	syncedChan := svc.listener.Listen(ctx, startBlock+1, svc)
+	return awaitSynced(ctx, svc.listener.Listen(ctx, startBlock+1, svc))
+}
 
-	return <-syncedChan
+// awaitSynced waits for the listener's synced signal or for ctx to end. A
+// stop during the startup sync cancels ctx; without this the build waited
+// on a signal that never came and the stop hung until the process was
+// killed (wasp #757). The error wraps both ErrInterruped and ctx.Err().
+func awaitSynced(ctx context.Context, synced <-chan error) error {
+	select {
+	case err := <-synced:
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("%w: %w", ErrInterruped, ctx.Err())
+	}
 }
 
 // updateChecksum updates the batchservice checksum once an event gets

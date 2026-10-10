@@ -1094,3 +1094,40 @@ func (h *hs) Sum(b []byte) []byte               { return []byte{h.ctr} }
 func (h *hs) Reset()                            {}
 func (h *hs) Size() int                         { panic("not implemented") }
 func (h *hs) BlockSize() int                    { panic("not implemented") }
+
+// silentListener never reports on its synced channel, like a startup sync
+// that has not caught up yet.
+type silentListener struct{}
+
+func (silentListener) Listen(context.Context, uint64, postage.EventUpdater) <-chan error {
+	return make(chan error)
+}
+func (silentListener) Close() error { return nil }
+
+// TestStartReturnsOnCancel checks that Start returns once its context is
+// cancelled, even when the listener has not reported. Before, Start waited
+// on the synced channel only, so a stop during the startup sync waited for
+// a build that never ended (#757).
+func TestStartReturnsOnCancel(t *testing.T) {
+	t.Parallel()
+
+	svc, _, err := batchservice.New(context.Background(), mocks.NewStateStore(), mock.New(), testLog, silentListener{}, nil, nil, nil, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- svc.Start(ctx, 10) }()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) || !errors.Is(err, batchservice.ErrInterruped) {
+			t.Fatalf("Start returned %v, want ErrInterruped wrapping context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start still waiting 5 s after the cancel")
+	}
+}
