@@ -21,6 +21,7 @@ type metrics struct {
 	OnChangeDuration      prometheus.Histogram   // duration of completed recalculations
 	CursorRequestsFailed  *prometheus.CounterVec // failed cursors requests by reason
 	ActedRadius           prometheus.Gauge       // storage radius the puller has acted on
+	NoProgress            prometheus.Counter     // sync calls with no error and no progress
 }
 
 func newMetrics(pullsyncRate func() float64) metrics {
@@ -83,6 +84,12 @@ func newMetrics(pullsyncRate func() float64) metrics {
 			Buckets:   []float64{0.1, 0.5, 1, 5, 15, 30, 60, 120, 300, 900, 1800, 3600},
 		}),
 		CursorRequestsFailed: cursorRequestsFailed(subsystem),
+		NoProgress: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "no_progress_total",
+			Help:      "Pull-sync calls that returned no error and did not advance the interval: an empty offer, or an offer whose topmost is below the start. A running peer never sends one; a neighbour that is shutting down may send one. Such calls are retried after the same growing pause as failed calls (#576).",
+		}),
 		ActedRadius: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: m.Namespace,
 			Subsystem: subsystem,

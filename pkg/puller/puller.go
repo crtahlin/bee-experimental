@@ -370,8 +370,11 @@ func (p *Puller) syncPeer(ctx context.Context, peer *syncPeer, storageRadius uin
 		if err != nil {
 			return fmt.Errorf("could not get cursors from peer %s: %w", peer.address, err)
 		}
-		peer.cursors = cursors
 
+		// The cursors are kept only once the epoch check has succeeded: set
+		// before it, a failed check would be skipped at every later
+		// recalculation, and the peer synced with intervals from its
+		// previous epoch. See #590.
 		storedEpoch, err := p.getPeerEpoch(peer.address)
 		if err != nil {
 			return fmt.Errorf("retrieve epoch for peer %s: %w", peer.address, err)
@@ -392,6 +395,7 @@ func (p *Puller) syncPeer(ctx context.Context, peer *syncPeer, storageRadius uin
 				return fmt.Errorf("set epoch for peer %s: %w", peer.address, err)
 			}
 		}
+		peer.cursors = cursors
 	}
 
 	if len(peer.cursors) != int(p.bins) {
@@ -524,17 +528,23 @@ func (p *Puller) syncPeerBin(parentCtx context.Context, peer *syncPeer, bin uint
 				}
 				errCount := countErrors(err)
 				p.logger.Debug("syncWorker interval failed", "error_count", errCount, "example_error", errors.Unwrap(err), "peer_address", address, "bin", bin, "cursor", cursor, "start", start, "topmost", top)
-				// A call that failed without advancing the interval is retried
-				// only after a pause; one that advanced (some chunks failed, the
-				// interval moved on) continues at once, as before. Without the
-				// pause, a peer that keeps failing is retried as fast as the
-				// network allows. See #573.
-				if top < start {
-					failures++
-					if !p.waitRetry(ctx, failures) {
-						p.logger.Debug("syncWorker context cancelled", "peer_address", address, "bin", bin)
-						return
-					}
+			} else if top < start {
+				// No error and no progress: an empty offer, or one whose
+				// topmost is below the start. A running peer never sends
+				// one; it waits for a chunk instead. See #576.
+				p.metrics.NoProgress.Inc()
+			}
+
+			// A call that did not advance the interval, with or without an
+			// error, is retried only after a pause; one that advanced
+			// continues at once, as before. Without the pause, a peer that
+			// keeps failing, or keeps answering with nothing, is retried as
+			// fast as the network allows. See #573 and #576.
+			if top < start {
+				failures++
+				if !p.waitRetry(ctx, failures) {
+					p.logger.Debug("syncWorker context cancelled", "peer_address", address, "bin", bin)
+					return
 				}
 			}
 
