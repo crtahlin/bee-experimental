@@ -36,7 +36,9 @@ const (
 	// "cancelled" commit counts as not on chain. The contract accepts
 	// commits only in the commit phase, so a commit that a head this far
 	// into the reveal phase does not know never landed; a lagging head
-	// is checked again at the next block.
+	// is checked again at the next block. The answer must also hold at
+	// two consecutive heads, because the commit's status and the head come
+	// from separate calls, which can reach different chain nodes.
 	commitSettleBlocks = 2
 
 	// stopWaitMargin is added to WaitBudget to bound the stop wait, so a
@@ -96,6 +98,11 @@ type Revealer struct {
 	// one of them counts as a reveal after a restart
 	startupRounds map[uint64]struct{}
 
+	// commitGoneAt is the head at which a round's commit was last seen
+	// missing from a settled head; a second such answer at a later head
+	// removes the key. Guarded by stepMu.
+	commitGoneAt map[uint64]uint64
+
 	earlyCancel context.CancelFunc
 	wg          sync.WaitGroup
 }
@@ -123,6 +130,7 @@ func NewRevealer(
 		logger:         logger.WithName(loggerName).Register(),
 		inProgress:     make(map[uint64]struct{}),
 		startupRounds:  make(map[uint64]struct{}),
+		commitGoneAt:   make(map[uint64]uint64),
 		earlyCancel:    func() {},
 	}
 
@@ -425,10 +433,11 @@ const (
 // commitOnChain checks the round's commit before its first reveal. It is
 // gone when its receipt reverted, or when a synced backend whose head is
 // commitSettleBlocks into the reveal phase does not know it (or reports
-// its nonce used by another transaction). The same answer from a head
-// closer to the phase start is checked again at the next block. A lookup
-// error, an unsynced backend or an unknown commit hash all mean
-// "possibly committed".
+// its nonce used by another transaction) at two consecutive heads. The
+// same answer from a head closer to the phase start, or the first such
+// answer, is checked again at the next block. A lookup error, an unsynced
+// backend or an unknown commit hash all mean "possibly committed", and
+// clear an earlier "missing" answer.
 func (r *Revealer) commitOnChain(ctx context.Context, round uint64) commitCheck {
 	commitTx := r.state.CommitTx(round)
 	if commitTx == (common.Hash{}) {
@@ -436,21 +445,33 @@ func (r *Revealer) commitOnChain(ctx context.Context, round uint64) commitCheck 
 	}
 	st, err := r.txService.TransactionStatus(ctx, commitTx)
 	if err != nil {
+		delete(r.commitGoneAt, round)
 		return commitPossible
 	}
 	switch st {
 	case transaction.TxReverted:
+		delete(r.commitGoneAt, round)
 		return commitGone
 	case transaction.TxNotFound, transaction.TxCancelled:
 		header, err := r.backend.HeaderByNumber(ctx, nil)
 		if err != nil || !headerFresh(header) {
+			delete(r.commitGoneAt, round)
 			return commitPossible
 		}
 		if header.Number == nil || header.Number.Uint64() < r.revealStart(round)+commitSettleBlocks {
 			return commitRecheck
 		}
-		return commitGone
+		head := header.Number.Uint64()
+		if first, ok := r.commitGoneAt[round]; ok && head > first {
+			delete(r.commitGoneAt, round)
+			return commitGone
+		}
+		if _, ok := r.commitGoneAt[round]; !ok {
+			r.commitGoneAt[round] = head
+		}
+		return commitRecheck
 	}
+	delete(r.commitGoneAt, round)
 	return commitPossible
 }
 

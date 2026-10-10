@@ -433,7 +433,13 @@ func TestNoSecondCommit(t *testing.T) {
 // the chain into its reveal phase.
 func revealFixtureInRevealPhase(t *testing.T) *revealFixture {
 	t.Helper()
-	f := newRevealFixture(t, mock.NewStateStore(), newFakeChain(17), newFakeTxs())
+	return revealFixtureAt(t, 17)
+}
+
+// revealFixtureAt is revealFixtureInRevealPhase with the chain at block.
+func revealFixtureAt(t *testing.T, block uint64) *revealFixture {
+	t.Helper()
+	f := newRevealFixture(t, mock.NewStateStore(), newFakeChain(block), newFakeTxs())
 	f.setSample(1)
 	if err := f.state().SetCommitKey(1, []byte("key")); err != nil {
 		t.Fatal(err)
@@ -501,45 +507,61 @@ func TestRevealNotResentWhilePending(t *testing.T) {
 }
 
 // The reveal is skipped only on a definite answer about the commit
-// (test 16).
+// (test 16). A skip removes the commit key and ends the round's steps;
+// the head is commitSettleBlocks into the reveal phase, so a missing
+// commit is gone once a second head agrees (#739).
 func TestRevealSkipOnlyWhenDefinite(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
-		name   string
-		state  transaction.TxState
-		err    error
-		lag    time.Duration
-		reveal bool
+		name    string
+		state   transaction.TxState
+		err     error
+		lag     time.Duration
+		reveal  bool
+		answers int // steps until a skip
 	}{
-		{"reverted", transaction.TxReverted, nil, 0, false},
-		{"not found, synced", transaction.TxNotFound, nil, 0, false},
-		{"not found, not synced", transaction.TxNotFound, nil, time.Hour, true},
-		{"lookup error", 0, errors.New("rpc down"), 0, true},
-		{"pending", transaction.TxPending, nil, 0, true},
-		{"mined", transaction.TxMined, nil, 0, true},
+		{"reverted", transaction.TxReverted, nil, 0, false, 1},
+		{"not found, synced", transaction.TxNotFound, nil, 0, false, 2},
+		{"not found, not synced", transaction.TxNotFound, nil, time.Hour, true, 1},
+		{"lookup error", 0, errors.New("rpc down"), 0, true, 1},
+		{"pending", transaction.TxPending, nil, 0, true, 1},
+		{"mined", transaction.TxMined, nil, 0, true, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			f := revealFixtureInRevealPhase(t)
-			f.txs.set(f.state().CommitTx(1), tc.state)
-			f.chain.setLag(tc.lag)
-			if tc.err != nil {
-				// the lookup fails for the commit only
-				commitTx := f.state().CommitTx(1)
-				f.revealer.txService = transactionmock.New(transactionmock.WithTransactionStatusFunc(func(ctx context.Context, h common.Hash) (transaction.TxState, error) {
-					if h == commitTx {
-						return 0, tc.err
+			synctest.Test(t, func(t *testing.T) {
+				f := revealFixtureAt(t, testBlocksPerRound+testBlocksPerPhase+commitSettleBlocks)
+				f.txs.set(f.state().CommitTx(1), tc.state)
+				f.chain.setLag(tc.lag)
+				if tc.err != nil {
+					// the lookup fails for the commit only
+					commitTx := f.state().CommitTx(1)
+					f.revealer.txService = transactionmock.New(transactionmock.WithTransactionStatusFunc(func(ctx context.Context, h common.Hash) (transaction.TxState, error) {
+						if h == commitTx {
+							return 0, tc.err
+						}
+						return transaction.TxNotFound, nil
+					}))
+				}
+
+				var done bool
+				for i := range tc.answers {
+					if i > 0 {
+						time.Sleep(testBlockTime)
 					}
-					return transaction.TxNotFound, nil
-				}))
-			}
+					done, _ = f.revealer.Reveal(context.Background(), 1)
+				}
 
-			_, _ = f.revealer.Reveal(context.Background(), 1)
-
-			if _, reveals := f.contract.counts(); (reveals == 1) != tc.reveal {
-				t.Fatalf("reveals %d, want reveal %v", reveals, tc.reveal)
-			}
+				if _, reveals := f.contract.counts(); (reveals == 1) != tc.reveal {
+					t.Fatalf("reveals %d, want reveal %v", reveals, tc.reveal)
+				}
+				if !tc.reveal {
+					if _, hasKey := f.state().CommitKey(1); !done || hasKey {
+						t.Fatalf("done %v, key kept %v; want a skip that removes the key", done, hasKey)
+					}
+				}
+			})
 		})
 	}
 }
@@ -1013,8 +1035,9 @@ func TestPendingConcurrentWithCommits(t *testing.T) {
 
 // A commit that is not found, or whose nonce reads as used by another
 // transaction, counts as never landed only from a head commitSettleBlocks
-// into the reveal phase. A head closer to the phase start keeps the key
-// and checks again at the next block.
+// into the reveal phase, and only when a later head gives the same answer
+// (#738). A head closer to the phase start, or the first such answer,
+// keeps the key and checks again at the next block.
 func TestCommitMissingNeedsSettledHead(t *testing.T) {
 	t.Parallel()
 
@@ -1024,7 +1047,7 @@ func TestCommitMissingNeedsSettledHead(t *testing.T) {
 		block   uint64
 		headLag uint64
 		state   transaction.TxState
-		gone    bool
+		gone    bool // gone at the second head
 	}{
 		{"not found, head settled", revealStart + commitSettleBlocks, 0, transaction.TxNotFound, true},
 		{"cancelled, head settled", revealStart + commitSettleBlocks, 0, transaction.TxCancelled, true},
@@ -1048,22 +1071,29 @@ func TestCommitMissingNeedsSettledHead(t *testing.T) {
 				f.txs.set(commitTx, tc.state)
 				f.chain.setHeadLag(tc.headLag)
 
+				// the first answer never removes the key
 				done, err := f.revealer.Reveal(context.Background(), round)
 				if err != nil {
 					t.Fatal(err)
 				}
-				_, hasKey := f.state().CommitKey(round)
-				if _, reveals := f.contract.counts(); reveals != 0 {
-					t.Fatalf("revealed %d times", reveals)
+				if _, hasKey := f.state().CommitKey(round); done || !hasKey {
+					t.Fatalf("first answer: done %v, key kept %v; want the key kept and a later check", done, hasKey)
 				}
+
 				if tc.gone {
-					if !done || hasKey {
-						t.Fatalf("done %v, key kept %v; want the key removed", done, hasKey)
+					// the same answer at the next head removes it
+					time.Sleep(testBlockTime)
+					done, err := f.revealer.Reveal(context.Background(), round)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, hasKey := f.state().CommitKey(round); !done || hasKey {
+						t.Fatalf("second answer: done %v, key kept %v; want the key removed", done, hasKey)
+					}
+					if _, reveals := f.contract.counts(); reveals != 0 {
+						t.Fatalf("revealed %d times", reveals)
 					}
 					return
-				}
-				if done || !hasKey {
-					t.Fatalf("done %v, key kept %v; want the key kept and a later check", done, hasKey)
 				}
 
 				// the lagging endpoint catches up: the commit is mined, and
@@ -1080,6 +1110,66 @@ func TestCommitMissingNeedsSettledHead(t *testing.T) {
 			})
 		})
 	}
+}
+
+// A commit missing at one settled head and found at the next keeps its
+// key and is revealed; two answers at the same head are not two heads
+// (#738).
+func TestCommitMissingOnceIsNotGone(t *testing.T) {
+	t.Parallel()
+
+	revealStart := uint64(testBlocksPerRound + testBlocksPerPhase)
+
+	t.Run("found at the next head", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			f := newRevealFixture(t, mock.NewStateStore(), newFakeChain(revealStart+commitSettleBlocks), newFakeTxs())
+			const round = 1
+			f.setSample(round)
+			if err := f.state().SetCommitKey(round, []byte("key")); err != nil {
+				t.Fatal(err)
+			}
+			commitTx := f.txs.newHash()
+			if err := f.state().SetCommitTx(round, commitTx); err != nil {
+				t.Fatal(err)
+			}
+			// a lagging chain node answers first
+			if done, err := f.revealer.Reveal(context.Background(), round); err != nil || done {
+				t.Fatalf("first answer: done %v err %v", done, err)
+			}
+			f.txs.set(commitTx, transaction.TxMined)
+			time.Sleep(testBlockTime)
+			if done, err := f.revealer.Reveal(context.Background(), round); err != nil || !done {
+				t.Fatalf("second answer: done %v err %v", done, err)
+			}
+			if _, reveals := f.contract.counts(); reveals != 1 || !f.state().HasRevealed(round) {
+				t.Fatalf("reveals %d, revealed %v; want the reveal sent", reveals, f.state().HasRevealed(round))
+			}
+		})
+	})
+
+	t.Run("same head twice", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			f := newRevealFixture(t, mock.NewStateStore(), newFakeChain(revealStart+commitSettleBlocks), newFakeTxs())
+			const round = 1
+			f.setSample(round)
+			if err := f.state().SetCommitKey(round, []byte("key")); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.state().SetCommitTx(round, f.txs.newHash()); err != nil {
+				t.Fatal(err)
+			}
+			for i := range 2 {
+				if done, err := f.revealer.Reveal(context.Background(), round); err != nil || done {
+					t.Fatalf("answer %d: done %v err %v", i+1, done, err)
+				}
+			}
+			if _, hasKey := f.state().CommitKey(round); !hasKey {
+				t.Fatal("key removed on two answers at one head")
+			}
+		})
+	})
 }
 
 // One signal never cancels the stop's context. When block number reads
