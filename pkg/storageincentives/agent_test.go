@@ -20,12 +20,14 @@ import (
 	contractMock "github.com/ethersphere/bee/v2/pkg/postage/postagecontract/mock"
 	erc20mock "github.com/ethersphere/bee/v2/pkg/settlement/swap/erc20/mock"
 	statestore "github.com/ethersphere/bee/v2/pkg/statestore/mock"
+	"github.com/ethersphere/bee/v2/pkg/storage"
 	"github.com/ethersphere/bee/v2/pkg/storageincentives"
 	"github.com/ethersphere/bee/v2/pkg/storageincentives/redistribution"
 	"github.com/ethersphere/bee/v2/pkg/storageincentives/staking/mock"
 	"github.com/ethersphere/bee/v2/pkg/storer"
 	resMock "github.com/ethersphere/bee/v2/pkg/storer/mock"
 	"github.com/ethersphere/bee/v2/pkg/swarm"
+	"github.com/ethersphere/bee/v2/pkg/transaction"
 	transactionmock "github.com/ethersphere/bee/v2/pkg/transaction/mock"
 	"github.com/ethersphere/bee/v2/pkg/util/testutil"
 )
@@ -207,8 +209,13 @@ func createServiceWithBlockTime(
 	}, reserveOpts...)
 	reserve := resMock.NewReserve(reserveOpts...)
 
+	revealer, err := newRevealer(statestore.NewStateStore(), contract, transactionmock.New(), backend, blockTime, blocksPerRound, blocksPerPhase)
+	if err != nil {
+		return nil, err
+	}
+
 	return storageincentives.New(
-		addr, common.Address{},
+		addr,
 		backend,
 		contract,
 		postageContract,
@@ -218,14 +225,21 @@ func createServiceWithBlockTime(
 		blockTime,
 		blocksPerRound,
 		blocksPerPhase,
-		statestore.NewStateStore(),
+		revealer,
 		&postage.NoOpBatchStore{},
-		erc20mock.New(),
-		transactionmock.New(),
 		&mockHealth{},
 		log.Noop,
 		reserveProofMode,
 	)
+}
+
+// newRevealer builds the shared state and Revealer an agent runs on.
+func newRevealer(store storage.StateStorer, contract redistribution.Contract, txService transaction.Service, backend storageincentives.RevealBackend, blockTime func() time.Duration, blocksPerRound, blocksPerPhase uint64) (*storageincentives.Revealer, error) {
+	state, err := storageincentives.NewRedistributionState(log.Noop, common.Address{}, store, erc20mock.New(), txService)
+	if err != nil {
+		return nil, err
+	}
+	return storageincentives.NewRevealer(state, contract, txService, backend, blockTime, blocksPerRound, blocksPerPhase, log.Noop), nil
 }
 
 type mockchainBackend struct {
@@ -346,14 +360,14 @@ func (m *mockContract) Claim(context.Context, redistribution.ChunkInclusionProof
 	return common.Hash{}, nil
 }
 
-func (m *mockContract) Commit(context.Context, []byte, uint64) (common.Hash, error) {
+func (m *mockContract) Commit(context.Context, []byte, uint64, transaction.BeforeBroadcastFunc) (common.Hash, error) {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 	m.callsList = append(m.callsList, commitCall)
 	return common.Hash{}, nil
 }
 
-func (m *mockContract) Reveal(_ context.Context, r uint8, _ []byte, _ []byte) (common.Hash, error) {
+func (m *mockContract) Reveal(_ context.Context, r uint8, _ []byte, _ []byte, _ transaction.BeforeBroadcastFunc) (common.Hash, error) {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 

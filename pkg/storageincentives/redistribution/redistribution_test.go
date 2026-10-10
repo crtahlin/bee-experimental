@@ -338,7 +338,7 @@ func TestRedistribution(t *testing.T) {
 			0,
 		)
 
-		_, err = contract.Commit(ctx, testobfus, 0)
+		_, err = contract.Commit(ctx, testobfus, 0, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -383,7 +383,7 @@ func TestRedistribution(t *testing.T) {
 			0,
 		)
 
-		_, err = contract.Reveal(ctx, depth, common.Hex2Bytes("hash"), common.Hex2Bytes("nonce"))
+		_, err = contract.Reveal(ctx, depth, common.Hex2Bytes("hash"), common.Hex2Bytes("nonce"), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -472,7 +472,7 @@ func TestRedistribution(t *testing.T) {
 			0,
 		)
 
-		_, err = contract.Commit(ctx, common.Hex2Bytes("hash"), 0)
+		_, err = contract.Commit(ctx, common.Hex2Bytes("hash"), 0, nil)
 		if err == nil {
 			t.Fatal("expected error")
 		}

@@ -21,17 +21,17 @@ import (
 	"github.com/ethersphere/bee/v2/pkg/postage"
 	"github.com/ethersphere/bee/v2/pkg/postage/postagecontract"
 	"github.com/ethersphere/bee/v2/pkg/safe"
-	"github.com/ethersphere/bee/v2/pkg/settlement/swap/erc20"
-	"github.com/ethersphere/bee/v2/pkg/storage"
 	"github.com/ethersphere/bee/v2/pkg/storageincentives/redistribution"
 	"github.com/ethersphere/bee/v2/pkg/storageincentives/staking"
 	"github.com/ethersphere/bee/v2/pkg/storer"
 	"github.com/ethersphere/bee/v2/pkg/swarm"
-	"github.com/ethersphere/bee/v2/pkg/transaction"
 	"resenje.org/singleflight"
 )
 
 const loggerName = "storageincentives"
+
+// errSkipCommit: the round is not committed (stopping, or committed before).
+var errSkipCommit = errors.New("commit skipped")
 
 const (
 	DefaultBlocksPerRound = 152
@@ -70,14 +70,15 @@ type Agent struct {
 	quit                   chan struct{}
 	wg                     sync.WaitGroup
 	state                  *RedistributionState
+	revealer               *Revealer
 	chainStateGetter       postage.ChainStateGetter
 	commitLock             sync.Mutex
 	health                 Health
 	sampleFlight           singleflight.Group[string, sampleResult]
 }
 
+// New starts the agent on the node's shared Revealer and its state.
 func New(overlay swarm.Address,
-	ethAddress common.Address,
 	backend ChainBackend,
 	contract redistribution.Contract,
 	batchExpirer postagecontract.PostageBatchExpirer,
@@ -87,10 +88,8 @@ func New(overlay swarm.Address,
 	blockTime func() time.Duration,
 	blocksPerRound,
 	blocksPerPhase uint64,
-	stateStore storage.StateStorer,
+	revealer *Revealer,
 	chainStateGetter postage.ChainStateGetter,
-	erc20Service erc20.Service,
-	tranService transaction.Service,
 	health Health,
 	logger log.Logger,
 	reserveProofMode string,
@@ -110,14 +109,9 @@ func New(overlay swarm.Address,
 		redistributionStatuser: redistributionStatuser,
 		health:                 health,
 		chainStateGetter:       chainStateGetter,
+		revealer:               revealer,
+		state:                  revealer.State(),
 	}
-
-	state, err := NewRedistributionState(logger, ethAddress, stateStore, erc20Service, tranService)
-	if err != nil {
-		return nil, err
-	}
-
-	a.state = state
 
 	a.wg.Add(1)
 	go a.start(blockTime, a.blocksPerRound, blocksPerPhase)
@@ -308,6 +302,9 @@ func (a *Agent) handleCommit(ctx context.Context, round uint64) error {
 	}
 
 	err = a.commit(ctx, sample, round)
+	if errors.Is(err, errSkipCommit) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -326,32 +323,22 @@ func roundsDiffer(contractRound, nodeRound uint64) bool {
 	return nodeRound-contractRound > 1
 }
 
+// handleReveal reveals through the shared Revealer, retrying every block
+// until the reveal is mined or ctx ends at the claim phase.
 func (a *Agent) handleReveal(ctx context.Context, round uint64) error {
-	// reveal requires the commitKey from the same round
-	commitKey, exists := a.state.CommitKey(round)
-	if !exists {
+	if _, exists := a.state.CommitKey(round); !exists {
 		// In absence of commitKey, phase is skipped
 		return nil
 	}
 
-	// reveal requires sample from previous round
-	sample, exists := a.state.SampleData(round - 1)
-	if !exists {
-		// Sample must have been saved so far
-		return fmt.Errorf("sample not found in reveal phase")
-	}
-
 	a.metrics.RevealPhase.Inc()
 
-	rsh := sample.ReserveSampleHash.Bytes()
-	txHash, err := a.contract.Reveal(ctx, sample.StorageRadius, rsh, commitKey)
-	if err != nil {
+	if !a.revealer.revealUntil(ctx, round) {
 		a.metrics.ErrReveal.Inc()
-		return err
+		if _, exists := a.state.CommitKey(round); exists {
+			return fmt.Errorf("reveal of round %d not mined", round)
+		}
 	}
-	a.state.AddFee(ctx, txHash)
-
-	a.state.SetHasRevealed(round)
 
 	return nil
 }
@@ -621,14 +608,25 @@ func (a *Agent) commit(ctx context.Context, sample SampleData, round uint64) err
 		return err
 	}
 
-	txHash, err := a.contract.Commit(ctx, obfuscatedHash, round)
+	// The key is stored, with a synced write, before the commit is sent:
+	// a mined commit without its key can never be revealed.
+	if err := a.revealer.beginCommit(round, key); err != nil {
+		if errors.Is(err, errCommitRefused) || errors.Is(err, errAlreadyCommitted) {
+			a.logger.Info("not committing", "round", round, "reason", err)
+			return errSkipCommit
+		}
+		return err
+	}
+
+	txHash, err := a.contract.Commit(ctx, obfuscatedHash, round, func(txHash common.Hash) error {
+		return a.state.SetCommitTx(round, txHash)
+	})
+	a.revealer.endCommit(round, err)
 	if err != nil {
 		a.metrics.ErrCommit.Inc()
 		return err
 	}
 	a.state.AddFee(ctx, txHash)
-
-	a.state.SetCommitKey(round, key)
 
 	return nil
 }

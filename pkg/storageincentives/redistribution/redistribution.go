@@ -27,8 +27,11 @@ type Contract interface {
 	IsPlaying(context.Context, uint8) (bool, error)
 	IsWinner(context.Context) (bool, error)
 	Claim(context.Context, ChunkInclusionProofs) (common.Hash, error)
-	Commit(context.Context, []byte, uint64) (common.Hash, error)
-	Reveal(context.Context, uint8, []byte, []byte) (common.Hash, error)
+	// Commit and Reveal call beforeBroadcast (if not nil) with the signed
+	// hash after the transaction is stored and before it is sent; see
+	// transaction.Service.SendWithHook.
+	Commit(ctx context.Context, obfusHash []byte, round uint64, beforeBroadcast transaction.BeforeBroadcastFunc) (common.Hash, error)
+	Reveal(ctx context.Context, storageDepth uint8, reserveCommitmentHash []byte, randomNonce []byte, beforeBroadcast transaction.BeforeBroadcastFunc) (common.Hash, error)
 	// CurrentRound returns the round the contract is in. The node computes
 	// the round itself from its compiled-in round length; this lets it check
 	// that the two agree before committing (#540).
@@ -142,7 +145,7 @@ func (c *contract) Claim(ctx context.Context, proofs ChunkInclusionProofs) (comm
 		Value:                big.NewInt(0),
 		Description:          "claim win transaction",
 	}
-	txHash, err := c.sendAndWait(ctx, request, BoostTipPercent)
+	txHash, err := c.sendAndWait(ctx, request, BoostTipPercent, nil)
 	if err != nil {
 		return txHash, fmt.Errorf("claim: %w", err)
 	}
@@ -151,7 +154,7 @@ func (c *contract) Claim(ctx context.Context, proofs ChunkInclusionProofs) (comm
 }
 
 // Commit submits the obfusHash hash by sending a transaction to the blockchain.
-func (c *contract) Commit(ctx context.Context, obfusHash []byte, round uint64) (common.Hash, error) {
+func (c *contract) Commit(ctx context.Context, obfusHash []byte, round uint64, beforeBroadcast transaction.BeforeBroadcastFunc) (common.Hash, error) {
 	callData, err := c.incentivesContractABI.Pack("commit", common.BytesToHash(obfusHash), round)
 	if err != nil {
 		return common.Hash{}, err
@@ -165,7 +168,7 @@ func (c *contract) Commit(ctx context.Context, obfusHash []byte, round uint64) (
 		Value:                big.NewInt(0),
 		Description:          "commit transaction",
 	}
-	txHash, err := c.sendAndWait(ctx, request, BoostTipPercent)
+	txHash, err := c.sendAndWait(ctx, request, BoostTipPercent, beforeBroadcast)
 	if err != nil {
 		return txHash, fmt.Errorf("commit: obfusHash %v: %w", common.BytesToHash(obfusHash), err)
 	}
@@ -174,7 +177,7 @@ func (c *contract) Commit(ctx context.Context, obfusHash []byte, round uint64) (
 }
 
 // Reveal submits the storageDepth, reserveCommitmentHash and RandomNonce in a transaction to blockchain.
-func (c *contract) Reveal(ctx context.Context, storageDepth uint8, reserveCommitmentHash []byte, RandomNonce []byte) (common.Hash, error) {
+func (c *contract) Reveal(ctx context.Context, storageDepth uint8, reserveCommitmentHash []byte, RandomNonce []byte, beforeBroadcast transaction.BeforeBroadcastFunc) (common.Hash, error) {
 	callData, err := c.incentivesContractABI.Pack("reveal", storageDepth, common.BytesToHash(reserveCommitmentHash), common.BytesToHash(RandomNonce))
 	if err != nil {
 		return common.Hash{}, err
@@ -188,7 +191,7 @@ func (c *contract) Reveal(ctx context.Context, storageDepth uint8, reserveCommit
 		Value:                big.NewInt(0),
 		Description:          "reveal transaction",
 	}
-	txHash, err := c.sendAndWait(ctx, request, BoostTipPercent)
+	txHash, err := c.sendAndWait(ctx, request, BoostTipPercent, beforeBroadcast)
 	if err != nil {
 		return txHash, fmt.Errorf("reveal: storageDepth %d reserveCommitmentHash %v RandomNonce %v: %w", storageDepth, common.BytesToHash(reserveCommitmentHash), common.BytesToHash(RandomNonce), err)
 	}
@@ -216,7 +219,7 @@ func (c *contract) ReserveSalt(ctx context.Context) ([]byte, error) {
 	return salt[:], nil
 }
 
-func (c *contract) sendAndWait(ctx context.Context, request *transaction.TxRequest, boostPercent int) (txHash common.Hash, err error) {
+func (c *contract) sendAndWait(ctx context.Context, request *transaction.TxRequest, boostPercent int, beforeBroadcast transaction.BeforeBroadcastFunc) (txHash common.Hash, err error) {
 	defer func() {
 		err = c.txService.UnwrapABIError(
 			ctx,
@@ -226,7 +229,7 @@ func (c *contract) sendAndWait(ctx context.Context, request *transaction.TxReque
 		)
 	}()
 
-	txHash, err = c.txService.Send(ctx, request, boostPercent)
+	txHash, err = c.txService.SendWithHook(ctx, request, boostPercent, beforeBroadcast)
 	if err != nil {
 		return txHash, err
 	}

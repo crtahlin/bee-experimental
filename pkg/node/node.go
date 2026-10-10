@@ -1708,9 +1708,14 @@ func NewBee(
 					postageReadyForLottery(eventListener) && !localStore.HeldPending()
 			}
 
+			redistributionState, err := storageincentives.NewRedistributionState(logger, overlayEthAddress, stateStore, erc20Service, transactionService)
+			if err != nil {
+				return nil, fmt.Errorf("storage incentives state: %w", err)
+			}
+			revealer := storageincentives.NewRevealer(redistributionState, redistributionContract, transactionService, chainBackend, blockTime, storageincentives.DefaultBlocksPerRound, storageincentives.DefaultBlocksPerPhase, logger)
+
 			agent, err = storageincentives.New(
 				swarmAddress,
-				overlayEthAddress,
 				chainBackend,
 				redistributionContract,
 				postageStampContractService,
@@ -1720,10 +1725,8 @@ func NewBee(
 				blockTime,
 				storageincentives.DefaultBlocksPerRound,
 				storageincentives.DefaultBlocksPerPhase,
-				stateStore,
+				revealer,
 				batchStore,
-				erc20Service,
-				transactionService,
 				saludService,
 				logger,
 				o.ReserveProofMode,
