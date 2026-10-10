@@ -15,6 +15,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethersphere/bee/v2/pkg/log"
@@ -96,6 +97,9 @@ type Options struct {
 	// RecalcPeersDur is how often the puller re-decides which peers to sync
 	// from. Zero uses DefaultRecalcPeersDur.
 	RecalcPeersDur time.Duration
+	// DumpDir is where a goroutine profile is written when a recalculation
+	// runs too long; the node's data directory. Empty writes none. See #695.
+	DumpDir string
 }
 
 type Puller struct {
@@ -134,6 +138,17 @@ type Puller struct {
 	// test can change them before Start without racing other tests. See #573.
 	retryBackoffBase time.Duration
 	retryBackoffMax  time.Duration
+
+	// cursorsTimeout bounds one cursors request; blockedRunThreshold and
+	// runWatchInterval drive the blocked-run diagnostic. Fields so a test can
+	// change them before Start. See #695.
+	cursorsTimeout      time.Duration
+	blockedRunThreshold time.Duration
+	runWatchInterval    time.Duration
+	dumpDir             string
+	cursorTimeoutLog    *rateLog
+	runStart            atomic.Int64 // unix nanoseconds of the run in progress, 0 if none
+	dumpedRun           atomic.Int64 // runStart of the last run a profile was written for
 }
 
 func New(
@@ -180,6 +195,12 @@ func New(
 
 		retryBackoffBase: defaultRetryBackoffBase,
 		retryBackoffMax:  defaultRetryBackoffMax,
+
+		cursorsTimeout:      defaultCursorsTimeout,
+		blockedRunThreshold: defaultBlockedRunThreshold,
+		runWatchInterval:    defaultRunWatchInterval,
+		dumpDir:             o.DumpDir,
+		cursorTimeoutLog:    newRateLog(cursorTimeoutLogInterval),
 	}
 
 	return p
@@ -223,8 +244,9 @@ func (p *Puller) Start(ctx context.Context) {
 		cctx, cancel := context.WithCancel(ctx)
 		p.cancel = cancel
 
-		p.wg.Add(1)
+		p.wg.Add(2)
 		go p.manage(cctx)
+		go p.watchRuns(cctx)
 	})
 }
 
@@ -244,6 +266,10 @@ func (p *Puller) manage(ctx context.Context) {
 
 	onChange := func() {
 		p.metrics.OnChangeRuns.Inc()
+
+		started := time.Now()
+		p.runStarted(started)
+		defer p.runFinished(started)
 
 		p.syncPeersMtx.Lock()
 		defer p.syncPeersMtx.Unlock()
@@ -333,7 +359,7 @@ func (p *Puller) syncPeer(ctx context.Context, peer *syncPeer, storageRadius uin
 	defer peer.mtx.Unlock()
 
 	if peer.cursors == nil {
-		cursors, epoch, err := p.syncer.GetCursors(ctx, peer.address)
+		cursors, epoch, err := p.getCursors(ctx, peer.address)
 		if err != nil {
 			return fmt.Errorf("could not get cursors from peer %s: %w", peer.address, err)
 		}

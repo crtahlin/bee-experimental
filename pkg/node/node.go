@@ -1642,6 +1642,7 @@ func NewBee(
 		pullerService = puller.New(swarmAddress, stateStore, kad, localStore, pullSyncProtocol, p2ps, logger, puller.Options{
 			MaxChunksPerSecond: o.PullerMaxChunksPerSecond,
 			RecalcPeersDur:     o.PullerRecalcPeersDur,
+			DumpDir:            o.DataDir,
 		})
 		b.pullerCloser = pullerService
 
