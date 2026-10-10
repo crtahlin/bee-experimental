@@ -102,3 +102,35 @@ func TestActedNotRecordedWhileRunBlocked(t *testing.T) {
 	close(c.ps.release)
 	waitActed(t, c, 1)
 }
+
+// TestNotActedAtTopRadius covers a radius at the bin count, where no bin is
+// at or above it: only a neighbour with its cursors counts, not a peer below
+// the radius and not a neighbour whose cursors request fails.
+func TestNotActedAtTopRadius(t *testing.T) {
+	t.Parallel()
+
+	t.Run("peer below the radius", func(t *testing.T) {
+		t.Parallel()
+		below := swarm.RandAddress(t)
+		c := newCursorPuller(t, time.Second, "", kadMock.AddrTuple{Addr: below, PO: 2})
+		c.rs.SetStorageRadius(3)
+		c.start(t)
+		waitFor(t, 5*time.Second, func() bool { return c.ps.callCount(below) >= 1 && c.p.OnChangeDurationCount() >= 1 }, "no run completed")
+		if _, _, ok := acted(c); ok {
+			t.Fatal("acted on radius 3 with only a peer below it")
+		}
+	})
+
+	t.Run("neighbour without cursors", func(t *testing.T) {
+		t.Parallel()
+		n := swarm.RandAddress(t)
+		c := newCursorPuller(t, time.Second, "", kadMock.AddrTuple{Addr: n, PO: 3})
+		c.rs.SetStorageRadius(3)
+		c.ps.set(n, "error")
+		c.start(t)
+		waitFor(t, 5*time.Second, func() bool { return c.ps.callCount(n) >= 1 && c.p.OnChangeDurationCount() >= 1 }, "no run completed")
+		if _, _, ok := acted(c); ok {
+			t.Fatal("acted on radius 3 with a neighbour that gave no cursors")
+		}
+	})
+}
