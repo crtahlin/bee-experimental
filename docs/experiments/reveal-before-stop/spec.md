@@ -59,7 +59,7 @@ Per round, `RoundData` gains `CommitTx` (the commit's signed hash) and `RevealTx
    - The commit was mined and **reverted** (`:238`): the key is removed and the round is not played.
    - The receipt wait failed (context cancelled at the reveal phase, monitor closed): the key and `CommitTx` are kept.
 4. **A key with an empty `CommitTx`** can exist only for a crash between the key write and the signing (nothing was broadcast then, but the node cannot know it after a restart). It is treated as "possibly committed": the reveal is attempted, and if the commit never landed the contract reverts it (gas only, no freeze). The transaction service's pending store is written only after `SendTransaction` returns (`pkg/transaction/transaction.go:200-224`), so the signed hash stored in item 3 is what makes every other case checkable.
-5. **After a restart, a key with a `CommitTx` is checked against its receipt, and the reveal is skipped only on a definite answer:** a mined receipt with status reverted, or "not found" from a backend that `transaction.IsSynced` reports synced, after the reveal phase has started. Any lookup error, or an unsynced backend, means "reveal": a wasted reveal costs gas, a skipped one costs a freeze.
+5. **After a restart, a key with a `CommitTx` is checked against its receipt, and the reveal is skipped only on a definite answer:** a mined receipt with status reverted, or "not found" from a backend that `transaction.IsSynced` reports synced, after the reveal phase has started. Since the code review, "not found" (or "cancelled") must also hold at two settled heads at least 2 blocks into the reveal phase (#738), and the node's nonce at the last block of the commit phase must show the commit's nonce unused (#745). Any lookup error, or an unsynced backend, means "reveal": a wasted reveal costs gas, a skipped one costs a freeze.
 6. **The reveal transactions:** `RevealTxs` is the list of every reveal transaction hash sent for the round, appended before each send (synced write, the signed hash as for the commit). `HasRevealed` is set when **any** of them has a successful receipt. During the reveal phase, before anything is re-sent, the receipts of all listed hashes are checked; then, for the newest hash:
    - **receipt successful:** done;
    - **not found on a synced backend:** rebroadcast the **exact stored signed transaction** (the same nonce, the stored `GasFeeCap`/`GasTipCap`, so the same hash) through a new `RebroadcastTransaction(ctx, hash)` on the transaction service. Today's `ResendTransaction` (`transaction.go:491`) re-signs with new fees, refuses when the hash changes, and swallows send errors, so it is not used here. If the fee has to be raised instead (the stored one is too low to be mined), a **same-nonce replacement** is signed, its hash appended to `RevealTxs` with a synced write **before** it is sent, and then sent. Send errors are returned in both cases and the block loop tries again;
@@ -155,6 +155,14 @@ Follow-ups from the review of #727, implemented together:
 - **`stopWaitedForReveal` counts only after a successful block read** at the stop (#729).
 - **`Revealer.Close` waits for a reveal step that single-flight gave up on** (#731).
 - **The replacement fee raise rounds up** (#734).
+
+Follow-up from the review of #741:
+
+- **A missing commit is pinned to the nonce at the end of the commit phase** (#745). The two status and head reads can still reach different chain nodes, behind a load balancer or after a failover. Before the key is removed, the node's nonce at the last block of the commit phase is compared with the commit's stored nonce; the answer is pinned to that block, so a chain node that lags behind cannot give it (one without the block returns an error).
+  - Nonce unused at that block: the commit never landed (the contract accepts commits only in the commit phase); the two-settled-heads rule then removes the key.
+  - Nonce used: the commit can be on chain, or the nonce went to another transaction. The key is kept and the reveal is sent; if the commit is not there, the reveal reverts, which costs gas only. The same holds for a "cancelled" answer: the status cannot tell whose transaction used the nonce.
+  - The nonce read fails (for example a chain node that does not have the block yet): possibly committed, so the key is kept and the reveal is sent, as for a failed status read. A read that kept failing must not hold the reveal back until the phase ends.
+  - The commit's stored transaction cannot be read: there is no nonce to compare, so the reveal is sent.
 
 ## Measurement
 

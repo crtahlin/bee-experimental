@@ -37,8 +37,10 @@ const (
 	// commits only in the commit phase, so a commit that a head this far
 	// into the reveal phase does not know never landed; a lagging head
 	// is checked again at the next block. The answer must also hold at
-	// two consecutive heads, because the commit's status and the head come
-	// from separate calls, which can reach different chain nodes.
+	// two different settled heads, and the node's nonce at the last block
+	// of the commit phase must show the commit's nonce unused, because
+	// the commit's status and the head come from separate calls, which
+	// can reach different chain nodes.
 	commitSettleBlocks = 2
 
 	// stopWaitMargin is added to WaitBudget to bound the stop wait, so a
@@ -56,6 +58,9 @@ var (
 type RevealBackend interface {
 	BlockNumber(context.Context) (uint64, error)
 	HeaderByNumber(context.Context, *big.Int) (*types.Header, error)
+	// NonceAt returns the account's nonce at the given block: the number
+	// of its transactions mined up to and including that block.
+	NonceAt(ctx context.Context, account common.Address, blockNumber *big.Int) (uint64, error)
 }
 
 // RevealGuard lets a stop wait for a pending reveal.
@@ -486,11 +491,14 @@ const (
 // commitOnChain checks the round's commit before its first reveal. It is
 // gone when its receipt reverted, or when a synced backend whose head is
 // commitSettleBlocks into the reveal phase does not know it (or reports
-// its nonce used by another transaction) at two consecutive heads. The
-// same answer from a head closer to the phase start, or the first such
-// answer, is checked again at the next block. A lookup error, an unsynced
-// backend or an unknown commit hash all mean "possibly committed", and
-// clear an earlier "missing" answer.
+// its nonce used by another transaction) at two different heads, and the
+// node's nonce at the last block of the commit phase shows the commit's
+// nonce unused. The same answer from a head closer to the phase start, or
+// the first such answer, is checked again at the next block. A lookup
+// error, an unsynced backend, an unknown commit hash, a commit whose
+// stored transaction cannot be read, a failed nonce read, or a commit
+// nonce used by the end of the commit phase all mean "possibly
+// committed", and clear an earlier "missing" answer.
 func (r *Revealer) commitOnChain(ctx context.Context, round uint64) commitCheck {
 	commitTx := r.state.CommitTx(round)
 	if commitTx == (common.Hash{}) {
@@ -514,6 +522,21 @@ func (r *Revealer) commitOnChain(ctx context.Context, round uint64) commitCheck 
 		if header.Number == nil || header.Number.Uint64() < r.revealStart(round)+commitSettleBlocks {
 			return commitRecheck
 		}
+		switch r.commitNonceUsed(ctx, round, commitTx) {
+		case nonceUsed:
+			// the commit can have been mined in the commit phase; a
+			// "not found" or "cancelled" answer then comes from a view
+			// that does not have it, or the nonce went to another
+			// transaction: reveal, and let the contract decide
+			delete(r.commitGoneAt, round)
+			return commitPossible
+		case nonceUnknown:
+			// a read that keeps failing, for example from a lagging
+			// node without the block, must not hold the reveal back
+			// until the phase ends: reveal, as for an unknown status
+			delete(r.commitGoneAt, round)
+			return commitPossible
+		}
 		head := header.Number.Uint64()
 		if first, ok := r.commitGoneAt[round]; ok && head > first {
 			delete(r.commitGoneAt, round)
@@ -526,6 +549,38 @@ func (r *Revealer) commitOnChain(ctx context.Context, round uint64) commitCheck 
 	}
 	delete(r.commitGoneAt, round)
 	return commitPossible
+}
+
+type nonceCheck int
+
+const (
+	nonceUnused  nonceCheck = iota // the commit was not mined in the commit phase
+	nonceUsed                      // the commit's nonce was used by the end of the commit phase
+	nonceUnknown                   // the read failed: possibly committed
+)
+
+// commitNonceUsed compares the commit's stored nonce with the node's nonce
+// at the last block of the round's commit phase. The answer is pinned to
+// that block, so a chain node that lags behind cannot give it: a node that
+// does not have the block yet returns an error. The contract accepts a
+// commit only in the commit phase, so a nonce still unused at that block
+// means the commit never landed.
+func (r *Revealer) commitNonceUsed(ctx context.Context, round uint64, commitTx common.Hash) nonceCheck {
+	stored, err := r.txService.StoredTransaction(commitTx)
+	if err != nil {
+		// no nonce to compare with: possibly committed
+		return nonceUsed
+	}
+	commitEnd := r.revealStart(round) - 1
+	nonce, err := r.backend.NonceAt(ctx, r.state.ethAddress, new(big.Int).SetUint64(commitEnd))
+	if err != nil {
+		r.logger.Debug("reveal: nonce at the end of the commit phase unavailable; revealing", "round", round, "block", commitEnd, "error", err)
+		return nonceUnknown
+	}
+	if nonce > stored.Nonce {
+		return nonceUsed
+	}
+	return nonceUnused
 }
 
 // feeTooLow reports whether the stored fee cap of the transaction is below
