@@ -44,14 +44,18 @@ func TestGetCursorsDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	start := time.Now()
-	_, _, err := client.GetCursors(ctx, swarm.RandAddress(t))
-	took := time.Since(start)
+	errc := make(chan error, 1)
+	go func() {
+		_, _, err := client.GetCursors(ctx, swarm.RandAddress(t))
+		errc <- err
+	}()
 
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("error %v, want %v", err, context.DeadlineExceeded)
-	}
-	if took > 5*time.Second {
-		t.Fatalf("returned after %v, want about the 200ms deadline", took)
+	select {
+	case err := <-errc:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("error %v, want %v", err, context.DeadlineExceeded)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("GetCursors still waiting 5s after its 200ms deadline")
 	}
 }
