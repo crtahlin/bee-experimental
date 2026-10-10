@@ -46,7 +46,7 @@ In the sync worker loop in `syncPeerBin`:
 
 **Why the wait must end with `ctx`, not only at shutdown.** When a peer is removed, or the radius changes, `disconnectPeer` calls `syncPeer.stop()`, which waits for that peer's workers while holding `peer.mtx`, and is itself called under `syncPeersMtx` from the manage loop. A worker that ignored `ctx` during a 1-minute wait would block the whole manage loop for that long. `Close` would not reveal it: it gives up after 10 s and returns nil.
 
-The result: a peer that keeps failing gets at most about 26 attempts per minute once the waits reach their maximum, instead of thousands per second. A peer that recovers is synced again within a minute.
+The result: a peer that keeps failing gets at most about 26 attempts per minute once the waits reach their maximum, instead of thousands per second. A peer that recovers is synced again within 72 s at most: the 1-minute cap plus up to 20 % random wait. (Corrected by #576; the first version said "within a minute".)
 
 ## Protocol impact
 

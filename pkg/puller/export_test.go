@@ -93,3 +93,12 @@ const (
 
 // PruneRunDumps exposes pruneRunDumps.
 var PruneRunDumps = pruneRunDumps
+
+// NoProgress returns the sync calls counted with no error and no progress.
+func (p *Puller) NoProgress() float64 {
+	var m dto.Metric
+	if err := p.metrics.NoProgress.Write(&m); err != nil {
+		return -1
+	}
+	return m.GetCounter().GetValue()
+}
