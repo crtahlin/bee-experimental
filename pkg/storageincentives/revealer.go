@@ -199,6 +199,17 @@ func (r *Revealer) Pending() (round, deadlineBlock uint64, ok bool) {
 	return 0, 0, false
 }
 
+// WaitBudget is how long a pending reveal can still take, from the last
+// block seen to the end of its reveal phase; 0 when none is pending.
+func (r *Revealer) WaitBudget() time.Duration {
+	_, deadline, ok := r.Pending()
+	if !ok {
+		return 0
+	}
+	block, _ := r.state.lastBlock()
+	return time.Duration(deadline-block+1) * r.blockTime()
+}
+
 // Wait implements RevealGuard.
 func (r *Revealer) Wait(ctx context.Context) error {
 	round, deadline, ok := r.Pending()

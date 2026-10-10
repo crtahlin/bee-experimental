@@ -87,7 +87,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/crypto/sha3"
 	"golang.org/x/net/idna"
-	"golang.org/x/sync/errgroup"
 )
 
 // LoggerName is the tree path name of the logger for this package.
@@ -131,6 +130,21 @@ type Bee struct {
 	syncingStopped           *syncutil.Signaler
 	accesscontrolCloser      io.Closer
 	ethClientCloser          func()
+	// revealGuard is the storage-lottery Revealer, set as soon as it is
+	// built, so a stop can wait for a pending reveal.
+	revealGuard       revealGuard
+	stopWaitForReveal bool
+}
+
+// revealGuard is what Shutdown needs of the storage-lottery Revealer.
+type revealGuard interface {
+	storageincentives.RevealGuard
+	// BeginShutdown refuses commits from now on.
+	BeginShutdown()
+	// WaitBudget is how long a pending reveal can still take; 0 when none
+	// is pending.
+	WaitBudget() time.Duration
+	io.Closer
 }
 
 type Options struct {
@@ -158,7 +172,10 @@ type Options struct {
 	// PostageStallShutdown stops the node once its batch store has been
 	// stale this long (#583). Zero, the default, never stops it: a stale node
 	// stays up in a degraded state.
-	PostageStallShutdown            time.Duration
+	PostageStallShutdown time.Duration
+	// StopWaitForReveal makes a stop wait for a pending storage-lottery
+	// reveal, bounded by the end of its reveal phase (#725).
+	StopWaitForReveal               bool
 	BlockSyncInterval               uint64
 	BootnodeMode                    bool
 	Bootnodes                       []string
@@ -566,7 +583,16 @@ func NewBee(
 	defer func(b *Bee) {
 		if err != nil {
 			logger.Error(err, "got error, shutting down...")
-			if err2 := b.Shutdown(); err2 != nil {
+			// a pending reveal (an early reveal after a restart) is
+			// waited for, bounded by its reveal phase
+			ctx, cancel := context.Background(), context.CancelFunc(func() {})
+			if b.revealGuard != nil {
+				if budget := b.revealGuard.WaitBudget(); budget > 0 {
+					ctx, cancel = context.WithTimeout(ctx, budget)
+				}
+			}
+			defer cancel()
+			if err2 := b.Shutdown(ctx); err2 != nil {
 				logger.Error(err2, "got error while shutting down")
 			}
 		}
@@ -755,7 +781,7 @@ func NewBee(
 
 	blockTime := blockTimeFunc(chainBackend, o.BlockTime, o.BlockTimeSet)
 	go watchBlockTime(ctx, logger, chainBackend, o.BlockTime, o.BlockTimeSet)
-	b.transactionCloser = tracerCloser
+	b.transactionCloser = transactionService
 	b.transactionMonitorCloser = transactionMonitor
 
 	beeNodeMode := api.LightMode
@@ -1713,6 +1739,8 @@ func NewBee(
 				return nil, fmt.Errorf("storage incentives state: %w", err)
 			}
 			revealer := storageincentives.NewRevealer(redistributionState, redistributionContract, transactionService, chainBackend, blockTime, storageincentives.DefaultBlocksPerRound, storageincentives.DefaultBlocksPerPhase, logger)
+			b.revealGuard = revealer
+			b.stopWaitForReveal = o.StopWaitForReveal
 
 			agent, err = storageincentives.New(
 				swarmAddress,
@@ -1917,8 +1945,47 @@ func (b *Bee) shutdownClosers() []namedCloser {
 	return closers
 }
 
-func (b *Bee) Shutdown() error {
-	var mErr error
+// shutdownSteps are the steps of Shutdown. runShutdown runs them in their
+// order, so the order is testable.
+type shutdownSteps struct {
+	refuseCommits func()                    // no new storage-lottery commit
+	api           func()                    // API closers and server
+	services      func()                    // shutdownClosers, in parallel
+	p2p           func()                    // p2p and price oracle
+	localstore    func()                    // runs alongside the reveal wait
+	waitReveal    func(ctx context.Context) // a pending reveal
+	chain         func()                    // revealer, transactions, chain client
+	rest          func()                    // the remaining services
+	stateStore    func()                    // last
+}
+
+func runShutdown(ctx context.Context, s shutdownSteps) {
+	s.refuseCommits()
+	s.api()
+	s.services()
+	s.p2p()
+
+	// The reveal reads only the state store and memory, so the localstore
+	// closes while it is awaited. The transaction service and its monitor,
+	// the chain client, the signer and the state store stay open until the
+	// wait ends.
+	var wg sync.WaitGroup
+	wg.Go(s.localstore)
+	s.waitReveal(ctx)
+	wg.Wait()
+
+	s.chain()
+	s.rest()
+	s.stateStore()
+}
+
+// Shutdown stops the node. A pending storage-lottery reveal is waited for
+// until it is mined, its claim phase starts or ctx is done.
+func (b *Bee) Shutdown(ctx context.Context) error {
+	var (
+		mErr   error
+		mErrMu sync.Mutex
+	)
 
 	// if a shutdown is already in process, return here
 	b.shutdownMutex.Lock()
@@ -1953,77 +2020,90 @@ func (b *Bee) Shutdown() error {
 			b.logger.Debug("finished shutdown", "component", component, "elapsed", time.Since(start))
 		}()
 		if err := c.Close(); err != nil {
+			mErrMu.Lock()
 			mErr = multierror.Append(mErr, fmt.Errorf("%s: %w", component, err))
+			mErrMu.Unlock()
 		}
 	}
 
-	tryClose(b.apiCloser, "api")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	var eg errgroup.Group
-	if b.apiServer != nil {
-		eg.Go(func() error {
-			if err := b.apiServer.Shutdown(ctx); err != nil {
-				return fmt.Errorf("api server: %w", err)
+	runShutdown(ctx, shutdownSteps{
+		refuseCommits: func() {
+			if b.revealGuard != nil {
+				b.revealGuard.BeginShutdown()
 			}
-			return nil
-		})
-	}
-	if err := eg.Wait(); err != nil {
-		mErr = multierror.Append(mErr, err)
-	}
+		},
+		api: func() {
+			tryClose(b.apiCloser, "api")
 
-	var wg sync.WaitGroup
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
 
-	closers := b.shutdownClosers()
+			if b.apiServer != nil {
+				if err := b.apiServer.Shutdown(ctx); err != nil {
+					mErrMu.Lock()
+					mErr = multierror.Append(mErr, fmt.Errorf("api server: %w", err))
+					mErrMu.Unlock()
+				}
+			}
+		},
+		services: func() {
+			var wg sync.WaitGroup
+			for _, nc := range b.shutdownClosers() {
+				wg.Go(func() { tryClose(nc.closer, nc.name) })
+			}
+			b.ctxCancel()
+			wg.Wait()
+		},
+		p2p: func() {
+			tryClose(b.p2pService, "p2p server")
+			tryClose(b.priceOracleCloser, "price oracle service")
+		},
+		localstore: func() {
+			// the agent samples the localstore, so it stops first; the
+			// reveal wait does not need it
+			tryClose(b.storageIncetivesCloser, "storage incentives agent")
+			tryClose(b.localstoreCloser, "localstore")
+		},
+		waitReveal: func(ctx context.Context) {
+			if b.revealGuard == nil || !b.stopWaitForReveal {
+				return
+			}
+			if err := b.revealGuard.Wait(ctx); err != nil {
+				b.logger.Info("stop: the storage-lottery reveal wait ended early", "error", err)
+			}
+		},
+		chain: func() {
+			if b.revealGuard != nil {
+				tryClose(b.revealGuard, "storage incentives revealer")
+			}
 
-	wg.Add(len(closers))
-	for _, nc := range closers {
-		go func(c io.Closer, name string) {
-			defer wg.Done()
-			tryClose(c, name)
-		}(nc.closer, nc.name)
-	}
+			var wg sync.WaitGroup
+			wg.Go(func() {
+				tryClose(b.transactionMonitorCloser, "transaction monitor")
+				tryClose(b.transactionCloser, "transaction")
+			})
+			wg.Go(func() { tryClose(b.listenerCloser, "listener") })
+			wg.Go(func() { tryClose(b.postageServiceCloser, "postage service") })
+			wg.Wait()
 
-	b.ctxCancel()
-	wg.Wait()
-
-	tryClose(b.p2pService, "p2p server")
-	tryClose(b.priceOracleCloser, "price oracle service")
-
-	wg.Add(3)
-	go func() {
-		defer wg.Done()
-		tryClose(b.transactionMonitorCloser, "transaction monitor")
-		tryClose(b.transactionCloser, "transaction")
-	}()
-	go func() {
-		defer wg.Done()
-		tryClose(b.listenerCloser, "listener")
-	}()
-	go func() {
-		defer wg.Done()
-		tryClose(b.postageServiceCloser, "postage service")
-	}()
-
-	wg.Wait()
-
-	if b.ethClientCloser != nil {
-		b.ethClientCloser()
-	}
-
-	tryClose(b.accesscontrolCloser, "accesscontrol")
-	tryClose(b.tracerCloser, "tracer")
-	tryClose(b.topologyCloser, "topology driver")
-	tryClose(b.storageIncetivesCloser, "storage incentives agent")
-	tryClose(b.stabilizationDetector, "stabilization detector")
-	// close localstore before StateStore to avoid ErrClosed / incomplete flush.
-	tryClose(b.localstoreCloser, "localstore")
-	tryClose(b.stateStoreCloser, "statestore")
-	tryClose(b.stamperStoreCloser, "stamperstore")
-	tryClose(b.resolverCloser, "resolver service")
+			if b.ethClientCloser != nil {
+				b.ethClientCloser()
+			}
+		},
+		rest: func() {
+			tryClose(b.accesscontrolCloser, "accesscontrol")
+			tryClose(b.tracerCloser, "tracer")
+			tryClose(b.topologyCloser, "topology driver")
+			tryClose(b.stabilizationDetector, "stabilization detector")
+		},
+		stateStore: func() {
+			// the localstore is closed before the state store, to avoid
+			// ErrClosed or an incomplete flush
+			tryClose(b.stateStoreCloser, "statestore")
+			tryClose(b.stamperStoreCloser, "stamperstore")
+			tryClose(b.resolverCloser, "resolver service")
+		},
+	})
 
 	return mErr
 }
