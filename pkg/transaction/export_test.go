@@ -5,3 +5,5 @@
 package transaction
 
 var StoredTransactionKey = storedTransactionKey
+
+var Bumped = bumped

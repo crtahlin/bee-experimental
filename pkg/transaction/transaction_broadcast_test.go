@@ -395,3 +395,25 @@ func TestTransactionStatus(t *testing.T) {
 		t.Fatalf("got %v, want the lookup error", err)
 	}
 }
+
+// The replacement raise rounds up: small values are raised too, and every
+// raised value is at least ReplacementBumpPercent above the original.
+func TestBumpedRoundsUp(t *testing.T) {
+	t.Parallel()
+
+	for v := int64(1); v <= 1000; v++ {
+		got := transaction.Bumped(big.NewInt(v))
+		if got.Cmp(big.NewInt(v)) <= 0 {
+			t.Fatalf("bumped(%d) = %s, not raised", v, got)
+		}
+		// got*100 >= v*(100+percent)
+		lhs := new(big.Int).Mul(got, big.NewInt(100))
+		rhs := big.NewInt(v * (100 + transaction.ReplacementBumpPercent))
+		if lhs.Cmp(rhs) < 0 {
+			t.Fatalf("bumped(%d) = %s, below a %d %% raise", v, got, transaction.ReplacementBumpPercent)
+		}
+	}
+	if got := transaction.Bumped(big.NewInt(0)); got.Sign() != 0 {
+		t.Fatalf("bumped(0) = %s, want 0", got)
+	}
+}

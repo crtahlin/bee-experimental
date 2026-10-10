@@ -735,11 +735,15 @@ func (t *transactionService) TransactionStatus(ctx context.Context, txHash commo
 	return TxNotFound, nil
 }
 
+// bumped raises v by ReplacementBumpPercent, rounded up, so that a small
+// value is raised too and the replacement is not rejected as underpriced.
 func bumped(v *big.Int) *big.Int {
 	if v == nil {
 		return new(big.Int)
 	}
-	return new(big.Int).Div(new(big.Int).Mul(v, big.NewInt(100+ReplacementBumpPercent)), big.NewInt(100))
+	n := new(big.Int).Mul(v, big.NewInt(100+ReplacementBumpPercent))
+	n.Add(n, big.NewInt(99))
+	return n.Div(n, big.NewInt(100))
 }
 
 func bigMax(a, b *big.Int) *big.Int {
