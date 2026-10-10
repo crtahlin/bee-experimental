@@ -149,6 +149,10 @@ type Reserve interface {
 	// actively evicting, or 0. The storage incentives agent sits out a
 	// round when it is at least EvictingMinAge (#649).
 	EvictingFor() time.Duration
+	// RadiusState returns the storage radius and how many times it has
+	// increased, from one read. The agent compares the count before and
+	// after a sample (#658).
+	RadiusState() (radius uint8, increases uint64)
 }
 
 // ReserveIterator is a helper interface which can be used to iterate over all
@@ -1069,6 +1073,15 @@ func (db *DB) Metrics() []prometheus.Collector {
 			Help:      "Active time of the current reserve eviction episode, not counting time paused for a sample; 0 when none (wasp #649).",
 		},
 		func() float64 { return db.EvictingFor().Seconds() },
+	))
+	collectors = append(collectors, prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Namespace: m.Namespace,
+			Subsystem: "localstore",
+			Name:      "eviction_expiry_running_seconds",
+			Help:      "Active time of the expired-batch eviction run in progress, not counting time paused for a sample; 0 when none (wasp #663).",
+		},
+		func() float64 { return db.episode.expiryActiveFor(time.Now()).Seconds() },
 	))
 	if v, ok := db.storage.(m.Collector); ok {
 		collectors = append(collectors, v.Metrics()...)

@@ -39,7 +39,10 @@ type Reserve struct {
 
 	capacity int
 	size     atomic.Int64
-	radius   atomic.Uint32
+	// radius holds the storage radius in the low 8 bits and the number of
+	// radius increases in the rest, in one word, so a reader never sees a
+	// radius and a count from different writes (#658).
+	radius atomic.Uint64
 	// arrivals counts the chunks Put added to the reserve, that is the
 	// increments of size. Eviction paces itself against its rate (#623).
 	arrivals atomic.Uint64
@@ -70,7 +73,7 @@ func New(
 		if err != nil && !errors.Is(err, storage.ErrNotFound) {
 			return err
 		}
-		rs.radius.Store(uint32(rItem.Radius))
+		rs.radius.Store(uint64(rItem.Radius))
 
 		epochItem := &EpochItem{}
 		err = s.IndexStore().Get(epochItem)
@@ -835,6 +838,13 @@ func (r *Reserve) Radius() uint8 {
 	return uint8(r.radius.Load())
 }
 
+// RadiusState returns the storage radius and the number of times it has
+// increased, from one read (#658).
+func (r *Reserve) RadiusState() (uint8, uint64) {
+	w := r.radius.Load()
+	return uint8(w), w >> 8
+}
+
 func (r *Reserve) Size() int {
 	return int(r.size.Load())
 }
@@ -855,7 +865,16 @@ func (r *Reserve) EvictionTarget() int {
 }
 
 func (r *Reserve) SetRadius(rad uint8) error {
-	r.radius.Store(uint32(rad))
+	for {
+		old := r.radius.Load()
+		count := old >> 8
+		if rad > uint8(old) {
+			count++
+		}
+		if r.radius.CompareAndSwap(old, count<<8|uint64(rad)) {
+			break
+		}
+	}
 	r.radiusSetter.SetStorageRadius(rad)
 	return r.st.Run(context.Background(), func(s transaction.Store) error {
 		return s.IndexStore().Put(&radiusItem{Radius: rad})

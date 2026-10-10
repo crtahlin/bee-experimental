@@ -21,6 +21,8 @@ type metrics struct {
 	Round                   prometheus.Gauge
 	InsufficientFundsToPlay prometheus.Counter
 	SkippedWhileEvicting    prometheus.Counter
+	SkippedRadiusIncrease   prometheus.Counter
+	PlayedAfterDecrease     prometheus.Counter
 
 	// total calls to chain backend
 	BackendCalls  prometheus.Counter
@@ -70,6 +72,18 @@ func newMetrics() metrics {
 			Subsystem: subsystem,
 			Name:      "skipped_while_evicting",
 			Help:      "Selected rounds skipped because the node had been evicting from its reserve for at least a minute (wasp #649).",
+		}),
+		SkippedRadiusIncrease: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "skipped_radius_increase_total",
+			Help:      "Selected rounds skipped because the storage radius increased between reading the round's depth and the end of the sample (wasp #658).",
+		}),
+		PlayedAfterDecrease: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "played_after_radius_decrease_total",
+			Help:      "Selected rounds played although the storage radius decreased while the sample was taken; a decrease cannot change the sampled range (wasp #658).",
 		}),
 		ClaimPhase: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: m.Namespace,

@@ -261,7 +261,7 @@ func (db *DB) reserveWorker(ctx context.Context, ready chan<- struct{}) {
 			return
 		case <-batchExpiryTrigger:
 
-			err := db.evictionRun(func() error { return db.evictExpiredBatches(ctx) })
+			err := db.evictionRun(evictionKindExpiry, func() error { return db.evictExpiredBatches(ctx) })
 			if err != nil {
 				// A shutdown is not a fault, and the worker is stopping
 				// anyway, so it returns rather than warning (#407).
@@ -280,7 +280,7 @@ func (db *DB) reserveWorker(ctx context.Context, ready chan<- struct{}) {
 		case <-overCapTrigger:
 
 			db.metrics.OverCapTriggerCount.Inc()
-			if err := db.evictionRun(func() error { return db.unreserve(ctx) }); err != nil {
+			if err := db.evictionRun(evictionKindUnreserve, func() error { return db.unreserve(ctx) }); err != nil {
 				if errors.Is(err, ErrDBQuit) {
 					return
 				}
@@ -626,6 +626,15 @@ func (db *DB) StorageRadius() uint8 {
 		return 0
 	}
 	return db.reserve.Radius()
+}
+
+// RadiusState returns the storage radius and how many times it has
+// increased, from one read, or (0, 0) without a reserve (#658).
+func (db *DB) RadiusState() (uint8, uint64) {
+	if db.reserve == nil {
+		return 0, 0
+	}
+	return db.reserve.RadiusState()
 }
 
 func (db *DB) CommittedDepth() uint8 {

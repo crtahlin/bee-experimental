@@ -24,7 +24,11 @@ import (
 //
 // Separately, an eviction episode measures how long the node has been
 // evicting, across reserve-worker runs, so the storage incentives agent can
-// sit out a round while a large eviction runs.
+// sit out a round while a large eviction runs. Only radius-increase
+// (unreserve) runs count: an expired batch's chunks are rejected by every
+// node's sample whether or not they have been evicted, so an expiry run
+// does not change a sample (#663). An expiry run inside an open episode
+// holds it: the episode stays open but its active time does not grow.
 
 const (
 	// EvictingMinAge is how long an eviction episode must have been active
@@ -150,6 +154,13 @@ func (db *DB) evictionBarrier(ctx context.Context, expiry <-chan struct{}) (func
 type evictionEpisode struct {
 	mu sync.Mutex
 
+	// held is set while an expiry run interrupts an open episode (#663).
+	held bool
+	// The expiry run in progress, if any, with its own paused time.
+	expStart      time.Time
+	expPaused     time.Duration
+	expPauseStart time.Time
+
 	open       bool
 	active     time.Duration // active time of the episode's finished runs
 	runStart   time.Time     // zero when no run is in progress
@@ -161,7 +172,7 @@ type evictionEpisode struct {
 // expiredLocked closes an episode whose last run ended more than the idle
 // grace ago with no run since.
 func (e *evictionEpisode) expiredLocked(now time.Time) bool {
-	if e.open && e.runStart.IsZero() && now.Sub(e.lastRunEnd) > episodeIdleGrace {
+	if e.open && e.runStart.IsZero() && !e.held && now.Sub(e.lastRunEnd) > episodeIdleGrace {
 		e.open = false
 		e.active = 0
 	}
@@ -198,15 +209,80 @@ func (e *evictionEpisode) runEnded(now time.Time, done bool) {
 	}
 }
 
+// expiryStarted starts an expiry run. It never opens an episode; an open
+// one is held, unless it is already past its idle grace, in which case it
+// is closed rather than revived (#663).
+func (e *evictionEpisode) expiryStarted(now time.Time) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.expiredLocked(now) {
+		e.held = true
+	}
+	e.expStart = now
+	e.expPaused = 0
+	e.expPauseStart = time.Time{}
+}
+
+// expiryEnded ends the expiry run and returns its active time. A held
+// episode stays open, with its idle grace counted from now; a shutdown
+// closes it.
+func (e *evictionEpisode) expiryEnded(now time.Time, quit bool) time.Duration {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var d time.Duration
+	if !e.expStart.IsZero() {
+		d = max(0, now.Sub(e.expStart)-e.expPaused)
+	}
+	e.expStart = time.Time{}
+	e.expPaused = 0
+	e.expPauseStart = time.Time{}
+	if e.held {
+		e.held = false
+		e.lastRunEnd = now
+	}
+	if quit {
+		e.open = false
+		e.active = 0
+	}
+	return d
+}
+
+// expiryActiveFor returns the active time of the expiry run in progress,
+// or 0.
+func (e *evictionEpisode) expiryActiveFor(now time.Time) time.Duration {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.expStart.IsZero() {
+		return 0
+	}
+	d := now.Sub(e.expStart) - e.expPaused
+	if !e.expPauseStart.IsZero() {
+		d -= now.Sub(e.expPauseStart)
+	}
+	return max(0, d)
+}
+
+// pauseStarted and pauseEnded count a pause against the expiry run while
+// one is in progress, so a held episode's active time is not altered, and
+// against the episode's run otherwise.
 func (e *evictionEpisode) pauseStarted(now time.Time) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if !e.expStart.IsZero() {
+		e.expPauseStart = now
+		return
+	}
 	e.pauseStart = now
 }
 
 func (e *evictionEpisode) pauseEnded(d time.Duration) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if !e.expStart.IsZero() {
+		e.expPaused += d
+		e.expPauseStart = time.Time{}
+		return
+	}
 	if !e.runStart.IsZero() {
 		e.runPaused += d
 	}
@@ -239,23 +315,40 @@ func (db *DB) EvictingFor() time.Duration {
 	return db.episode.activeFor(time.Now())
 }
 
-// evictionRun runs one eviction run of the reserve worker inside the
-// current episode, and closes the episode when no work is left or the node
-// is stopping.
-func (db *DB) evictionRun(run func() error) error {
+// evictionKind is the kind of a reserve-worker eviction run.
+type evictionKind int
+
+const (
+	// evictionKindUnreserve is a radius-increase run (unreserve). It opens
+	// and extends the eviction episode.
+	evictionKindUnreserve evictionKind = iota
+	// evictionKindExpiry evicts expired batches. It never opens an episode
+	// and only holds an open one (#663).
+	evictionKindExpiry
+)
+
+// evictionRun runs one eviction run of the reserve worker. An unreserve
+// run runs inside the current episode and closes it when no work is left
+// or the node is stopping; an expiry run holds an open episode and counts
+// its own active time.
+func (db *DB) evictionRun(kind evictionKind, run func() error) (err error) {
+	if kind == evictionKindExpiry {
+		db.episode.expiryStarted(time.Now())
+		defer func() {
+			d := db.episode.expiryEnded(time.Now(), errors.Is(err, ErrDBQuit))
+			db.metrics.EvictionExpirySeconds.Add(d.Seconds())
+		}()
+		return run()
+	}
 	db.episode.runStarted(time.Now())
-	err := run()
-	done := errors.Is(err, ErrDBQuit) || !db.evictionWorkLeft()
+	err = run()
+	done := errors.Is(err, ErrDBQuit) || !db.episodeWorkLeft()
 	db.episode.runEnded(time.Now(), done)
 	return err
 }
 
-// evictionWorkLeft reports whether the reserve is over capacity or an
-// expired batch is still recorded for eviction.
-func (db *DB) evictionWorkLeft() bool {
-	if db.reserve != nil && db.reserve.EvictionTarget() > 0 {
-		return true
-	}
-	batches, err := db.getExpiredBatches()
-	return err != nil || len(batches) > 0
+// episodeWorkLeft reports whether the reserve is still over capacity.
+// Pending expired batches do not keep an episode open (#663).
+func (db *DB) episodeWorkLeft() bool {
+	return db.reserve != nil && db.reserve.EvictionTarget() > 0
 }
