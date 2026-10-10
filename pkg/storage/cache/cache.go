@@ -84,18 +84,28 @@ func (c *Cache) Has(k storage.Key) (bool, error) {
 }
 
 // Put implements storage.Store interface.
-// On a call it also inserts the item into the cache so that the next
-// call to Put and Has will be able to retrieve the item from cache.
+// It writes the item to the wrapped store first and caches it only when
+// the write succeeds, so that the next call to Get and Has can retrieve
+// it from cache. A failed write drops any cached value for the key, so
+// the next Get reads the stored value (wasp #732).
 func (c *Cache) Put(i storage.Item) error {
+	if err := c.IndexStore.Put(i); err != nil {
+		_ = c.lru.Remove(key(i))
+		return err
+	}
 	c.add(i)
-	return c.IndexStore.Put(i)
+	return nil
 }
 
 // PutSync implements storage.SyncWriter: it writes through to the wrapped
-// store's synced write and caches the item, as Put does.
+// store's synced write and caches the item on success, as Put does.
 func (c *Cache) PutSync(i storage.Item) error {
+	if err := c.IndexStore.PutSync(i); err != nil {
+		_ = c.lru.Remove(key(i))
+		return err
+	}
 	c.add(i)
-	return c.IndexStore.PutSync(i)
+	return nil
 }
 
 // Delete implements storage.Store interface.
