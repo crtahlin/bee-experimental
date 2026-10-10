@@ -42,6 +42,42 @@ type Syncer interface {
 	Start(context.Context)
 }
 
+// RadiusSyncReporter is implemented by a Syncer that can tell since when it
+// has been syncing at a storage radius. The reserve worker then lowers the
+// radius again only after the syncer has acted on the current one (#696).
+type RadiusSyncReporter interface {
+	// ActedOnRadius returns the storage radius the puller has acted on and
+	// since when. ok is false until it has acted on any radius.
+	ActedOnRadius() (radius uint8, since time.Time, ok bool)
+}
+
+// Reasons a radius decrease is deferred (#696).
+const (
+	deferNotStarted  = "puller_not_started"
+	deferNotAtRadius = "puller_not_at_radius"
+	deferSettling    = "puller_settling"
+)
+
+// radiusDecreaseDeferral returns why a decrease from radius must wait for the
+// puller, or "" when it may go ahead. Without a reporter it never defers.
+func (db *DB) radiusDecreaseDeferral(radius uint8, now time.Time) (reason string, acted uint8, age time.Duration) {
+	if db.radiusReporter == nil {
+		return "", 0, 0
+	}
+	acted, since, ok := db.radiusReporter.ActedOnRadius()
+	if !ok {
+		return deferNotStarted, 0, 0
+	}
+	age = now.Sub(since)
+	if acted != radius {
+		return deferNotAtRadius, acted, age
+	}
+	if age < db.reserveOptions.decreaseSettle {
+		return deferSettling, acted, age
+	}
+	return "", acted, age
+}
+
 func threshold(capacity int) int { return capacity * 5 / 10 }
 
 func (db *DB) startReserveWorkers(
@@ -309,6 +345,13 @@ func (db *DB) reserveWorker(ctx context.Context, ready chan<- struct{}) {
 			}
 
 			if count < threshold(db.reserve.Capacity()) && db.syncer.SyncRate() == 0 && radius > db.reserveOptions.minimumRadius {
+				// A sync rate of 0 also holds while the puller has not synced at
+				// this radius at all; lower it again only once it has (#696).
+				if reason, acted, age := db.radiusDecreaseDeferral(radius, time.Now()); reason != "" {
+					db.metrics.RadiusDecreaseDeferred.WithLabelValues(reason).Inc()
+					db.logger.Debug("reserve radius decrease deferred until the puller has synced at the current radius", "radius", radius, "puller_radius", acted, "since", age, "reason", reason)
+					continue
+				}
 				radius--
 				if err := db.reserve.SetRadius(radius); err != nil {
 					db.logger.Error(err, "reserve set radius")

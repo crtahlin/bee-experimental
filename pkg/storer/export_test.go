@@ -18,6 +18,7 @@ import (
 	"github.com/ethersphere/bee/v2/pkg/storer/internal/transaction"
 	"github.com/ethersphere/bee/v2/pkg/swarm"
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 )
 
 func (db *DB) Reserve() *reserve.Reserve {
@@ -227,3 +228,19 @@ func (db *DB) HeldCount() uint64 { return db.held.count() }
 func (db *DB) DeleteChunkForTest(ctx context.Context, addr swarm.Address) error {
 	return db.storage.Run(ctx, func(s transaction.Store) error { return s.ChunkStore().Delete(ctx, addr) })
 }
+
+// RadiusDecreaseDeferred returns the deferred radius decreases counted for
+// reason (#696).
+func (db *DB) RadiusDecreaseDeferred(reason string) float64 {
+	var m dto.Metric
+	if err := db.metrics.RadiusDecreaseDeferred.WithLabelValues(reason).Write(&m); err != nil {
+		return -1
+	}
+	return m.GetCounter().GetValue()
+}
+
+const (
+	DeferNotStarted  = deferNotStarted
+	DeferNotAtRadius = deferNotAtRadius
+	DeferSettling    = deferSettling
+)

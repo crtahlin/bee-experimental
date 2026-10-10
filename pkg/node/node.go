@@ -1183,6 +1183,7 @@ func NewBee(
 		// configure reserve only for full node
 		lo.ReserveCapacity = reserveCapacity
 		lo.ReserveWakeUpDuration = DefaultReserveWakeUpDuration
+		lo.RadiusDecreaseSettle = puller.DefaultHistRateWindow
 		if o.ReserveWakeUpDuration > 0 {
 			lo.ReserveWakeUpDuration = o.ReserveWakeUpDuration
 		}

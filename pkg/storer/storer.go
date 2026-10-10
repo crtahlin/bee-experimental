@@ -692,6 +692,13 @@ type Options struct {
 
 	MinimumStorageRadius uint
 
+	// RadiusDecreaseSettle is how long the puller must have synced at the
+	// current radius before the reserve worker lowers it again; one sync-rate
+	// window. Zero disables only this wait; the checks that the puller has
+	// acted on the current radius still apply when the syncer reports it.
+	// See #696.
+	RadiusDecreaseSettle time.Duration
+
 	// ShutdownTimeout bounds how long Close waits for background cache and
 	// reserve workers to finish before giving up and reporting an error.
 	// Zero means defaultShutdownTimeout.
@@ -772,8 +779,11 @@ type DB struct {
 	validStamp       postage.ValidStampFn
 	setSyncerOnce    sync.Once
 	syncer           Syncer
-	reserveOptions   reserveOpts
-	shutdownTimeout  time.Duration
+	// radiusReporter is the syncer when it reports the radius it acted on
+	// (#696); nil otherwise.
+	radiusReporter  RadiusSyncReporter
+	reserveOptions  reserveOpts
+	shutdownTimeout time.Duration
 	// drainWindow is how long each shutdown drain waits. Zero means
 	// drainTimeout. A field rather than a bare constant so a test can
 	// shorten it per store, instead of mutating package state that
@@ -812,6 +822,8 @@ type reserveOpts struct {
 	cacheMinEvictCount uint64
 	minimumRadius      uint8
 	capacityDoubling   int
+	// decreaseSettle is Options.RadiusDecreaseSettle (#696).
+	decreaseSettle time.Duration
 	// samplerReadConcurrency is how many chunk loads the sampler has in flight.
 	// Separate from the hasher count because loading is disk-bound and hashing
 	// is CPU-bound; see issue #9.
@@ -983,6 +995,7 @@ func New(ctx context.Context, dirPath string, opts *Options) (*DB, error) {
 			minEvictCount:          opts.ReserveMinEvictCount,
 			cacheMinEvictCount:     opts.CacheMinEvictCount,
 			minimumRadius:          uint8(opts.MinimumStorageRadius),
+			decreaseSettle:         opts.RadiusDecreaseSettle,
 			capacityDoubling:       opts.ReserveCapacityDoubling,
 			samplerReadConcurrency: opts.SamplerReadConcurrency,
 			samplerSortWindow:      opts.SamplerSortWindow,
@@ -1173,6 +1186,9 @@ func (db *DB) SetRetrievalService(r retrieval.Interface) {
 func (db *DB) StartReserveWorker(ctx context.Context, s Syncer, radius func() (uint8, error), ready chan<- struct{}) {
 	db.setSyncerOnce.Do(func() {
 		db.syncer = s
+		if r, ok := s.(RadiusSyncReporter); ok {
+			db.radiusReporter = r
+		}
 		go db.startReserveWorkers(ctx, radius, ready)
 	})
 }

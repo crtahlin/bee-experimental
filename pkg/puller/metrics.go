@@ -20,6 +20,7 @@ type metrics struct {
 	OnChangeStarted       prometheus.Gauge       // start time of the recalculation in progress, 0 if none
 	OnChangeDuration      prometheus.Histogram   // duration of completed recalculations
 	CursorRequestsFailed  *prometheus.CounterVec // failed cursors requests by reason
+	ActedRadius           prometheus.Gauge       // storage radius the puller has acted on
 }
 
 func newMetrics(pullsyncRate func() float64) metrics {
@@ -82,6 +83,12 @@ func newMetrics(pullsyncRate func() float64) metrics {
 			Buckets:   []float64{0.1, 0.5, 1, 5, 15, 30, 60, 120, 300, 900, 1800, 3600},
 		}),
 		CursorRequestsFailed: cursorRequestsFailed(subsystem),
+		ActedRadius: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "acted_radius",
+			Help:      "Storage radius at which the puller last started syncing from at least one neighbour; the reserve worker lowers the radius again only after a sync-rate window at it (#696).",
+		}),
 	}
 }
 
