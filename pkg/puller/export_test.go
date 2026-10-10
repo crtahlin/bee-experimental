@@ -48,3 +48,48 @@ func (p *Puller) IsBinSyncing(addr swarm.Address, bin uint8) bool {
 	}
 	return false
 }
+
+// SetCursorsTimeout sets the cursors request deadline. Call it before Start.
+func (p *Puller) SetCursorsTimeout(d time.Duration) { p.cursorsTimeout = d }
+
+// SetBlockedRunWatch sets the blocked-run threshold and the watcher interval.
+// Call it before Start.
+func (p *Puller) SetBlockedRunWatch(threshold, interval time.Duration) {
+	p.blockedRunThreshold = threshold
+	p.runWatchInterval = interval
+}
+
+// CursorRequestsFailed returns the failed cursors requests counted for reason.
+func (p *Puller) CursorRequestsFailed(reason string) float64 {
+	var m dto.Metric
+	if err := p.metrics.CursorRequestsFailed.WithLabelValues(reason).Write(&m); err != nil {
+		return -1
+	}
+	return m.GetCounter().GetValue()
+}
+
+// OnChangeStarted returns the start-time gauge of the run in progress.
+func (p *Puller) OnChangeStarted() float64 {
+	var m dto.Metric
+	if err := p.metrics.OnChangeStarted.Write(&m); err != nil {
+		return -1
+	}
+	return m.GetGauge().GetValue()
+}
+
+// OnChangeDurationCount returns how many completed runs were observed.
+func (p *Puller) OnChangeDurationCount() uint64 {
+	var m dto.Metric
+	if err := p.metrics.OnChangeDuration.Write(&m); err != nil {
+		return 0
+	}
+	return m.GetHistogram().GetSampleCount()
+}
+
+const (
+	CursorFailTimeout = cursorFailTimeout
+	CursorFailError   = cursorFailError
+)
+
+// PruneRunDumps exposes pruneRunDumps.
+var PruneRunDumps = pruneRunDumps
