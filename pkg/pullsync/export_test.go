@@ -32,6 +32,14 @@ func (s *Syncer) WaitingTracked() int {
 	return s.waiting.count()
 }
 
+// WaitingKeys returns the number of (peer, bin) keys in the waiting-request
+// map.
+func (s *Syncer) WaitingKeys() int {
+	s.waiting.mu.Lock()
+	defer s.waiting.mu.Unlock()
+	return len(s.waiting.m)
+}
+
 func metricValue(m prometheus.Metric) float64 {
 	var d dto.Metric
 	if err := m.Write(&d); err != nil {
