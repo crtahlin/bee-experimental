@@ -135,6 +135,7 @@ whether upstream has the problem. See
 | [#643](https://github.com/crtahlin/wasp/issues/643) | pull-sync: the requested bin is not checked against the number of bins, so a request for a bin that cannot exist waits forever | done | `feat/643-pullsync-bin-check` | [`e379e428`](https://github.com/crtahlin/wasp/commit/e379e428) |
 | [#647](https://github.com/crtahlin/wasp/issues/647) | pull-sync: data race inside the singleflight library when a caller leaves while another joins the same key | done | `feat/647-singleflight-v041` | [`a7c471b0`](https://github.com/crtahlin/wasp/commit/a7c471b0) |
 | [#695](https://github.com/crtahlin/wasp/issues/695) | puller: one peer that does not answer the cursors request blocks the whole recalculation, so a radius change is not acted on | done | `feat/695-puller-cursors-deadline` | [`03261874`](https://github.com/crtahlin/wasp/commit/03261874) |
+| [#696](https://github.com/crtahlin/wasp/issues/696) | storer: the radius drops a second step while the puller has not synced at the current radius, because a sync rate of 0 counts as synced | open | - | - |
 
 #301 and #302 are done, and they settle only half of what #300 says. Its per
 peer half stands: the three chain calls were confirmed directly, and the rate at

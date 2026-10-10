@@ -149,6 +149,9 @@ type Puller struct {
 	cursorTimeoutLog    *rateLog
 	runStart            atomic.Int64 // unix nanoseconds of the run in progress, 0 if none
 	dumpedRun           atomic.Int64 // runStart of the last run a profile was written for
+
+	// acted is the radius the puller has acted on and since when (#696).
+	acted actedState
 }
 
 func New(
@@ -306,6 +309,10 @@ func (p *Puller) manage(ctx context.Context) {
 		}
 
 		p.recalcPeers(ctx, newRadius)
+
+		if p.actedOn(newRadius) {
+			p.recordActed(newRadius, time.Now())
+		}
 	}
 
 	tick := time.NewTicker(p.recalcPeersDur)

@@ -27,6 +27,7 @@ type metrics struct {
 	EvictedChunkCount             prometheus.Counter
 	ExpiredChunkCount             prometheus.Counter
 	OverCapTriggerCount           prometheus.Counter
+	RadiusDecreaseDeferred        *prometheus.CounterVec
 	ExpiredBatchCount             prometheus.Counter
 	LevelDBStats                  *prometheus.HistogramVec
 	ExpiryTriggersCount           prometheus.Counter
@@ -339,7 +340,24 @@ func newMetrics() metrics {
 				Help:      "Stretches of sampling that reached the cap on how long eviction waits; eviction then ran during the sample (wasp #649).",
 			},
 		),
+		RadiusDecreaseDeferred: radiusDecreaseDeferred(subsystem),
 	}
+}
+
+func radiusDecreaseDeferred(subsystem string) *prometheus.CounterVec {
+	c := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: m.Namespace,
+			Subsystem: subsystem,
+			Name:      "radius_decrease_deferred_total",
+			Help:      "Radius decreases the reserve worker deferred because the puller had not yet synced at the current radius, by reason (wasp #696).",
+		},
+		[]string{"reason"},
+	)
+	for _, r := range []string{deferNotStarted, deferNotAtRadius, deferSettling} {
+		c.WithLabelValues(r)
+	}
+	return c
 }
 
 var _ storage.Putter = (*putterWithMetrics)(nil)
