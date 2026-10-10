@@ -15,6 +15,7 @@ package pebblestore
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -211,6 +212,34 @@ func (s *Store) Count(k storage.Key) (int, error) {
 	var c int
 	for iter.First(); iter.Valid(); iter.Next() {
 		c++
+	}
+	return c, errors.Join(iter.Error(), iter.Close())
+}
+
+// countCheckEvery is how many keys a context-aware count steps over between
+// checks of its context.
+const countCheckEvery = 4096
+
+// CountContext is Count that returns the context's error once the context
+// ends, checked every countCheckEvery keys (wasp #635).
+func (s *Store) CountContext(ctx context.Context, k storage.Key) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	prefix := []byte(k.Namespace() + separator)
+	iter, err := s.db.NewIter(prefixBounds(prefix))
+	if err != nil {
+		return 0, err
+	}
+
+	var c int
+	for iter.First(); iter.Valid(); iter.Next() {
+		c++
+		if c%countCheckEvery == 0 {
+			if err := ctx.Err(); err != nil {
+				return 0, errors.Join(err, iter.Close())
+			}
+		}
 	}
 	return c, errors.Join(iter.Error(), iter.Close())
 }

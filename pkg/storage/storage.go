@@ -181,6 +181,23 @@ type Reader interface {
 	Count(Key) (int, error)
 }
 
+// ContextCounter is implemented by a store whose count can be stopped by a
+// context. A full count of a large namespace takes minutes on a large
+// reserve, so a node stopping during startup must not wait for it (wasp
+// #635).
+type ContextCounter interface {
+	CountContext(context.Context, Key) (int, error)
+}
+
+// CountContext counts the items in k's namespace with r's CountContext when
+// r has one, and with Count otherwise.
+func CountContext(ctx context.Context, r Reader, k Key) (int, error) {
+	if c, ok := r.(ContextCounter); ok {
+		return c.CountContext(ctx, k)
+	}
+	return r.Count(k)
+}
+
 // Writer groups methods that change the state of the store.
 type Writer interface {
 	// Put inserts or updates the given Item identified by its Key.ID.

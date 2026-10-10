@@ -62,10 +62,21 @@ type store struct {
 	bstore      storage.BatchStore
 	metrics     metrics
 	chunkLocker *multex.Multex
+	gate        *gate
 }
 
 func NewStorage(sharky *sharky.Store, bstore storage.BatchStore) Storage {
-	return &store{sharky, bstore, newMetrics(), multex.New()}
+	return &store{sharky, bstore, newMetrics(), multex.New(), newGate()}
+}
+
+// StopAdmitting stops admitting store work and waits until every unit of
+// work already admitted (a transaction until its done function, or a
+// top-level read) has left. Work started afterwards gets ErrClosed. still
+// is called once, with the number of units inside, if the wait lasts more
+// than a few seconds. The storer calls it after its drains and before it
+// closes the store (wasp #634).
+func (s *store) StopAdmitting(still func(inside int64)) {
+	s.gate.close(still)
 }
 
 type transaction struct {
@@ -85,16 +96,23 @@ type transaction struct {
 // By design, it is best to not batch too many writes to a single transaction, including multiple chunks writes.
 // Calls made to the transaction are NOT thread-safe.
 func (s *store) NewTransaction(ctx context.Context) (Transaction, func()) {
+	// A transaction is admitted as a whole, until its done function: its
+	// Commit releases sharky slots, and a refused or late release would
+	// leak a slot or block on a closed shard (wasp #634).
+	if !s.gate.enter() {
+		return closedTransaction{}, func() {}
+	}
+
 	b := s.bstore.Batch(ctx)
 
-	index := &indexTrx{s.bstore, b, s.metrics}
+	index := &indexTrx{s.bstore, b, s.metrics, s.gate, false}
 	sharky := &sharkyTrx{s.sharky, s.metrics, nil, nil}
 
 	t := &transaction{
 		start:      time.Now(),
 		batch:      b,
 		indexstore: index,
-		chunkStore: &chunkStoreTrx{index, sharky, s.chunkLocker, make(map[string]struct{}), s.metrics, false},
+		chunkStore: &chunkStoreTrx{index, sharky, s.chunkLocker, make(map[string]struct{}), s.metrics, false, nil},
 		sharkyTrx:  sharky,
 		metrics:    s.metrics,
 	}
@@ -111,17 +129,22 @@ func (s *store) NewTransaction(ctx context.Context) (Transaction, func()) {
 		}
 		t.sharkyTrx.writtenLocs = nil
 		t.chunkStore.lockedAddrs = nil
+		s.gate.leave()
 	}
 }
 
+// IndexStore returns a reader outside any transaction. Each call is
+// admitted on its own (wasp #634).
 func (s *store) IndexStore() storage.Reader {
-	return &indexTrx{s.bstore, nil, s.metrics}
+	return &indexTrx{s.bstore, nil, s.metrics, s.gate, true}
 }
 
+// ChunkStore returns a read-only chunk store outside any transaction. Each
+// call is admitted on its own (wasp #634).
 func (s *store) ChunkStore() storage.ReadOnlyChunkStore {
-	indexStore := &indexTrx{s.bstore, nil, s.metrics}
+	indexStore := &indexTrx{s.bstore, nil, s.metrics, s.gate, false}
 	sharyTrx := &sharkyTrx{s.sharky, s.metrics, nil, nil}
-	return &chunkStoreTrx{indexStore, sharyTrx, s.chunkLocker, nil, s.metrics, true}
+	return &chunkStoreTrx{indexStore, sharyTrx, s.chunkLocker, nil, s.metrics, true, s.gate}
 }
 
 // Run creates a new transaction and gives the caller access to the transaction
@@ -222,10 +245,30 @@ type chunkStoreTrx struct {
 	lockedAddrs  map[string]struct{}
 	metrics      metrics
 	readOnly     bool
+	// gate admits each call of a read-only chunk store made outside a
+	// transaction; nil inside a transaction, which is admitted as a whole.
+	gate *gate
+}
+
+// admit admits one call outside a transaction. Inside a transaction it
+// admits nothing and returns a no-op.
+func (c *chunkStoreTrx) admit() (func(), error) {
+	if c.gate == nil {
+		return func() {}, nil
+	}
+	if !c.gate.enter() {
+		return nil, ErrClosed
+	}
+	return c.gate.leave, nil
 }
 
 func (c *chunkStoreTrx) Get(ctx context.Context, addr swarm.Address) (ch swarm.Chunk, err error) {
 	defer handleMetric("chunkstore_get", c.metrics)(&err)
+	leave, err := c.admit()
+	if err != nil {
+		return nil, err
+	}
+	defer leave()
 	unlock := c.lock(addr)
 	defer unlock()
 	ch, err = chunkstore.Get(ctx, c.indexStore, c.sharkyTrx, addr)
@@ -234,6 +277,11 @@ func (c *chunkStoreTrx) Get(ctx context.Context, addr swarm.Address) (ch swarm.C
 
 func (c *chunkStoreTrx) Has(ctx context.Context, addr swarm.Address) (_ bool, err error) {
 	defer handleMetric("chunkstore_has", c.metrics)(&err)
+	leave, err := c.admit()
+	if err != nil {
+		return false, err
+	}
+	defer leave()
 	unlock := c.lock(addr)
 	defer unlock()
 	return chunkstore.Has(ctx, c.indexStore, addr)
@@ -255,6 +303,11 @@ func (c *chunkStoreTrx) Delete(ctx context.Context, addr swarm.Address) (err err
 
 func (c *chunkStoreTrx) Iterate(ctx context.Context, fn storage.IterateChunkFn) (err error) {
 	defer handleMetric("chunkstore_iterate", c.metrics)(&err)
+	leave, err := c.admit()
+	if err != nil {
+		return err
+	}
+	defer leave()
 	return chunkstore.Iterate(ctx, c.indexStore, c.sharkyTrx, fn)
 }
 
@@ -285,18 +338,93 @@ type indexTrx struct {
 	store   storage.Reader
 	batch   storage.Batch
 	metrics metrics
+	// gate stops iterations at their next item once the store is closing.
+	gate *gate
+	// topLevel admits each call on its own: a reader outside any
+	// transaction (wasp #634).
+	topLevel bool
 }
 
-func (s *indexTrx) Get(i storage.Item) error           { return s.store.Get(i) }
-func (s *indexTrx) Has(k storage.Key) (bool, error)    { return s.store.Has(k) }
-func (s *indexTrx) GetSize(k storage.Key) (int, error) { return s.store.GetSize(k) }
+// admit admits one top-level call; inside a transaction, or for the index
+// reader of a read-only chunk store whose calls are admitted there, it is
+// a no-op.
+func (s *indexTrx) admit() (func(), error) {
+	if !s.topLevel {
+		return func() {}, nil
+	}
+	if !s.gate.enter() {
+		return nil, ErrClosed
+	}
+	return s.gate.leave, nil
+}
+
+func (s *indexTrx) Get(i storage.Item) error {
+	leave, err := s.admit()
+	if err != nil {
+		return err
+	}
+	defer leave()
+	return s.store.Get(i)
+}
+
+func (s *indexTrx) Has(k storage.Key) (bool, error) {
+	leave, err := s.admit()
+	if err != nil {
+		return false, err
+	}
+	defer leave()
+	return s.store.Has(k)
+}
+
+func (s *indexTrx) GetSize(k storage.Key) (int, error) {
+	leave, err := s.admit()
+	if err != nil {
+		return 0, err
+	}
+	defer leave()
+	return s.store.GetSize(k)
+}
+
+// Iterate stops at the next item once the store is closing, so a long
+// scan does not hold the close for minutes (wasp #634).
 func (s *indexTrx) Iterate(q storage.Query, f storage.IterateFn) (err error) {
 	defer handleMetric("iterate", s.metrics)(&err)
-	return s.store.Iterate(q, f)
+	leave, err := s.admit()
+	if err != nil {
+		return err
+	}
+	defer leave()
+	if s.gate == nil {
+		return s.store.Iterate(q, f)
+	}
+	return s.store.Iterate(q, func(r storage.Result) (bool, error) {
+		if s.gate.stopped() {
+			return true, ErrClosed
+		}
+		return f(r)
+	})
 }
-func (s *indexTrx) Count(k storage.Key) (int, error) { return s.store.Count(k) }
-func (s *indexTrx) Put(i storage.Item) error         { return s.batch.Put(i) }
-func (s *indexTrx) Delete(i storage.Item) error      { return s.batch.Delete(i) }
+
+func (s *indexTrx) Count(k storage.Key) (int, error) {
+	leave, err := s.admit()
+	if err != nil {
+		return 0, err
+	}
+	defer leave()
+	return s.store.Count(k)
+}
+
+// CountContext is Count that ends with the context's error (wasp #635).
+func (s *indexTrx) CountContext(ctx context.Context, k storage.Key) (int, error) {
+	leave, err := s.admit()
+	if err != nil {
+		return 0, err
+	}
+	defer leave()
+	return storage.CountContext(ctx, s.store, k)
+}
+func (s *indexTrx) Put(i storage.Item) error    { return s.batch.Put(i) }
+func (s *indexTrx) Delete(i storage.Item) error { return s.batch.Delete(i) }
 
 type sharkyTrx struct {
 	sharky       *sharky.Store
