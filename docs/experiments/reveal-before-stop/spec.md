@@ -161,7 +161,7 @@ Follow-up from the review of #741:
 - **A missing commit is pinned to the nonce at the end of the commit phase** (#745). The two status and head reads can still reach different chain nodes, behind a load balancer or after a failover. Before the key is removed, the node's nonce at the last block of the commit phase is compared with the commit's stored nonce; the answer is pinned to that block, so a chain node that lags behind cannot give it (one without the block returns an error).
   - Nonce unused at that block: the commit never landed (the contract accepts commits only in the commit phase); the two-settled-heads rule then removes the key.
   - Nonce used: the commit can be on chain, or the nonce went to another transaction. The key is kept and the reveal is sent; if the commit is not there, the reveal reverts, which costs gas only. The same holds for a "cancelled" answer: the status cannot tell whose transaction used the nonce.
-  - The nonce read fails: checked again at the next block.
+  - The nonce read fails (for example a chain node that does not have the block yet): possibly committed, so the key is kept and the reveal is sent, as for a failed status read. A read that kept failing must not hold the reveal back until the phase ends.
   - The commit's stored transaction cannot be read: there is no nonce to compare, so the reveal is sent.
 
 ## Measurement

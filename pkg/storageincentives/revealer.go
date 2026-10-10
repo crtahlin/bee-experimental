@@ -494,10 +494,10 @@ const (
 // its nonce used by another transaction) at two different heads, and the
 // node's nonce at the last block of the commit phase shows the commit's
 // nonce unused. The same answer from a head closer to the phase start, or
-// the first such answer, is checked again at the next block, as is a
-// failed nonce read. A lookup error, an unsynced backend, an unknown
-// commit hash, a commit whose stored transaction cannot be read, or a
-// commit nonce used by the end of the commit phase all mean "possibly
+// the first such answer, is checked again at the next block. A lookup
+// error, an unsynced backend, an unknown commit hash, a commit whose
+// stored transaction cannot be read, a failed nonce read, or a commit
+// nonce used by the end of the commit phase all mean "possibly
 // committed", and clear an earlier "missing" answer.
 func (r *Revealer) commitOnChain(ctx context.Context, round uint64) commitCheck {
 	commitTx := r.state.CommitTx(round)
@@ -531,7 +531,11 @@ func (r *Revealer) commitOnChain(ctx context.Context, round uint64) commitCheck 
 			delete(r.commitGoneAt, round)
 			return commitPossible
 		case nonceUnknown:
-			return commitRecheck
+			// a read that keeps failing, for example from a lagging
+			// node without the block, must not hold the reveal back
+			// until the phase ends: reveal, as for an unknown status
+			delete(r.commitGoneAt, round)
+			return commitPossible
 		}
 		head := header.Number.Uint64()
 		if first, ok := r.commitGoneAt[round]; ok && head > first {
@@ -552,7 +556,7 @@ type nonceCheck int
 const (
 	nonceUnused  nonceCheck = iota // the commit was not mined in the commit phase
 	nonceUsed                      // the commit's nonce was used by the end of the commit phase
-	nonceUnknown                   // the read failed; check again at the next block
+	nonceUnknown                   // the read failed: possibly committed
 )
 
 // commitNonceUsed compares the commit's stored nonce with the node's nonce
@@ -570,7 +574,7 @@ func (r *Revealer) commitNonceUsed(ctx context.Context, round uint64, commitTx c
 	commitEnd := r.revealStart(round) - 1
 	nonce, err := r.backend.NonceAt(ctx, r.state.ethAddress, new(big.Int).SetUint64(commitEnd))
 	if err != nil {
-		r.logger.Debug("reveal: nonce at the end of the commit phase unavailable; checking again at the next block", "round", round, "block", commitEnd, "error", err)
+		r.logger.Debug("reveal: nonce at the end of the commit phase unavailable; revealing", "round", round, "block", commitEnd, "error", err)
 		return nonceUnknown
 	}
 	if nonce > stored.Nonce {

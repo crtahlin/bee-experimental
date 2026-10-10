@@ -1481,16 +1481,13 @@ func TestCommitMissingPinnedToNonce(t *testing.T) {
 			reveal: true,
 		},
 		{
-			name:  "nonce read fails, then shows the nonce unused",
-			state: transaction.TxNotFound,
-			nonce: func(step int) (uint64, error) {
-				if step < 2 {
-					return 0, errNonce
-				}
-				return commitNonce, nil
-			},
-			steps: 4,
-			gone:  true,
+			// a lagging node without the block fails every read: the
+			// reveal is sent in the reveal phase and the key kept
+			name:   "nonce read always fails",
+			state:  transaction.TxNotFound,
+			nonce:  func(int) (uint64, error) { return 0, errNonce },
+			steps:  1,
+			reveal: true,
 		},
 		{
 			name:      "stored commit unreadable",
@@ -1550,8 +1547,11 @@ func TestCommitMissingPinnedToNonce(t *testing.T) {
 						t.Fatalf("done %v, key kept %v, reveals %d; want the key removed and no reveal", done, hasKey, reveals)
 					}
 				case tc.reveal:
-					if !done || reveals != 1 || !f.state().HasRevealed(round) {
-						t.Fatalf("done %v, reveals %d, revealed %v; want the reveal sent", done, reveals, f.state().HasRevealed(round))
+					if !done || reveals != 1 || !f.state().HasRevealed(round) || !hasKey {
+						t.Fatalf("done %v, reveals %d, revealed %v, key kept %v; want the reveal sent and the key kept", done, reveals, f.state().HasRevealed(round), hasKey)
+					}
+					if blk := f.chain.block(); blk >= revealStart+testBlocksPerPhase {
+						t.Fatalf("revealed at block %d, after the reveal phase", blk)
 					}
 				}
 			})
