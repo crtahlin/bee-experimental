@@ -112,6 +112,7 @@ func New(overlay swarm.Address,
 		revealer:               revealer,
 		state:                  revealer.State(),
 	}
+	a.setStopCounts()
 
 	a.wg.Add(1)
 	go a.start(blockTime, a.blocksPerRound, blocksPerPhase)
@@ -220,6 +221,7 @@ func (a *Agent) start(blockTime func() time.Duration, blocksPerRound, blocksPerP
 		a.logger.Info("entered new phase", "phase", currentPhase.String(), "round", round, "block", block)
 
 		a.state.SetCurrentEvent(currentPhase, round)
+		a.setStopCounts()
 		a.state.SetFullySynced(a.fullSyncedFunc())
 		a.state.SetHealthy(a.health.IsHealthy())
 		safe.Go(a.logger, "storageincentives-purge-stale-round-data", func() {
@@ -661,6 +663,28 @@ func (a *Agent) wrapCommit(storageRadius uint8, sample []byte, key []byte) ([]by
 // Status returns the node status
 func (a *Agent) Status() (*Status, error) {
 	return a.state.Status()
+}
+
+// RevealPending reports whether a storage-lottery reveal is pending, and if
+// so the last block of its reveal phase: a restart after that block cannot
+// miss it.
+func (a *Agent) RevealPending() (pending bool, safeToRestartAfterBlock uint64) {
+	_, deadline, ok := a.revealer.Pending()
+	if !ok {
+		return false, 0
+	}
+	return true, deadline - 1
+}
+
+// setStopCounts sets the gauges of the persisted stop counts.
+func (a *Agent) setStopCounts() {
+	status, err := a.state.Status()
+	if err != nil {
+		return
+	}
+	a.metrics.StopWaitedForReveal.Set(float64(status.StopWaitedForReveal))
+	a.metrics.RevealMissedOnStop.Set(float64(status.RevealMissedOnStop))
+	a.metrics.RevealAfterRestart.Set(float64(status.RevealAfterRestart))
 }
 
 type SampleWithProofs struct {

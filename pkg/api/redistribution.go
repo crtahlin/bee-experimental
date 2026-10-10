@@ -28,6 +28,11 @@ type redistributionStatusResponse struct {
 	Reward                    *bigint.BigInt `json:"reward"`
 	Fees                      *bigint.BigInt `json:"fees"`
 	IsHealthy                 bool           `json:"isHealthy"`
+	RevealPending             bool           `json:"revealPending"`
+	SafeToRestartAfterBlock   uint64         `json:"safeToRestartAfterBlock"`
+	StopWaitedForReveal       uint64         `json:"stopWaitedForReveal"`
+	RevealMissedOnStop        uint64         `json:"revealMissedOnStop"`
+	RevealAfterRestart        uint64         `json:"revealAfterRestart"`
 }
 
 func (s *Service) redistributionStatusHandler(w http.ResponseWriter, r *http.Request) {
@@ -54,6 +59,8 @@ func (s *Service) redistributionStatusHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	revealPending, safeToRestartAfterBlock := s.redistributionAgent.RevealPending()
+
 	jsonhttp.OK(w, redistributionStatusResponse{
 		MinimumGasFunds:           bigint.Wrap(minGasFunds),
 		HasSufficientFunds:        hasSufficientFunds,
@@ -70,5 +77,10 @@ func (s *Service) redistributionStatusHandler(w http.ResponseWriter, r *http.Req
 		Reward:                    bigint.Wrap(status.Reward),
 		Fees:                      bigint.Wrap(status.Fees),
 		IsHealthy:                 status.IsHealthy,
+		RevealPending:             revealPending,
+		SafeToRestartAfterBlock:   safeToRestartAfterBlock,
+		StopWaitedForReveal:       status.StopWaitedForReveal,
+		RevealMissedOnStop:        status.RevealMissedOnStop,
+		RevealAfterRestart:        status.RevealAfterRestart,
 	})
 }

@@ -1,7 +1,7 @@
 openapi: 3.0.3
 
 info:
-  version: 8.2.2
+  version: 8.3.0
   title: Wasp API
   description: "API endpoints for interacting with the Swarm network, supporting file operations, messaging, and node management. Wasp is an unofficial experimental distribution of Bee; it is wire-compatible with stock Bee but its HTTP API may diverge where a defect is fixed. Divergences are listed under each affected endpoint."
 
