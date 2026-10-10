@@ -38,6 +38,8 @@ type fakeChain struct {
 	start     time.Time
 	baseBlock uint64
 	lag       time.Duration // how far the latest block's time lags the clock
+	headLag   uint64        // how many blocks the latest header lags block()
+	failBlock bool          // BlockNumber fails
 	baseFee   *big.Int
 }
 
@@ -51,12 +53,37 @@ func (c *fakeChain) block() uint64 {
 	return c.baseBlock + uint64(time.Since(c.start)/testBlockTime)
 }
 
-func (c *fakeChain) BlockNumber(context.Context) (uint64, error) { return c.block(), nil }
+func (c *fakeChain) BlockNumber(context.Context) (uint64, error) {
+	c.mu.Lock()
+	fail := c.failBlock
+	c.mu.Unlock()
+	if fail {
+		return 0, errors.New("block number unavailable")
+	}
+	return c.block(), nil
+}
 
 func (c *fakeChain) HeaderByNumber(context.Context, *big.Int) (*types.Header, error) {
+	number := c.block()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return &types.Header{Time: uint64(time.Now().Add(-c.lag).Unix()), BaseFee: c.baseFee}, nil
+	return &types.Header{
+		Number:  new(big.Int).SetUint64(number - min(c.headLag, number)),
+		Time:    uint64(time.Now().Add(-c.lag).Unix()),
+		BaseFee: c.baseFee,
+	}, nil
+}
+
+func (c *fakeChain) setHeadLag(n uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.headLag = n
+}
+
+func (c *fakeChain) setFailBlock(fail bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.failBlock = fail
 }
 
 func (c *fakeChain) setLag(d time.Duration) {
@@ -982,4 +1009,115 @@ func TestPendingConcurrentWithCommits(t *testing.T) {
 			_, _, _ = f.revealer.Pending()
 		}
 	}
+}
+
+// A commit that is not found, or whose nonce reads as used by another
+// transaction, counts as never landed only from a head commitSettleBlocks
+// into the reveal phase. A head closer to the phase start keeps the key
+// and checks again at the next block.
+func TestCommitMissingNeedsSettledHead(t *testing.T) {
+	t.Parallel()
+
+	revealStart := uint64(testBlocksPerRound + testBlocksPerPhase)
+	for _, tc := range []struct {
+		name    string
+		block   uint64
+		headLag uint64
+		state   transaction.TxState
+		gone    bool
+	}{
+		{"not found, head settled", revealStart + commitSettleBlocks, 0, transaction.TxNotFound, true},
+		{"cancelled, head settled", revealStart + commitSettleBlocks, 0, transaction.TxCancelled, true},
+		{"not found, head at the phase start", revealStart, 0, transaction.TxNotFound, false},
+		{"not found, head lags the block number", revealStart + 3, 3, transaction.TxNotFound, false},
+		{"cancelled, head lags the block number", revealStart + 3, 3, transaction.TxCancelled, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				f := newRevealFixture(t, mock.NewStateStore(), newFakeChain(tc.block), newFakeTxs())
+				const round = 1
+				f.setSample(round)
+				if err := f.state().SetCommitKey(round, []byte("key")); err != nil {
+					t.Fatal(err)
+				}
+				commitTx := f.txs.newHash()
+				if err := f.state().SetCommitTx(round, commitTx); err != nil {
+					t.Fatal(err)
+				}
+				f.txs.set(commitTx, tc.state)
+				f.chain.setHeadLag(tc.headLag)
+
+				done, err := f.revealer.Reveal(context.Background(), round)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, hasKey := f.state().CommitKey(round)
+				if _, reveals := f.contract.counts(); reveals != 0 {
+					t.Fatalf("revealed %d times", reveals)
+				}
+				if tc.gone {
+					if !done || hasKey {
+						t.Fatalf("done %v, key kept %v; want the key removed", done, hasKey)
+					}
+					return
+				}
+				if done || !hasKey {
+					t.Fatalf("done %v, key kept %v; want the key kept and a later check", done, hasKey)
+				}
+
+				// the lagging endpoint catches up: the commit is mined, and
+				// the next block's step reveals
+				f.txs.set(commitTx, transaction.TxMined)
+				f.chain.setHeadLag(0)
+				time.Sleep(testBlockTime)
+				if done, err := f.revealer.Reveal(context.Background(), round); err != nil || !done {
+					t.Fatalf("retry: done %v, err %v", done, err)
+				}
+				if _, reveals := f.contract.counts(); reveals != 1 {
+					t.Fatalf("reveals %d after the retry, want 1", reveals)
+				}
+			})
+		})
+	}
+}
+
+// One signal never cancels the stop's context. When block number reads
+// keep failing, the wait still ends within WaitBudget plus the margin,
+// and the stop goes on (the miss is counted).
+func TestWaitBoundedWhenBlockReadsFail(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		f := newRevealFixture(t, mock.NewStateStore(), newFakeChain(testBlocksPerRound+2), newFakeTxs())
+		const round = 1
+		f.setSample(round)
+		if err := f.state().SetCommitKey(round, []byte("key")); err != nil {
+			t.Fatal(err)
+		}
+		f.state().SetCurrentBlock(f.chain.block())
+		f.chain.setFailBlock(true)
+
+		limit := f.revealer.WaitBudget() + stopWaitMargin
+		if limit <= stopWaitMargin {
+			t.Fatal("no reveal pending")
+		}
+
+		// the test's own deadline: a wait still running after it is
+		// cancelled, which a bounded wait never needs
+		ctx, cancel := context.WithTimeout(context.Background(), 2*limit)
+		defer cancel()
+
+		start := time.Now()
+		if err := f.revealer.Wait(ctx); err != nil {
+			t.Fatalf("wait ended by the test's deadline (%v) after %v, want it bounded by %v", err, time.Since(start), limit)
+		}
+		if took := time.Since(start); took > limit {
+			t.Fatalf("wait took %v, limit %v", took, limit)
+		}
+		st, _ := f.state().Status()
+		if st.StopWaitedForReveal != 1 || st.RevealMissedOnStop != 1 {
+			t.Fatalf("counts waited %d missed %d, want 1 and 1", st.StopWaitedForReveal, st.RevealMissedOnStop)
+		}
+	})
 }

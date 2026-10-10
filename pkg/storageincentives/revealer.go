@@ -30,6 +30,18 @@ const (
 	// reveal that is still pending, or not found, is replaced with raised
 	// fees instead of waited for or rebroadcast unchanged.
 	revealReplaceAfterBlocks = 6
+
+	// commitSettleBlocks is how many blocks past the start of the reveal
+	// phase the backend's head must be before a "not found" or
+	// "cancelled" commit counts as not on chain. The contract accepts
+	// commits only in the commit phase, so a commit that a head this far
+	// into the reveal phase does not know never landed; a lagging head
+	// is checked again at the next block.
+	commitSettleBlocks = 2
+
+	// stopWaitMargin is added to WaitBudget to bound the stop wait, so a
+	// wait whose block number reads keep failing still ends.
+	stopWaitMargin = 30 * time.Second
 )
 
 var (
@@ -216,14 +228,24 @@ func (r *Revealer) Wait(ctx context.Context) error {
 	if !ok {
 		return nil
 	}
-	if block, err := r.backend.BlockNumber(ctx); err == nil && block >= deadline {
+
+	// One signal never cancels ctx, so the wait is bounded by the time
+	// left in the reveal phase: it ends even if block reads keep failing.
+	limit := r.WaitBudget() + stopWaitMargin
+	waitCtx, cancel := context.WithTimeout(ctx, limit)
+	defer cancel()
+
+	if block, err := r.backend.BlockNumber(waitCtx); err == nil && block >= deadline {
 		// the last block seen is stale: the phase is over already
 		return nil
 	}
 
-	r.logger.Warning("stop waits for the storage-lottery reveal", "round", round, "up_to_block", deadline)
+	r.logger.Warning("stop waits for the storage-lottery reveal", "round", round, "up_to_block", deadline, "at_most", limit)
 
-	revealed := r.revealUntil(ctx, round)
+	revealed := r.revealUntil(waitCtx, round)
+	if !revealed && ctx.Err() == nil && errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
+		r.logger.Warning("stop: the storage-lottery reveal wait reached its time limit", "round", round, "limit", limit)
+	}
 	if revealed {
 		r.logger.Info("stop: storage-lottery reveal mined, stopping", "round", round)
 		r.state.countStop(1, 0, 0)
@@ -359,12 +381,18 @@ func (r *Revealer) revealStep(ctx context.Context, round uint64) (bool, error) {
 			}
 			r.logger.Info("reveal: the reveal's nonce was used by another transaction, sending a new one", "round", round, "tx", newest)
 		}
-	} else if r.commitMissing(ctx, round) {
-		r.logger.Info("reveal: the round's commit reverted or never landed; not revealing", "round", round)
-		if err := r.state.RemoveCommitKey(round); err != nil {
-			r.logger.Error(err, "removing commit key", "round", round)
+	} else {
+		switch r.commitOnChain(ctx, round) {
+		case commitGone:
+			r.logger.Info("reveal: the round's commit reverted or never landed; not revealing", "round", round)
+			if err := r.state.RemoveCommitKey(round); err != nil {
+				r.logger.Error(err, "removing commit key", "round", round)
+			}
+			return true, nil
+		case commitRecheck:
+			r.logger.Debug("reveal: commit not seen by a head close to the reveal phase start; checking again at the next block", "round", round)
+			return false, nil
 		}
-		return true, nil
 	}
 
 	txHash, err := r.contract.Reveal(ctx, sample.StorageRadius, sample.ReserveSampleHash.Bytes(), key, listRevealTx)
@@ -386,26 +414,44 @@ func (r *Revealer) revealed(ctx context.Context, round uint64, txHash common.Has
 	}
 }
 
-// commitMissing reports whether the round's commit is known not to be on
-// chain: its receipt reverted, or a synced backend does not know it. A
-// lookup error, an unsynced backend or an unknown commit hash all mean
+type commitCheck int
+
+const (
+	commitPossible commitCheck = iota // reveal
+	commitGone                        // definitely not on chain
+	commitRecheck                     // not seen yet; check at the next block
+)
+
+// commitOnChain checks the round's commit before its first reveal. It is
+// gone when its receipt reverted, or when a synced backend whose head is
+// commitSettleBlocks into the reveal phase does not know it (or reports
+// its nonce used by another transaction). The same answer from a head
+// closer to the phase start is checked again at the next block. A lookup
+// error, an unsynced backend or an unknown commit hash all mean
 // "possibly committed".
-func (r *Revealer) commitMissing(ctx context.Context, round uint64) bool {
+func (r *Revealer) commitOnChain(ctx context.Context, round uint64) commitCheck {
 	commitTx := r.state.CommitTx(round)
 	if commitTx == (common.Hash{}) {
-		return false
+		return commitPossible
 	}
 	st, err := r.txService.TransactionStatus(ctx, commitTx)
 	if err != nil {
-		return false
+		return commitPossible
 	}
 	switch st {
 	case transaction.TxReverted:
-		return true
+		return commitGone
 	case transaction.TxNotFound, transaction.TxCancelled:
-		return r.synced(ctx)
+		header, err := r.backend.HeaderByNumber(ctx, nil)
+		if err != nil || !headerFresh(header) {
+			return commitPossible
+		}
+		if header.Number == nil || header.Number.Uint64() < r.revealStart(round)+commitSettleBlocks {
+			return commitRecheck
+		}
+		return commitGone
 	}
-	return false
+	return commitPossible
 }
 
 // feeTooLow reports whether the stored fee cap of the transaction is below
@@ -426,10 +472,14 @@ func (r *Revealer) feeTooLow(ctx context.Context, txHash common.Hash) bool {
 // transaction.IsSynced does.
 func (r *Revealer) synced(ctx context.Context) bool {
 	header, err := r.backend.HeaderByNumber(ctx, nil)
-	if err != nil || header == nil {
+	if err != nil {
 		return false
 	}
-	return time.Unix(int64(header.Time), 0).After(time.Now().Add(-syncMaxDelay))
+	return headerFresh(header)
+}
+
+func headerFresh(header *types.Header) bool {
+	return header != nil && time.Unix(int64(header.Time), 0).After(time.Now().Add(-syncMaxDelay))
 }
 
 // StartEarlyReveal sends, in the background, a reveal that is pending from
