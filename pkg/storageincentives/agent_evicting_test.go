@@ -8,6 +8,7 @@ import (
 	"context"
 	"math/big"
 	"strings"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -42,20 +43,29 @@ type anyDepthContract struct{ *mockContract }
 
 func (anyDepthContract) IsPlaying(context.Context, uint8) (bool, error) { return true, nil }
 
-// skippedWhileEvicting reads bee_storageincentives_skipped_while_evicting.
-func skippedWhileEvicting(t *testing.T, a *storageincentives.Agent) float64 {
+// Reveal records the call without checking the depth, which changes in
+// these tests.
+func (c anyDepthContract) Reveal(context.Context, uint8, []byte, []byte) (common.Hash, error) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	c.callsList = append(c.callsList, revealCall)
+	return common.Hash{}, nil
+}
+
+// counterValue reads the agent counter whose name contains name.
+func counterValue(t *testing.T, a *storageincentives.Agent, name string) float64 {
 	t.Helper()
 	for _, c := range a.Metrics() {
 		ch := make(chan *prometheus.Desc, 4)
 		c.Describe(ch)
 		close(ch)
 		for d := range ch {
-			if !strings.Contains(d.String(), "skipped_while_evicting") {
+			if !strings.Contains(d.String(), `"bee_storageincentives_`+name+`"`) {
 				continue
 			}
 			m, ok := c.(prometheus.Metric)
 			if !ok {
-				t.Fatal("skipped_while_evicting is not a single metric")
+				t.Fatalf("%s is not a single metric", name)
 			}
 			var v dto.Metric
 			if err := m.Write(&v); err != nil {
@@ -64,8 +74,32 @@ func skippedWhileEvicting(t *testing.T, a *storageincentives.Agent) float64 {
 			return v.GetCounter().GetValue()
 		}
 	}
-	t.Fatal("skipped_while_evicting not found")
+	t.Fatalf("%s not found", name)
 	return 0
+}
+
+// skippedWhileEvicting reads bee_storageincentives_skipped_while_evicting.
+func skippedWhileEvicting(t *testing.T, a *storageincentives.Agent) float64 {
+	t.Helper()
+	return counterValue(t, a, "skipped_while_evicting")
+}
+
+// radiusStep is a change of the storage radius made while the agent's
+// first sample runs.
+type radiusStep int
+
+const (
+	stepNone radiusStep = iota
+	stepUp
+	stepDown
+	stepUpDown // up by one and back down again
+)
+
+// agentCounters are the agent's gate counters after a run.
+type agentCounters struct {
+	skippedWhileEvicting  float64
+	skippedRadiusIncrease float64
+	playedAfterDecrease   float64
 }
 
 type evictingCase struct {
@@ -73,16 +107,23 @@ type evictingCase struct {
 	fullySynced  bool
 	frozen       bool
 	notSelected  bool
-	stepInSample bool // the radius steps while the sample runs
+	stepInSample radiusStep // how the radius changes while the first sample runs
 }
 
 // runEvictingAgent runs an agent that can afford to play through several
 // rounds and returns the contract calls it made and the skip counter.
 func runEvictingAgent(t *testing.T, tc evictingCase) ([]contractCall, float64) {
 	t.Helper()
+	calls, counters := runEvictingAgentCounters(t, tc)
+	return calls, counters.skippedWhileEvicting
+}
+
+// runEvictingAgentCounters is runEvictingAgent returning all gate counters.
+func runEvictingAgentCounters(t *testing.T, tc evictingCase) ([]contractCall, agentCounters) {
+	t.Helper()
 	var (
-		calls   []contractCall
-		skipped float64
+		calls    []contractCall
+		counters agentCounters
 	)
 	synctest.Test(t, func(t *testing.T) {
 		const (
@@ -103,7 +144,7 @@ func runEvictingAgent(t *testing.T, tc evictingCase) ([]contractCall, float64) {
 		switch {
 		case tc.notSelected:
 			contract = notSelectedContract{mc}
-		case tc.stepInSample:
+		case tc.stepInSample != stepNone:
 			contract = anyDepthContract{mc}
 		}
 
@@ -113,9 +154,21 @@ func runEvictingAgent(t *testing.T, tc evictingCase) ([]contractCall, float64) {
 			resMock.WithSample(storer.RandSample(t, nil)),
 			resMock.WithEvictingFor(tc.evictingFor),
 		}
-		if tc.stepInSample {
+		if tc.stepInSample != stepNone {
+			var once sync.Once
 			opts = append(opts, resMock.WithSampleHook(func() {
-				reserve.SetStorageRadius(reserve.StorageRadius() + 1)
+				once.Do(func() {
+					r := reserve.StorageRadius()
+					switch tc.stepInSample {
+					case stepUp:
+						reserve.SetStorageRadius(r + 1)
+					case stepDown:
+						reserve.SetStorageRadius(r - 1)
+					case stepUpDown:
+						reserve.SetStorageRadius(r + 1)
+						reserve.SetStorageRadius(r)
+					}
+				})
 			}))
 		}
 		reserve = resMock.NewReserve(opts...)
@@ -140,9 +193,13 @@ func runEvictingAgent(t *testing.T, tc evictingCase) ([]contractCall, float64) {
 		<-wait
 		synctest.Wait()
 		calls = mc.getCalls()
-		skipped = skippedWhileEvicting(t, agent)
+		counters = agentCounters{
+			skippedWhileEvicting:  skippedWhileEvicting(t, agent),
+			skippedRadiusIncrease: counterValue(t, agent, "skipped_radius_increase_total"),
+			playedAfterDecrease:   counterValue(t, agent, "played_after_radius_decrease_total"),
+		}
 	})
-	return calls, skipped
+	return calls, counters
 }
 
 func hasCommit(calls []contractCall) bool {
@@ -213,13 +270,80 @@ func TestAgentEvictingGateOrder(t *testing.T) {
 	}
 }
 
-// TestAgentSkipsRoundWhenDepthChangesInSample checks that a sample whose
-// committed depth changed while it ran is not committed (#649).
+// TestAgentSkipsRoundWhenDepthChangesInSample checks that a sample during
+// which the radius increased is not committed and is counted (#649, #658).
 func TestAgentSkipsRoundWhenDepthChangesInSample(t *testing.T) {
 	t.Parallel()
 
-	calls, _ := runEvictingAgent(t, evictingCase{fullySynced: true, stepInSample: true})
-	if hasCommit(calls) {
-		t.Fatalf("committed a sample whose depth changed, calls %v", calls)
+	calls, c := runEvictingAgentCounters(t, evictingCase{fullySynced: true, stepInSample: stepUp})
+	// The round whose sample saw the increase is not committed; later
+	// rounds read the new radius and play.
+	base, _ := runEvictingAgentCounters(t, evictingCase{fullySynced: true})
+	if got, want := countCalls(calls, commitCall), countCalls(base, commitCall)-1; got != want {
+		t.Fatalf("commits %d, want %d (one round fewer than with no radius change), calls %v", got, want, calls)
 	}
+	if c.skippedRadiusIncrease != 1 {
+		t.Fatalf("skipped_radius_increase_total %v, want 1", c.skippedRadiusIncrease)
+	}
+	if c.playedAfterDecrease != 0 {
+		t.Fatalf("played_after_radius_decrease_total %v, want 0", c.playedAfterDecrease)
+	}
+}
+
+// TestAgentPlaysAfterRadiusDecreaseInSample checks that a decrease during
+// the sample does not skip the round: it cannot change the sampled range
+// (#658).
+func TestAgentPlaysAfterRadiusDecreaseInSample(t *testing.T) {
+	t.Parallel()
+
+	calls, c := runEvictingAgentCounters(t, evictingCase{fullySynced: true, stepInSample: stepDown})
+	if c.skippedRadiusIncrease != 0 {
+		t.Fatalf("skipped_radius_increase_total %v, want 0", c.skippedRadiusIncrease)
+	}
+	if c.playedAfterDecrease != 1 {
+		t.Fatalf("played_after_radius_decrease_total %v, want 1", c.playedAfterDecrease)
+	}
+	// As many commits as a run with no radius change: the round whose
+	// sample saw the decrease was played.
+	base, _ := runEvictingAgentCounters(t, evictingCase{fullySynced: true})
+	if got, want := countCalls(calls, commitCall), countCalls(base, commitCall); got != want || want == 0 {
+		t.Fatalf("commits %d, want %d as with no radius change, calls %v", got, want, calls)
+	}
+}
+
+// TestAgentSkipsRoundAfterIncreaseThenDecrease checks that an increase
+// followed by a decrease back to the depth read still skips the round:
+// the chunks unreserve deleted are gone although the depth is unchanged
+// (#658).
+func TestAgentSkipsRoundAfterIncreaseThenDecrease(t *testing.T) {
+	t.Parallel()
+
+	_, c := runEvictingAgentCounters(t, evictingCase{fullySynced: true, stepInSample: stepUpDown})
+	if c.skippedRadiusIncrease != 1 {
+		t.Fatalf("skipped_radius_increase_total %v, want 1", c.skippedRadiusIncrease)
+	}
+	if c.playedAfterDecrease != 0 {
+		t.Fatalf("played_after_radius_decrease_total %v, want 0", c.playedAfterDecrease)
+	}
+}
+
+// TestAgentRadiusCountersExportedAtZero checks that both #658 counters are
+// exported before any skip or decrease.
+func TestAgentRadiusCountersExportedAtZero(t *testing.T) {
+	t.Parallel()
+
+	_, c := runEvictingAgentCounters(t, evictingCase{fullySynced: true})
+	if c.skippedRadiusIncrease != 0 || c.playedAfterDecrease != 0 {
+		t.Fatalf("counters %+v, want both 0", c)
+	}
+}
+
+func countCalls(calls []contractCall, want contractCall) int {
+	n := 0
+	for _, c := range calls {
+		if c == want {
+			n++
+		}
+	}
+	return n
 }

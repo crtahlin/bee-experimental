@@ -149,6 +149,10 @@ type Reserve interface {
 	// actively evicting, or 0. The storage incentives agent sits out a
 	// round when it is at least EvictingMinAge (#649).
 	EvictingFor() time.Duration
+	// RadiusState returns the storage radius and how many times it has
+	// increased, from one read. The agent compares the count before and
+	// after a sample (#658).
+	RadiusState() (radius uint8, increases uint64)
 }
 
 // ReserveIterator is a helper interface which can be used to iterate over all

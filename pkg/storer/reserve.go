@@ -628,6 +628,15 @@ func (db *DB) StorageRadius() uint8 {
 	return db.reserve.Radius()
 }
 
+// RadiusState returns the storage radius and how many times it has
+// increased, from one read, or (0, 0) without a reserve (#658).
+func (db *DB) RadiusState() (uint8, uint64) {
+	if db.reserve == nil {
+		return 0, 0
+	}
+	return db.reserve.RadiusState()
+}
+
 func (db *DB) CommittedDepth() uint8 {
 	if db.reserve == nil {
 		return 0

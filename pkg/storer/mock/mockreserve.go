@@ -137,6 +137,7 @@ type ReserveStore struct {
 	epoch      uint64
 
 	radius           uint8
+	radiusIncreases  uint64
 	reservesize      int
 	capacityDoubling int
 	sampling         atomic.Bool
@@ -187,8 +188,19 @@ func (s *ReserveStore) StorageRadius() uint8 {
 
 func (s *ReserveStore) SetStorageRadius(r uint8) {
 	s.mtx.Lock()
+	if r > s.radius {
+		s.radiusIncreases++
+	}
 	s.radius = r
 	s.mtx.Unlock()
+}
+
+// RadiusState returns the radius and how many times SetStorageRadius raised
+// it (#658).
+func (s *ReserveStore) RadiusState() (uint8, uint64) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	return s.radius, s.radiusIncreases
 }
 
 func (s *ReserveStore) CommittedDepth() uint8 {

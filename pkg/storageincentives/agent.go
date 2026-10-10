@@ -430,8 +430,11 @@ func (a *Agent) handleClaim(ctx context.Context, round uint64) error {
 }
 
 func (a *Agent) handleSample(ctx context.Context, round uint64) (bool, error) {
-	// minimum proximity between the anchor and the stored chunks
-	committedDepth := a.store.CommittedDepth()
+	// minimum proximity between the anchor and the stored chunks. The depth
+	// is derived from the same read as the radius increase count, so the
+	// check after the sample compares against exactly this state (#658).
+	readRadius, readIncreases := a.store.RadiusState()
+	committedDepth := readRadius + a.store.CapacityDoubling()
 
 	if a.state.IsFrozen() {
 		a.logger.Info("skipping round because node is frozen")
@@ -488,13 +491,19 @@ func (a *Agent) handleSample(ctx context.Context, round uint64) (bool, error) {
 	dur := time.Since(now)
 	a.metrics.SampleDuration.Set(dur.Seconds())
 
-	// A radius step between reading the depth and the start of the sample
-	// changes the committed depth; a sample at the old depth could differ
-	// from the neighbourhood's, so the round is not played (#649). The
-	// eviction barrier keeps a step from landing during the sample itself.
-	if d := a.store.CommittedDepth(); d != committedDepth {
-		a.logger.Info("skipping round because the committed depth changed during the sample", "round", round, "sample_depth", committedDepth, "committed_depth", d)
+	// A radius increase since the depth was read can change the sampled
+	// content (unreserve deletes in the bin the range starts at, or the
+	// range is clipped away), so the round is not played. The count, not
+	// the radius, is compared, so an increase followed by a decrease is
+	// caught. A decrease cannot reach the sampled range, so the round is
+	// played (#658).
+	if radius, increases := a.store.RadiusState(); increases != readIncreases {
+		a.logger.Info("skipping round because the storage radius increased since the round's depth was read", "round", round, "sample_depth", committedDepth, "committed_depth", radius+a.store.CapacityDoubling())
+		a.metrics.SkippedRadiusIncrease.Inc()
 		return false, nil
+	} else if radius < readRadius {
+		a.logger.Info("radius decreased since the round's depth was read; playing at the depth read", "round", round, "sample_depth", committedDepth, "committed_depth", radius+a.store.CapacityDoubling())
+		a.metrics.PlayedAfterDecrease.Inc()
 	}
 
 	a.logger.Info("produced sample", "hash", sample.ReserveSampleHash, "radius", committedDepth, "round", round)
