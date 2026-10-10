@@ -7,49 +7,62 @@ package reserve_test
 import (
 	"context"
 	"errors"
-	"io/fs"
-	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/ethersphere/bee/v2/pkg/log"
-	"github.com/ethersphere/bee/v2/pkg/sharky"
-	"github.com/ethersphere/bee/v2/pkg/storage/leveldbstore"
+	"github.com/ethersphere/bee/v2/pkg/storage"
+	"github.com/ethersphere/bee/v2/pkg/storer/internal"
 	"github.com/ethersphere/bee/v2/pkg/storer/internal/reserve"
 	"github.com/ethersphere/bee/v2/pkg/storer/internal/transaction"
 	"github.com/ethersphere/bee/v2/pkg/swarm"
 	kademlia "github.com/ethersphere/bee/v2/pkg/topology/mock"
 )
 
-type tempFS struct{ dir string }
+var errContextCount = errors.New("context-aware count used")
 
-func (d tempFS) Open(path string) (fs.File, error) {
-	return os.OpenFile(filepath.Join(d.dir, path), os.O_RDWR|os.O_CREATE, 0o600)
+// countSpyStorage wraps a storage so its transactions' index store reports
+// which count NewContext used.
+type countSpyStorage struct {
+	transaction.Storage
+	t *testing.T
 }
 
-// The reserve count, the slowest step of opening a large reserve, ends
-// with the context's error, so a stop during startup does not wait for it
-// (wasp #635).
-func TestNewContextCancelledCount(t *testing.T) {
-	sh, err := sharky.New(tempFS{t.TempDir()}, 32, swarm.SocMaxChunkSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	store, _, err := leveldbstore.New("", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	st := transaction.NewStorage(sh, store)
-	t.Cleanup(func() { _ = st.Close() })
+func (s countSpyStorage) Run(ctx context.Context, f func(transaction.Store) error) error {
+	return s.Storage.Run(ctx, func(st transaction.Store) error {
+		return f(countSpyStore{st, s.t})
+	})
+}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	_, err = reserve.NewContext(ctx, swarm.RandAddress(t), st, 10, kademlia.NewTopologyDriver(), log.Noop)
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("NewContext with a cancelled context: %v, want context.Canceled", err)
-	}
+type countSpyStore struct {
+	transaction.Store
+	t *testing.T
+}
 
-	if _, err := reserve.NewContext(context.Background(), swarm.RandAddress(t), st, 10, kademlia.NewTopologyDriver(), log.Noop); err != nil {
-		t.Fatalf("NewContext: %v", err)
+func (s countSpyStore) IndexStore() storage.IndexStore {
+	return countSpyIndex{s.Store.IndexStore(), s.t}
+}
+
+type countSpyIndex struct {
+	storage.IndexStore
+	t *testing.T
+}
+
+func (i countSpyIndex) Count(storage.Key) (int, error) {
+	i.t.Error("NewContext used Count, which a stop during startup cannot end")
+	return 0, nil
+}
+
+func (i countSpyIndex) CountContext(context.Context, storage.Key) (int, error) {
+	return 0, errContextCount
+}
+
+// NewContext counts the reserve with the context-aware count, so a stop
+// during startup does not wait for a full count of a large reserve (wasp
+// #635).
+func TestNewContextUsesContextAwareCount(t *testing.T) {
+	st := countSpyStorage{internal.NewInmemStorage(), t}
+	_, err := reserve.NewContext(context.Background(), swarm.RandAddress(t), st, 10, kademlia.NewTopologyDriver(), log.Noop)
+	if !errors.Is(err, errContextCount) {
+		t.Fatalf("NewContext: %v, want the context-aware count's result", err)
 	}
 }
