@@ -1320,3 +1320,80 @@ func TestCloseWaitsForAbandonedStep(t *testing.T) {
 		t.Fatal("Close did not return after the step ended")
 	}
 }
+
+// The newest listed reveal reads as reverted because an older listed one
+// was mined after the step's first check; the listed hashes are checked
+// again, so the round counts as revealed (#730).
+func TestRevealListedRevertedRechecksListed(t *testing.T) {
+	t.Parallel()
+
+	f := revealFixtureInRevealPhase(t)
+	older, newer := f.txs.newHash(), f.txs.newHash()
+	f.txs.set(older, transaction.TxPending)
+	f.txs.set(newer, transaction.TxReverted)
+	if err := f.state().AddRevealTx(1, older, 17); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.state().AddRevealTx(1, newer, 17); err != nil {
+		t.Fatal(err)
+	}
+	// the older reveal is mined between the step's first check and the
+	// newest hash's status read
+	base := f.revealer.txService
+	reads := 0
+	f.revealer.txService = transactionmock.New(transactionmock.WithTransactionStatusFunc(func(ctx context.Context, h common.Hash) (transaction.TxState, error) {
+		if h == older {
+			reads++
+			if reads > 1 {
+				return transaction.TxMined, nil
+			}
+		}
+		return base.TransactionStatus(ctx, h)
+	}))
+
+	done, err := f.revealer.Reveal(context.Background(), 1)
+	if !done || err != nil {
+		t.Fatalf("done %v err %v; want done with no error", done, err)
+	}
+	if !f.state().HasRevealed(1) {
+		t.Fatal("round not revealed although an older listed reveal was mined")
+	}
+}
+
+// winnerCheckContract records whether the claim phase asked if the node
+// won, which it does only for a revealed round.
+type winnerCheckContract struct {
+	*fakeContract
+	asked bool
+}
+
+func (c *winnerCheckContract) IsWinner(context.Context) (bool, error) {
+	c.asked = true
+	return false, nil
+}
+
+// The claim phase rechecks the listed reveal hashes when HasRevealed is
+// false: a reveal mined after the reveal phase's last status read is not
+// a reason to skip the claim (#730).
+func TestClaimRechecksListedReveals(t *testing.T) {
+	t.Parallel()
+
+	f := revealFixtureInRevealPhase(t)
+	h := f.txs.newHash()
+	f.txs.set(h, transaction.TxMined)
+	if err := f.state().AddRevealTx(1, h, 17); err != nil {
+		t.Fatal(err)
+	}
+	c := &winnerCheckContract{fakeContract: f.contract}
+	f.agent.contract = c
+
+	if err := f.agent.handleClaim(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if !c.asked {
+		t.Fatal("claim skipped although a listed reveal was mined")
+	}
+	if !f.state().HasRevealed(1) {
+		t.Fatal("HasRevealed not set from the mined listed reveal")
+	}
+}

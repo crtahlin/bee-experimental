@@ -393,6 +393,11 @@ func (r *Revealer) revealStep(ctx context.Context, round uint64) (bool, error) {
 			r.revealed(ctx, round, newest)
 			return true, nil
 		case transaction.TxReverted:
+			// an older listed reveal can have been mined after the check
+			// above; the newest then reverts because the round is revealed
+			if r.listedRevealMined(ctx, round) {
+				return true, nil
+			}
 			return true, fmt.Errorf("%w: %s", errRevealReverted, newest)
 		case transaction.TxPending:
 			if !aged && !r.feeTooLow(ctx, newest) {
