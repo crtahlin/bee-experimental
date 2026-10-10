@@ -223,6 +223,9 @@ const countCheckEvery = 4096
 // CountContext is Count that returns the context's error once the context
 // ends, checked every countCheckEvery keys (wasp #635).
 func (s *Store) CountContext(ctx context.Context, k storage.Key) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	prefix := []byte(k.Namespace() + separator)
 	iter, err := s.db.NewIter(prefixBounds(prefix))
 	if err != nil {
