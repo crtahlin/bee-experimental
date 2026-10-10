@@ -35,7 +35,10 @@ func newGatedStorage(t *testing.T) (transaction.Storage, *sharky.Store, string) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	return transaction.NewStorage(sh, store), sh, dir
+	st := transaction.NewStorage(sh, store)
+	// Close the files, or Windows cannot remove the temporary directory.
+	t.Cleanup(func() { _ = st.Close() })
+	return st, sh, dir
 }
 
 func putEntries(t *testing.T, st transaction.Storage, n int) {
