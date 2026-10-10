@@ -784,6 +784,46 @@ func NewBee(
 	b.transactionCloser = transactionService
 	b.transactionMonitorCloser = transactionMonitor
 
+	// Compute gas limit for contract transactions: when TrxDebugMode is enabled,
+	// gas estimation is skipped and DefaultGasLimit is used for all contract calls.
+	var contractGasLimit uint64
+	if o.TrxDebugMode {
+		contractGasLimit = transaction.DefaultGasLimit
+	}
+
+	// The storage-lottery state and its Revealer are built as soon as the
+	// chain client, the transaction service and the state store exist: a
+	// reveal pending from before a restart is sent before the chain sync
+	// wait, the store open and the postage catch-up, and a stop from here
+	// on waits for it (#725).
+	var (
+		redistributionContract redistribution.Contract
+		revealer               *storageincentives.Revealer
+	)
+	if o.FullNodeMode && !o.BootnodeMode && o.EnableStorageIncentives {
+		chainCfg, _ := config.GetByChainID(chainID)
+		redistributionContractAddress := chainCfg.RedistributionAddress
+		if o.RedistributionContractAddress != "" {
+			if !common.IsHexAddress(o.RedistributionContractAddress) {
+				return nil, errors.New("malformed redistribution contract address")
+			}
+			redistributionContractAddress = common.HexToAddress(o.RedistributionContractAddress)
+		}
+
+		redistributionContract = redistribution.New(swarmAddress, overlayEthAddress, logger, transactionService, redistributionContractAddress, abiutil.MustParseABI(chainCfg.RedistributionABI), contractGasLimit)
+
+		// the token service comes after the chain sync wait; the agent
+		// sets it on the state
+		redistributionState, err := storageincentives.NewRedistributionState(logger, overlayEthAddress, stateStore, nil, transactionService)
+		if err != nil {
+			return nil, fmt.Errorf("storage incentives state: %w", err)
+		}
+		revealer = storageincentives.NewRevealer(redistributionState, redistributionContract, transactionService, chainBackend, blockTime, storageincentives.DefaultBlocksPerRound, storageincentives.DefaultBlocksPerPhase, logger)
+		b.revealGuard = revealer
+		b.stopWaitForReveal = o.StopWaitForReveal
+		revealer.StartEarlyReveal()
+	}
+
 	beeNodeMode := api.LightMode
 	if o.FullNodeMode {
 		beeNodeMode = api.FullMode
@@ -1100,13 +1140,6 @@ func NewBee(
 	}
 
 	postageStampContractABI := abiutil.MustParseABI(chainCfg.PostageStampABI)
-
-	// Compute gas limit for contract transactions: when TrxDebugMode is enabled,
-	// gas estimation is skipped and DefaultGasLimit is used for all contract calls.
-	var contractGasLimit uint64
-	if o.TrxDebugMode {
-		contractGasLimit = transaction.DefaultGasLimit
-	}
 
 	postageStampContractService = postagecontract.New(
 		overlayEthAddress,
@@ -1714,17 +1747,6 @@ func NewBee(
 		}
 
 		if o.EnableStorageIncentives {
-
-			redistributionContractAddress := chainCfg.RedistributionAddress
-			if o.RedistributionContractAddress != "" {
-				if !common.IsHexAddress(o.RedistributionContractAddress) {
-					return nil, errors.New("malformed redistribution contract address")
-				}
-				redistributionContractAddress = common.HexToAddress(o.RedistributionContractAddress)
-			}
-
-			redistributionContract := redistribution.New(swarmAddress, overlayEthAddress, logger, transactionService, redistributionContractAddress, abiutil.MustParseABI(chainCfg.RedistributionABI), contractGasLimit)
-
 			isFullySynced := func() bool {
 				reserveThreshold := reserveCapacity * 5 / 10
 				logger.Debug("Sync status check evaluated", "stabilized", detector.IsStabilized())
@@ -1734,13 +1756,7 @@ func NewBee(
 					postageReadyForLottery(eventListener) && !localStore.HeldPending()
 			}
 
-			redistributionState, err := storageincentives.NewRedistributionState(logger, overlayEthAddress, stateStore, erc20Service, transactionService)
-			if err != nil {
-				return nil, fmt.Errorf("storage incentives state: %w", err)
-			}
-			revealer := storageincentives.NewRevealer(redistributionState, redistributionContract, transactionService, chainBackend, blockTime, storageincentives.DefaultBlocksPerRound, storageincentives.DefaultBlocksPerPhase, logger)
-			b.revealGuard = revealer
-			b.stopWaitForReveal = o.StopWaitForReveal
+			revealer.State().SetERC20Service(erc20Service)
 
 			agent, err = storageincentives.New(
 				swarmAddress,
