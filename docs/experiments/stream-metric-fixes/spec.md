@@ -16,18 +16,23 @@ The handler counts an abandoned request only when `context.Cause(reqCtx)` is the
 
 After `makeOffer`, `watch.stop()` and `unregister`, the abandoned request is counted when either:
 1. the cause is the watcher's error, as today, counted under the watcher's reason; or
-2. the handler's own context has ended (the connection dropped) and the node is not stopping (`s.quit` is still open): counted as `disconnect`, unless the watcher recorded a reason, which is used instead.
+2. the stream's handler context (`streamCtx`, which libp2p cancels on a disconnect; not the handler's local `ctx`, which `s.quit` also cancels, `pullsync.go:173-180`) has ended and `s.quit` is still open, and the cause is not `errRequestReplaced`: counted under the watcher's reason when it recorded one, otherwise as `disconnect`. A **nil watcher** (a stream without a read deadline, `watcher.go:56-59`) counts as `disconnect`; such unwatched requests were never counted before and now are.
 
-A request ended because the same peer replaced it (#640) is not affected: its handler context is still live. A node that is stopping counts nothing, as today. The handler's returned error wraps `errRequesterGone` in case 2 as well. The metric's help text says the count covers requests whose connection ended.
+A request the same peer replaced (#640) keeps that cause and is counted only under `requests_replaced_total`, also when its connection then drops. A node that is stopping mostly counts nothing; during a real shutdown the handler contexts can end shortly before `s.quit` closes (`pkg/node/node.go:1975-1985`), so a few requests can be counted as `disconnect` then. The handler's returned error wraps `errRequesterGone` in case 2 as well.
+
+The metric's help text says the count covers requests whose connection ended, including connections this node closed itself (a disconnect or blocklist, `pkg/p2p/libp2p/peer.go:228-235`), and unwatched requests.
 
 ### Tests
 
-1. **Parent first:** a request waits; the test cancels the handler context (as libp2p does on a disconnect) without any stream error. The request is counted once as `disconnect`. On unmodified code it is not counted.
-2. **Watcher first:** the stream is reset by the requester; counted once under `reset`, as today.
-3. **Shutdown:** the syncer is closed while a request waits; nothing is counted.
-4. **Replacement:** a request ended by a newer one from the same peer is counted only under `requests_replaced_total`, as today.
+The handler is called directly (`s.handler` through an export), with a `streamCtx` the test cancels, because `streamtest` passes `context.Background()` to handlers (`pkg/p2p/streamtest/streamtest.go:168`).
 
-**Mutation checks:** case 2 removed (test 1); the `s.quit` check removed (test 3); case 2 applied while the handler context is still live (test 4).
+1. **Parent first:** a request waits; the test cancels `streamCtx` without any stream error. The request is counted once as `disconnect`. On unmodified code it is not counted.
+2. **Watcher first:** the stream is reset by the requester; counted once under `reset`, as today.
+3. **Nil watcher:** a stream without a read deadline, `streamCtx` cancelled: counted once as `disconnect`.
+4. **Shutdown:** the syncer is closed while a request waits, `streamCtx` live; nothing is counted.
+5. **Replacement, then disconnect:** a request ended by a newer one from the same peer, then its `streamCtx` cancelled: counted only under `requests_replaced_total`.
+
+**Mutation checks:** case 2 removed (tests 1, 3); the nil-watcher case dereferenced or dropped (test 3); the `s.quit` check removed (test 4); the replacement cause not given precedence (test 5); the local `ctx` checked instead of `streamCtx` (test 4).
 
 ## #687: the inbound stream group gauge
 
@@ -39,7 +44,7 @@ A request ended because the same peer replaced it (#640) is not affected: its ha
 
 ### Change
 
-The two gauge children are looked up once, in `newStreamLimits`, and kept. `reserveGroup` calls `Inc` and `releaseGroup` calls `Dec` on them when (and only when) the count changes, outside the mutex. Increments and decrements commute, so the gauge equals the count whatever the order in which concurrent changes reach it; no ordering under the lock is needed, and no label lookup per stream remains.
+The two gauge children are looked up once, in `newStreamLimits`, and kept. `reserveGroup` calls `Inc` and `releaseGroup` calls `Dec` on them when (and only when) the count changes, inside the existing lock, so the gauge always equals the count and never briefly reads -1 (a release's `Dec` cannot reach the gauge before its reserve's `Inc`). No label lookup per stream remains.
 
 ### Tests
 
@@ -54,6 +59,6 @@ No wire change (rule 6), no setting, no behaviour change. Race detector on `pkg/
 
 ## Measurement
 
-None beyond the tests for #687. For #672, on the dense host after deployment: restart one node and compare its neighbours' `requests_abandoned_total{reason="disconnect"}` steps with the number of pull-sync requests that node had open (from its `bee_pullsync_waiting_requests` just before the restart); they should now match within a few.
+None beyond the tests for #687. For #672, on the dense host after deployment: restart one node (node R) and compare, on each of its neighbours that runs this build, the step in `requests_abandoned_total{reason="disconnect"}` at the restart with the drop in that neighbour's own `bee_pullsync_waiting_requests` at the same moment (the requests R had waiting there). Summed over the neighbours they should match within a few; as a cross-check, the total is close to R's live sync-worker count (`bee_puller_worker`) just before the restart, counting only workers on those neighbours. (`waiting_requests` on R itself counts the neighbours' requests waiting at R, not R's, so it is not the comparison.)
 
 Generated with help of AI.
