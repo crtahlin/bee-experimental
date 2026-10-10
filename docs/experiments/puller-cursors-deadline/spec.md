@@ -4,53 +4,71 @@ Issue: #695. Companion: #696 (the radius drops a second step while the puller ha
 
 ## Terms
 
-- **Recalculation:** `onChange` in `manage` (`pkg/puller/puller.go:245-292`). It runs at start, on every topology change and every `recalcPeersDur` (5 minutes, `DefaultRecalcPeersDur`). It reads the storage radius, drops peers that are gone, resets intervals after a radius decrease, and calls `recalcPeers`. `bee_puller_on_change_runs` counts its starts (`:246`).
-- **Cursors request:** `GetCursors` (`pkg/pullsync/pullsync.go`), the stream `cursors` on which a peer answers with its last BinID per bin and its epoch. The puller calls it once per new sync peer, in `syncPeer` (`puller.go:336`), before it can start any bin.
+- **Recalculation:** `onChange` in `manage` (`pkg/puller/puller.go:245-283`). It runs at start, on every topology change and every `recalcPeersDur` (5 minutes, `DefaultRecalcPeersDur`). It reads the storage radius, drops peers that are gone, resets intervals after a radius decrease, and calls `recalcPeers`. wasp's `bee_puller_on_change_runs` counts its starts (`:246`); upstream has no such counter.
+- **Cursors request:** `GetCursors` (`pkg/pullsync/pullsync.go`), the stream `cursors` on which a peer answers with its last BinID per bin and its epoch. The puller calls it once per new sync peer, in `syncPeer` (`puller.go:336`), before it can start any bin. The remote `cursorHandler` takes no lock and answers from `ReserveLastBinIDs`.
 
 ## Problem
 
-`recalcPeers` (`puller.go:315-329`) starts `syncPeer` for every peer in its own goroutine and then waits for all of them (`wg.Wait()`, `:328`), holding `syncPeersMtx` for the whole recalculation. `syncPeer` holds the peer's `mtx` and calls `GetCursors(ctx, ...)` with the puller's own context, which has no deadline. `GetCursors` opens a stream, writes the `Syn` and reads the `Ack` with that context: nothing bounds the stream open, the protocol negotiation or the read. One peer that answers slowly or never therefore holds up the whole recalculation, and while it runs the puller reacts to nothing, including a change of the storage radius: the bins a radius decrease opens are not synced until the next recalculation, and the ticker drops the ticks it misses.
+`recalcPeers` (`puller.go:315-329`) starts `syncPeer` for every peer in its own goroutine and then waits for all of them (`wg.Wait()`, `:328`), holding `syncPeersMtx` for the whole recalculation. `syncPeer` holds the peer's `mtx` and calls `GetCursors(ctx, ...)` with the puller's own context, which has no deadline. `NewStream` bounds only its header exchange (10 s); the `Syn` write and the `Ack` read are bounded by nothing but that context. One peer that answers slowly or never therefore holds up the whole recalculation, and while it runs the puller reacts to nothing, including a change of the storage radius: the bins a radius decrease opens are not synced until the next recalculation, and the ticker drops the ticks it misses.
 
 The same code is on upstream `master` (cc5c4706e): `recalcPeers` waits at `pkg/puller/puller.go:253` and `syncPeer` calls `GetCursors(ctx, ...)` without a deadline at `:261`.
 
 ### Measured (dense host, ten nodes restarted at once, 2026-10-09)
 
-On two nodes `bee_puller_on_change_runs` stayed at 1 from the end of warm-up for about 30 minutes, then moved to 2 on both within a minute of each other. Neither node synced the bins opened by its radius decrease until that second run; one of them (radius 7 to 6 at minute 16) pulled nothing until minute 37 and dropped a second step meanwhile (#696).
+On two nodes `bee_puller_on_change_runs` stayed at 1 from the end of warm-up for about 30 minutes, then moved to 2 on both within a minute of each other. Neither node synced the bins opened by its radius decrease until that second run; one of them (radius 7 to 6 at minute 16) pulled nothing until minute 37 and dropped a second step meanwhile (#696). That two nodes unblocked together suggests one peer shared by both (hypothesis).
 
-Which peer held the run up is not known: the cursors request logs at debug level only. **That a single slow `GetCursors` is the cause is a hypothesis** consistent with the counter and with the code above. The measurement below confirms or refutes it; if recalculations stay long with no cursor timeouts, the next suspect inside `onChange` is `disconnectPeer`, which waits for a peer's workers (`syncPeer.stop`, `peer.wg.Wait()`).
+### What can block the first run
+
+The stuck run was the **first** one after the restart. There `prevRadius` is 0 and `p.syncPeers` is empty, so neither the radius-decrease branch (`disconnectPeer` for every peer, `resetIntervals`) nor the removal of departed peers runs. What runs, and can block, is:
+
+1. `EachConnectedPeerRev` on the topology;
+2. per peer, in parallel, `GetCursors` (no deadline);
+3. per peer, under the puller-wide `intervalMtx`: `getPeerEpoch`, `resetPeerIntervals` (32 statestore deletes) and `setPeerEpoch`. Every sync worker also takes `intervalMtx` on each iteration (`nextPeerInterval`, `addPeerInterval`), so on a host with saturated disk I/O (which the dense host had during the restart) these statestore writes can form a convoy.
+
+**That a silent `GetCursors` is the cause is a hypothesis.** Path 3 is the alternative. This spec fixes path 2 and adds the diagnostic that tells them apart (Change 4): if the dump of a long run shows goroutines in `intervalMtx` or the statestore rather than in `GetCursors`, the cause is path 3 and gets its own issue.
 
 ## Change
 
-1. **A deadline on the cursors request.** In `syncPeer`, the call becomes `GetCursors` with a context derived from the recalculation's with a timeout `cursorsTimeout`, 30 seconds. The `cursors` handler answers at once from `ReserveLastBinIDs` (one index read per bin), so a correct peer answers in milliseconds plus a round trip; 30 seconds leaves room for a busy peer and a slow link. The deadline covers the stream open, negotiation, write and read, because all of them take that context.
-2. **On a timeout or error** `syncPeer` returns as today ("sync peer failed", debug), `peer.cursors` stays nil, and the next recalculation asks again. No backoff is added: the next ask is at least one recalculation later (up to 5 minutes), and a peer that never answers costs one stream and 30 seconds per recalculation.
-3. **`recalcPeers` keeps waiting for all peers.** The wait under `syncPeersMtx` is what keeps a `syncPeer` from running after the next recalculation removed that peer (`disconnectPeer` stops the peer's workers and deletes it under the same mutex; a `syncPeer` still running afterwards could start bins on a removed peer that nothing will stop). With the deadline, the wait is bounded by about `cursorsTimeout`, since the `syncPeer` calls run in parallel. Removing the wait would need a "stopped" flag on `syncPeer`, checked under `peer.mtx`, and is not needed to fix the measured fault.
-4. **Metrics:**
-   - `bee_puller_cursor_requests_failed_total{reason="timeout"|"error"}`, a counter; both labels created at start so the series export 0.
-   - `bee_puller_on_change_duration_seconds`, a histogram of how long each recalculation took (buckets 0.1 s to 3,600 s), so a blocked recalculation is visible directly instead of by a counter that stops moving.
-5. **No wire change** (rule 6) and no setting: `cursorsTimeout` is a constant, like `recalcPeersDur`. A test can lower it through a package variable.
+1. **A deadline on the cursors request.** In `syncPeer`, `GetCursors` gets a context derived from the recalculation's with a timeout `cursorsTimeout`, 30 seconds. The deadline covers the stream open, the negotiation, the write and the read, because all of them take that context. A correct peer answers in milliseconds plus a round trip; 30 seconds leaves room for a busy peer and a slow link.
+2. **On a timeout or error** `syncPeer` returns as today, `peer.cursors` stays nil, and the next recalculation asks again. No backoff: the next ask is at least one recalculation later. A peer that never answers costs one stream and 30 seconds of the run per recalculation, which happens every 5 minutes, on topology changes, and after every radius decrease (a decrease re-creates all sync peers, so every peer is asked again).
+3. **`recalcPeers` keeps waiting for all peers.** The wait under `syncPeersMtx` keeps a `syncPeer` from running after a later recalculation removed that peer: `disconnectPeer` stops the peer's workers and deletes it under the same mutex, and a `syncPeer` still running afterwards would start bins on a removed object, which after a radius decrease means duplicate workers for the same peer and bins. With the deadline and parallel calls, the run is bounded at about `cursorsTimeout`. Only the run itself (and tests) take `syncPeersMtx`.
+4. **Visibility:**
+   - `bee_puller_on_change_started_timestamp_seconds`, a gauge with the start time of the run in progress (0 when none), so a run that is still blocked is visible as `now − start`;
+   - `bee_puller_on_change_duration_seconds`, a histogram of completed runs (buckets 0.1 s to 3,600 s);
+   - `bee_puller_cursor_requests_failed_total{reason="timeout"|"error"}`, both labels created at start. A timeout is `cctx.Err() == context.DeadlineExceeded` on the request's own context; when the puller's context has ended (shutdown) the failure is counted as neither;
+   - an **info** line naming the peer (overlay) whose cursors request timed out, with the timeout, at most once per peer per 10 minutes;
+   - **a goroutine dump** written to the log at warning level when a run has been in progress for more than 2 minutes, once per run, so a blocked run shows where it waits (path 2 or path 3 above).
+5. **No wire change** (rule 6) and no setting: `cursorsTimeout` and the 2-minute dump threshold are constants, like `recalcPeersDur`. Tests lower them through package variables.
 
 ## Tests
 
-1. **Reproduction, `TestRecalcNotBlockedBySilentPeer`.** A test-local `pullsync.Interface` stub (so the test runs unchanged on upstream) whose `GetCursors` for peer A blocks until its context ends and answers at once for peer B; a topology mock with A and B; a short `RecalcPeersDur`. With `cursorsTimeout` lowered, the test asserts that `on_change_runs` reaches at least 3 within a few recalculation periods and that peer B's bins are synced. On unmodified code the first recalculation never returns and the test fails with the counter at 1. Real time, with the periods in tens of milliseconds and a generous overall deadline; not `synctest`, because on unmodified code every goroutine is durably blocked and `synctest` would panic instead of failing.
-2. **Timeout counted:** after one recalculation with peer A silent, `cursor_requests_failed_total{reason="timeout"}` is 1 and `{reason="error"}` 0; an error answer counts as `error`.
-3. **Retry:** when peer A starts answering, the next recalculation gets its cursors and starts its bins.
-4. **Duration histogram:** one observation per recalculation.
-5. **Radius change acted on:** with peer A silent, a radius decrease is followed by syncing the newly opened bins from peer B within one recalculation period plus `cursorsTimeout`.
+1. **Reproduction, `TestRecalcNotBlockedBySilentPeer`, portable to upstream.** It uses only what upstream has: the kademlia mock with `WithEachPeerRevCalls` and `Trigger()` to drive recalculations, and a test-local `pullsync.Interface` stub. The stub's `GetCursors` blocks until its context ends for peer A and answers at once for peer B, and counts its calls per peer with atomics. The test triggers a recalculation, waits for B's first `GetCursors`, triggers a second one, and asserts **lock-free** that B's `GetCursors` count reaches at least 2 (a second recalculation ran) within a generous deadline, polling. No assertion takes `syncPeersMtx`: on unmodified code the first run holds it forever, so a test that took it would hang instead of failing. The timeout is set through a per-tree shim in the test's own file: on wasp a package variable, on the upstream tree (where none exists) the shim is absent and the test fails on the deadline with "second recalculation did not run", which is the reproduction.
+2. **`pullsync` level, `TestGetCursorsDeadline`:** with `streamtest` and a cursors handler that never answers, `GetCursors` with a context carrying a deadline returns at that deadline with `context.DeadlineExceeded`. This is what kills the mutation "deadline applied only to the stream open", which no puller-level test can, since those stub `pullsync`.
+3. **Timeout counted and logged:** one recalculation with peer A silent gives `cursor_requests_failed_total{reason="timeout"}` 1, `{reason="error"}` 0, and one info line naming A; an error answer counts as `error`; a shutdown during the request counts as neither.
+4. **Retry:** when A starts answering, the next recalculation gets its cursors and starts its bins.
+5. **Gauge and histogram:** the start gauge is set while a run is in progress and 0 after; one histogram observation per completed run.
+6. **Dump:** with the threshold lowered, a blocked run writes one warning with a goroutine dump, not one per check.
+7. **Radius change acted on:** with peer A silent, a radius decrease is followed by syncing the newly opened bins from B within one trigger plus `cursorsTimeout`.
 
-**Mutation checks** (each must make a test fail): deadline removed; deadline applied only to the stream open (a context dropped before the read); timeout counted as `error`; failed request not counted; duration not observed.
+Real-time tests use periods in tens of milliseconds, assert "at least" counts, and poll with generous deadlines; they do not use `synctest`, because on unmodified code every goroutine is durably blocked and `synctest` would panic instead of failing.
 
-Race detector on the puller package; check the exit status directly.
+**Mutation checks** (each must make a test fail): deadline removed (tests 1, 7); deadline applied only to the stream open (test 2); timeout counted as `error` (test 3); shutdown counted as a failure (test 3); failed request not counted or not logged (test 3); start gauge not cleared (test 5); dump written on every check (test 6).
+
+Race detector on `pkg/puller` and `pkg/pullsync`; check the exit status directly.
 
 ## Upstream
 
-Expected to affect upstream: the same code is on `master` at the lines above. Check: run test 1 (it uses only a local stub and the existing topology mock) on an unmodified `upstream/master` worktree; if it fails there with the counter at 1, add `affects-upstream` to #695 with what was checked, and a row in `docs/UPSTREAM.md`.
+Expected to affect upstream: the same code is on `master` at the lines above. Check: run test 1 on an unmodified `upstream/master` worktree (cc5c4706e or newer); if it fails there with "second recalculation did not run", add `affects-upstream` to #695 with what was checked, and a row in `docs/UPSTREAM.md`.
 
 ## Measurement
 
 On the dense host (ten nodes, by role), with the build carrying this change and #696:
 
 - Restart all ten nodes at once, twice, a day apart.
-- Per node, for 2 hours after each restart: the gaps between increments of `bee_puller_on_change_runs` (pass: no gap longer than 6 minutes, against about 30 minutes on two nodes on 2026-10-09), the `on_change_duration` maximum (pass: under 60 seconds), and `cursor_requests_failed_total` by reason.
-- If gaps stay long with no timeouts counted, the hypothesis above is refuted and the issue stays open with that result.
+- Per node, for 2 hours after each restart:
+  - the largest `now − bee_puller_on_change_started_timestamp_seconds` while a run is in progress, sampled every 15 s (pass: under 60 s, against about 30 minutes on two nodes on 2026-10-09);
+  - `cursor_requests_failed_total` by reason, and the peers named in the timeout lines (is one peer shared across nodes?);
+  - any goroutine dump: where the blocked run waited.
+- If runs stay long with no timeouts and the dump shows path 3, the hypothesis is refuted for that case and path 3 gets its own issue.
 
 Generated with help of AI.
