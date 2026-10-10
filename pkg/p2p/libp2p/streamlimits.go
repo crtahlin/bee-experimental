@@ -15,6 +15,7 @@ import (
 	libp2ppeer "github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // Built-in values of the inbound stream limits. They apply only while
@@ -175,20 +176,26 @@ type streamLimits struct {
 	unnegotiated map[libp2ppeer.ID]int
 	unnegMax     int
 	group        [3]int
+	// groupGauge holds the gauge child of each group, looked up once. It is
+	// changed with Inc and Dec under mu, so it always equals group (#687).
+	groupGauge [3]prometheus.Gauge
 }
 
 func newStreamLimits(cfg streamLimitsConfig, m metrics, attr *streamAttribution) *streamLimits {
 	for _, l := range []string{streamLimitPeerUnnegotiated, streamLimitGroupPullSync, streamLimitGroupOther} {
 		m.InboundStreamsRefused.WithLabelValues(l)
 	}
-	m.InboundStreamsGroup.WithLabelValues("pullsync").Set(0)
-	m.InboundStreamsGroup.WithLabelValues("other").Set(0)
-	return &streamLimits{
+	l := &streamLimits{
 		cfg:          cfg,
 		metrics:      m,
 		attr:         attr,
 		unnegotiated: make(map[libp2ppeer.ID]int),
 	}
+	l.groupGauge[streamGroupPullSync] = m.InboundStreamsGroup.WithLabelValues("pullsync")
+	l.groupGauge[streamGroupOther] = m.InboundStreamsGroup.WithLabelValues("other")
+	l.groupGauge[streamGroupPullSync].Set(0)
+	l.groupGauge[streamGroupOther].Set(0)
+	return l
 }
 
 // refuse counts a refusal and notes the peer for the attribution log.
@@ -252,31 +259,21 @@ func (l *streamLimits) groupMax(g int) int {
 // passes the group's limit.
 func (l *streamLimits) reserveGroup(g int) bool {
 	l.mu.Lock()
+	defer l.mu.Unlock()
 	n := l.group[g] + 1
 	if limit := l.groupMax(g); limit > 0 && n > limit {
-		l.mu.Unlock()
 		return false
 	}
 	l.group[g] = n
-	l.mu.Unlock()
-	l.setGroupGauge(g, n)
+	l.groupGauge[g].Inc()
 	return true
 }
 
 func (l *streamLimits) releaseGroup(g int) {
 	l.mu.Lock()
+	defer l.mu.Unlock()
 	l.group[g]--
-	n := l.group[g]
-	l.mu.Unlock()
-	l.setGroupGauge(g, n)
-}
-
-func (l *streamLimits) setGroupGauge(g, n int) {
-	label := "other"
-	if g == streamGroupPullSync {
-		label = "pullsync"
-	}
-	l.metrics.InboundStreamsGroup.WithLabelValues(label).Set(float64(n))
+	l.groupGauge[g].Dec()
 }
 
 // limitedStreamScope wraps the scope of one inbound stream. It holds the

@@ -124,7 +124,7 @@ func newMetrics() metrics {
 				Namespace: m.Namespace,
 				Subsystem: subsystem,
 				Name:      "requests_abandoned_total",
-				Help:      "Inbound requests still waiting for their first chunk that were ended because the requester went away: reason reset (the requester reset the stream), disconnect (the connection ended), eof (the requester closed its write side), error (another read error), or unexpected_data (the requester sent data before the offer, which a correct requester never does) (#641).",
+				Help:      "Inbound requests still waiting for their first chunk that were ended because the requester went away: reason reset (the requester reset the stream), disconnect (the connection ended, including connections this node closed itself by a disconnect or blocklist, and requests on streams without a read deadline, which have no watcher), eof (the requester closed its write side), error (another read error), or unexpected_data (the requester sent data before the offer, which a correct requester never does) (#641, #672).",
 			}, []string{"reason"}),
 		RequestsRefused: prometheus.NewCounterVec(
 			prometheus.CounterOpts{

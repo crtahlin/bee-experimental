@@ -18,7 +18,7 @@ After `makeOffer`, `watch.stop()` and `unregister`, the abandoned request is cou
 1. the cause is the watcher's error, as today, counted under the watcher's reason; or
 2. the stream's handler context (`streamCtx`, which libp2p cancels on a disconnect; not the handler's local `ctx`, which `s.quit` also cancels, `pullsync.go:173-180`) has ended and `s.quit` is still open, and the cause is not `errRequestReplaced`: counted under the watcher's reason when it recorded one, otherwise as `disconnect`. A **nil watcher** (a stream without a read deadline, `watcher.go:56-59`) counts as `disconnect`; such unwatched requests were never counted before and now are.
 
-A request the same peer replaced (#640) keeps that cause and is counted only under `requests_replaced_total`, also when its connection then drops. A node that is stopping mostly counts nothing; during a real shutdown the handler contexts can end shortly before `s.quit` closes (`pkg/node/node.go:1975-1985`), so a few requests can be counted as `disconnect` then. The handler's returned error wraps `errRequesterGone` in case 2 as well.
+A request whose offer was built just as `streamCtx` ended is counted as `disconnect` and its offer is not written; the write would fail anyway. A request the same peer replaced (#640) keeps that cause and is counted only under `requests_replaced_total`, also when its connection then drops. A node that is stopping mostly counts nothing; during a real shutdown the handler contexts can end shortly before `s.quit` closes (`pkg/node/node.go:1975-1985`), so a few requests can be counted as `disconnect` then. The handler's returned error wraps `errRequesterGone` in case 2 as well.
 
 The metric's help text says the count covers requests whose connection ended, including connections this node closed itself (a disconnect or blocklist, `pkg/p2p/libp2p/peer.go:228-235`), and unwatched requests.
 
@@ -32,7 +32,7 @@ The handler is called directly (`s.handler` through an export), with a `streamCt
 4. **Shutdown:** the syncer is closed while a request waits, `streamCtx` live; nothing is counted.
 5. **Replacement, then disconnect:** a request ended by a newer one from the same peer, then its `streamCtx` cancelled: counted only under `requests_replaced_total`.
 
-**Mutation checks:** case 2 removed (tests 1, 3); the nil-watcher case dereferenced or dropped (test 3); the `s.quit` check removed (test 4); the replacement cause not given precedence (test 5); the local `ctx` checked instead of `streamCtx` (test 4).
+**Mutation checks:** case 2 removed (tests 1, 3); the nil-watcher case dereferenced or dropped (test 3); the `s.quit` check removed (test 4); the replacement cause not given precedence (test 5). Checking the local `ctx` instead of `streamCtx` is an **equivalent mutation**: with `s.quit` open the two contexts end together (`pullsync.go:170-180`), and with it closed the `s.quit` check decides; it is not a test target. (Noted in the review of this spec.)
 
 ## #687: the inbound stream group gauge
 
@@ -59,6 +59,6 @@ No wire change (rule 6), no setting, no behaviour change. Race detector on `pkg/
 
 ## Measurement
 
-None beyond the tests for #687. For #672, on the dense host after deployment: restart one node (node R) and compare, on each of its neighbours that runs this build, the step in `requests_abandoned_total{reason="disconnect"}` at the restart with the drop in that neighbour's own `bee_pullsync_waiting_requests` at the same moment (the requests R had waiting there). Summed over the neighbours they should match within a few; as a cross-check, the total is close to R's live sync-worker count (`bee_puller_worker`) just before the restart, counting only workers on those neighbours. (`waiting_requests` on R itself counts the neighbours' requests waiting at R, not R's, so it is not the comparison.)
+None beyond the tests for #687. For #672, on the dense host after deployment: restart one node (node R) and compare, on each of its neighbours that runs this build, the step in `requests_abandoned_total{reason="disconnect"}` at the restart with the drop in that neighbour's own `bee_pullsync_waiting_requests` at the same moment (the requests R had waiting there). Summed over the neighbours they should match within a few; as a rough cross-check only, the total can be compared with R's `bee_puller_worker` just before the restart; that gauge is node-wide and includes historical workers (`pkg/puller/metrics.go`), so it cannot be split by neighbour and only bounds the total from above. (`waiting_requests` on R itself counts the neighbours' requests waiting at R, not R's, so it is not the comparison.)
 
 Generated with help of AI.
