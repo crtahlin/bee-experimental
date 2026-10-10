@@ -25,80 +25,93 @@ After the sample, the agent compares the committed depth with the depth read and
 
 A played round has `proximity(overlay, anchor) >= depth read` (the contract's `IsPlaying` selects by that), so `sampleBins` (`pkg/storer/sample.go:654-662`) returns the range `[max(depth read, storage radius), MaxPO]`, and the iteration also requires `proximity(chunk, anchor) >= depth read` (`sample.go:263`).
 
-1. **Expiry eviction does not change the content.** `batchstore.cleanup` (`pkg/postage/batchstore/store.go:300-345`) first calls `evictFn`, which only records an `expiredBatchItem` and wakes the reserve worker (`reserve.go:412-426`), and then deletes the batch from the batch store. From then on every remaining chunk of that batch fails `validStamp` in phase 3 of the sample (`sample.go:493`, `postage.ValidStamp` returns not found, counted as `InvalidStamp`), whether the expiry run has deleted it yet or not. Before `cleanup` runs, the batch's value is at or below the cumulative payout, which is below the agent's `minBatchBalance` (`agent.go:568-575`, total payout plus the price for the blocks up to the next round), so `batchesBelowValue` (`sample.go:542`) already excludes it. Edge: with a current price of 0 the two values are equal and `batchesBelowValue` (strict `<`) keeps the batch; it is then still in the batch store, its chunks pass `validStamp`, and they are sampled consistently until `cleanup` deletes it, so this edge is also independent of eviction. Expiry eviction costs the sample time (the chunks are read and hashed before the stamp check), which the pause covers.
-2. **An increase can change the content on a default node.** With no doubling, the depth read equals the radius r, so the range starts at bin r. A step to r+1 lets unreserve delete in bin r (the #649 barrier stops that during the sample, not before it), and a sample that starts after the step reads radius r+1 and starts at bin r+1. On a doubled node the deleted bin is below the range.
-3. **A decrease does not change the content.** It deletes nothing. The puller then pulls chunks in bin r−1 and below; such a chunk shares fewer than r bits with the overlay, while every chunk in range shares at least the depth read (≥ r) bits with it, so none of them is in range. The sample at the depth read is the one the node was selected for.
+1. **Expiry eviction does not change the content.** `batchstore.cleanup` (`pkg/postage/batchstore/store.go:298-343`, under `s.mtx`) first calls `evictFn`, which only records an `expiredBatchItem` and wakes the reserve worker (`reserve.go:412-426`), and then deletes the batch from the batch store. From then on every remaining chunk of that batch fails `validStamp` in phase 3 of the sample (`sample.go:493`, `postage.ValidStamp` returns not found, counted as `InvalidStamp`), whether the expiry run has deleted it yet or not. Before `cleanup` runs, the batch's value is at or below the cumulative payout, which is below the agent's `minBatchBalance` (`agent.go:568-575`, total payout plus the price for the blocks up to the next round), so `batchesBelowValue` (`sample.go:542`) already excludes it. Edge: with a current price of 0 the two values are equal and `batchesBelowValue` (strict `<`) keeps the batch; it is then still in the batch store and its chunks are sampled consistently until `cleanup` deletes it, so the edge does not depend on eviction (and with price 0 nothing expires). Expiry eviction costs the sample time (the chunks are read and hashed before the stamp check), which the pause covers.
+2. **An increase can change the content.** Let D be the depth read, d the doubling, r = D − d the radius, and p the proximity of the overlay to the round's anchor. `sampleBins` (`sample.go:240-246, 654-662`) gives bins D..MaxPO when p ≥ D, and only bin p when p < D; either range is then clipped to bins at or above the current radius. An increase to r+1 lets unreserve delete in bin r. With no doubling (D = r) the range starts at bin r, so the deletion is inside it. With doubling and p = r the range is bin r alone, so after the increase it is clipped away and the sample is empty. So an increase can change the sample in both configurations; the skip on any increase stays.
+3. **A decrease cannot reach the range.** It deletes nothing, and the puller then adds chunks only in bins below the old radius r. The range lies at or above bin p (p < D) or bin D (p ≥ D). For a decrease to add a chunk in range would need p < r. **Assumption (hypothesis, from the contract's selection rule as wasp uses it in `IsPlaying(ctx, D)`, not verified against the contract source here):** a selected node has p ≥ D − d = r, so every chunk the decrease brings in is outside the range, and the sample at the depth read is the one the node was selected for.
+4. **Neighbours agree on an expiry whatever their eviction state.** A neighbour whose batch store has not yet run `cleanup` still excludes the batch through `minBatchBalance`, which projects to the next round (`agent.go:568-575`), so its sample matches. Neighbours can still disagree for reasons unrelated to eviction (a lagging batch store, other content). So sitting out a round for an expiry buys nothing.
 
 So: expiry runs should not count toward the gate; a decrease should not skip; an increase should, including an increase followed by a decrease that brings the depth back to the depth read (bin r chunks are gone, and the current comparison would miss it).
 
 ## Hypothesis
 
 1. Counting only unreserve runs toward the episode removes every expiry-driven skip and keeps every skip for a radius increase.
-2. Skipping only when the radius rose between the depth read and the end of the sample keeps the round for a decrease and still skips every sample whose content an increase could have changed, including increase-then-decrease.
+2. Skipping only when the radius rose (the increase count changed) between the depth read and the end of the sample keeps the round for a decrease and still skips every sample whose content an increase could have changed, including increase-then-decrease.
 
 ## Design
 
 ### 1. Expiry runs do not count toward the episode (#663)
 
-- `evictionRun` gains a kind: `evictionRun(kindUnreserve, ...)` and `evictionRun(kindExpiry, ...)` at the two call sites (`reserve.go:283` and `:264`). Nothing else in `reserve.go` changes.
-- **Unreserve runs** behave as today: open an episode if none is open, add active time, close it when no work is left.
-- **Expiry runs** never open an episode and add no active time. If an episode is open (an unreserve run left work, for example because a batch expiry interrupted it, `reserve.go:551, 568, 589`), the expiry run keeps it open: it sets `lastRunEnd` at its end so the idle grace counts from there, and it does not close it.
-- **"Work left" for the episode** becomes `EvictionTarget() > 0` only (the reserve is over capacity). Pending expired batches no longer keep an episode open. `evictionWorkLeft` keeps its current meaning for anything else that uses it; the episode uses a new helper.
-- **The pause during a sample** (`waitWhileSampling`, the `Before` hook, the barrier) applies to expiry runs unchanged, so an expiry run still does not compete with a running sample.
-- **Shutdown** closes the episode as today.
-- **Metrics:** `bee_localstore_expiry_eviction_seconds_total` (counter, active seconds of expiry runs, paused time excluded) and `bee_localstore_expiry_eviction_running_seconds` (`GaugeFunc`, active seconds of the expiry run in progress, 0 when none), so expiry eviction stays visible now that it no longer shows in `bee_localstore_eviction_running_seconds`.
+- `evictionRun` gains a kind: `evictionRun(kindUnreserve, ...)` at the unreserve call site (`reserve.go:283`) and `evictionRun(kindExpiry, ...)` at the expiry call site (`:264`). Nothing else in `reserve.go` changes.
+- **Unreserve runs** behave as today: `runStarted` opens an episode if none is open, active time accrues, `runEnded` closes it when no work is left.
+- **Expiry runs** never open an episode and add no active time. They use a **hold** instead of a run:
+  - `holdStarted(now)`: if an episode is open, mark it held (`holdStart = now`); if none is open, do nothing.
+  - `holdEnded(now)`: clear the hold and set `lastRunEnd = now`, so the idle grace counts from the end of the expiry run; the episode stays open whatever the outcome (an expiry run never closes it).
+  - `expiredLocked` treats a held episode as busy (like a run in progress): it does not close it, however long the hold.
+  - **`EvictingFor()` during a hold** returns the episode's accumulated active time, frozen: the hold adds nothing. So an episode interrupted by an expiry neither closes nor advances toward `EvictingMinAge` while the expiry runs.
+  - A shutdown during a hold closes the episode, as for a run.
+- **"Work left" for the episode** becomes `EvictionTarget() > 0` only (the reserve is over capacity). `evictionWorkLeft` has no other caller (`evictionsample.go`), so it is replaced by `episodeWorkLeft`, not kept beside it. Pending expired batches no longer keep an episode open.
+- **The pause during a sample** (`waitWhileSampling`, the `Before` hook, the barrier) applies to expiry runs unchanged.
+- **Metrics,** in the existing `bee_localstore_eviction_*` family, with the `_total` suffix on counters as in the sibling metrics:
+  - `bee_localstore_eviction_expiry_seconds_total`: active seconds of expiry runs. Expiry runs keep their own run start and paused time (the same accounting as `runPaused`/`pauseStart`, `evictionsample.go:207-232`, kept in separate fields), so time paused for a sample is excluded;
+  - `bee_localstore_eviction_expiry_running_seconds` (`GaugeFunc`): active seconds of the expiry run in progress, 0 when none.
+- **Progress lines (#705):** spec #705 logs progress "while an episode runs", with kind `expired` for expiry runs. After this change an expiry run outside an unreserve episode has no episode, so #705's progress line must key on "an eviction run is in progress" (unreserve or expiry), not on the episode. This is recorded here and in a comment on #705; whichever lands second adapts.
 
 ### 2. Skip after a sample only on a radius increase (#658)
 
-- The storer counts radius increases: `pkg/storer/internal/reserve` `SetRadius` compares the new radius with the stored one and increments an atomic counter when it is higher. This covers the unreserve step (`reserve.go:587-597`) without touching the decrease branch. The start-up `SetRadius` (`startReserveWorkers`) runs before the agent and is not relevant.
-- `storer.Reserve` gains `RadiusIncreases() uint64`; the mock reserve implements it (its `SetStorageRadius` counts a higher radius the same way).
-- `handleSample` reads `RadiusIncreases()` together with the depth at the top. After the sample:
-  - if `RadiusIncreases()` changed: skip, log `skipping round because the storage radius increased since the round's depth was read` with the depth read and the current depth, and count `bee_storageincentives_skipped_depth_changed_total{direction="increase"}`;
-  - else if the committed depth is lower than the depth read: play, log at info `radius decreased since the round's depth was read; playing at the depth read`, and count `{direction="decrease"}` in a separate counter `bee_storageincentives_played_after_radius_decrease_total`, so a skip and a play are not mixed in one series;
+- The storer counts radius increases. In `pkg/storer/internal/reserve` `SetRadius`, the radius and the counter are kept in **one atomic `uint64`**: radius in the low 8 bits, the increase count in the rest. `SetRadius` does a compare-and-swap loop that stores the new radius and, when it is higher than the old, increments the count in the same word. `Radius()` reads the low 8 bits. One word removes any interleaving between "radius changed" and "counter changed". The unreserve step (`reserve.go:587-597`) goes through `SetRadius`; no path changes the radius without it. The start-up `SetRadius` runs before the agent.
+- `storer.Reserve` gains `RadiusState() (radius uint8, increases uint64)`, read from that one word; `CommittedDepth()` is unchanged. The mock reserve implements it the same way.
+- `handleSample` reads `RadiusState()` first, at the top, and computes the depth read from that radius plus the doubling, in place of the separate `CommittedDepth()` call (`agent.go:434`). After the sample it reads `RadiusState()` again:
+  - if the increase count changed: skip, log `skipping round because the storage radius increased since the round's depth was read` with the depth read and the current depth, and count `bee_storageincentives_skipped_radius_increase_total`;
+  - else if the radius is lower than at the read: play, log at info `radius decreased since the round's depth was read; playing at the depth read`, and count `bee_storageincentives_played_after_radius_decrease_total`;
   - otherwise play as today.
-- Both counters are created at start so they export 0.
-- The comparison is on the increase counter, not on the depth, so increase-then-decrease is caught.
+- No label on either counter (each has one meaning). Both are created at start so they export 0.
 
 ## Tests
 
 Storer (`pkg/storer`):
 
-1. **Expired-batch chunks give the same sample whether evicted or not.** A real storer (`memStorer`, the real reserve) with chunks of a valid batch A and a batch E in range. Take sample S1 with both batches valid. Then expire E the way `cleanup` does: record it with `EvictBatch` and delete it from the batch store, without letting the reserve worker run. Take S2. Then run the expiry eviction of E. Take S3. Assert S2 == S3 (same hash and items) and that neither contains an item of E, and that S1 contains at least one item of E (so the test exercises the case). A second case uses a batch whose value is below `minBatchBalance` while still in the batch store: excluded before and after eviction.
-2. **An expiry run alone never makes the node evicting.** An expiry run that lasts longer than `EvictingMinAge` (fake clock through the episode's `now` arguments, as the #649 tests do): `EvictingFor()` stays 0 throughout.
-3. **An expiry run inside an open episode keeps it open without adding time.** Unreserve run (30 s active, work left), expiry run (90 s), unreserve run (40 s): the episode is open throughout, `EvictingFor()` is 70 s after the last run, and it never exceeds the unreserve time.
-4. **Pending expired batches do not keep an episode open.** Unreserve run ends with the reserve within capacity while an `expiredBatchItem` is recorded: the episode closes.
+1. **Expired-batch chunks give the same sample whether evicted or not (verification).** A real storer (`memStorer`) with the **real batch store**: `batchstore.New` over a test state store, its `evictFn` wired to `db.EvictBatch` as in `pkg/node/node.go:713-719, 1200`, and the default `postage.ValidStamp(batchStore)` (no accept-all). Two batches, A and E, each with a real owner key, saved through the batch store, and chunks stamped with real signatures (`postagetesting` signer). E's chunks are placed in the anchor's range deterministically: the anchor is the overlay with the sampled bits fixed, and E's chunks are mined to share at least the committed depth with it, so S1 is guaranteed to contain an E item (asserted). Steps:
+   - S1 with both batches valid;
+   - expire E through `PutChainState` with a total amount above E's value, so `cleanup` runs its real order (evict at `store.go:328`, delete at `:336`); the reserve worker is not started, so nothing is deleted yet; S2;
+   - start the reserve worker and wait for the expiry eviction of E to finish; S3.
+
+   Assert S2 == S3 (hash and items), that neither contains an E item, and that S1 does. A second case: a batch whose value is below `minBatchBalance` but above the total amount (still in the batch store) is excluded before and after its eviction. If test 1 fails, the reasoning behind #663 is wrong and the change must not ship.
+2. **An expiry run alone never makes the node evicting.** An expiry hold longer than `EvictingMinAge` with no open episode (fake clock through the episode's `now` arguments, as the #649 tests do): `EvictingFor()` stays 0.
+3. **A hold keeps an open episode open without adding time.** Unreserve run (30 s active, work left), then an expiry hold of 90 s, then an unreserve run of 40 s. `EvictingFor()` is called **during the hold** at 15 s and at 80 s (both past the 10 s idle grace) and returns 30 s both times (open, frozen); after the last run it returns 70 s.
+4. **Pending expired batches do not keep an episode open.** An unreserve run ends with the reserve within capacity while an `expiredBatchItem` is recorded: the episode closes.
 5. **Expiry eviction still pauses for a sample.** The existing #649 pause test, run with an expiry run.
-6. **Increase counter:** `SetRadius` to a higher radius increments, to the same or a lower radius does not.
+6. **Radius word:** `SetRadius` to a higher radius increments the count and stores the radius in the same word; to the same or a lower radius it stores the radius and leaves the count; concurrent `SetRadius` and `RadiusState` under `-race` never return a radius and count from different writes (a reader sees either the old pair or the new pair).
+7. **Worker level: an expiry eviction leaves `EvictingFor()` at 0.** As `TestEvictingForFollowsTheWorker` (`evictionsample_storer_test.go:338`), with a pacing rate so the eviction takes seconds: a batch expiry through `EvictBatch` on a reserve within capacity; while the expiry eviction runs (the expiry running gauge above 0), `EvictingFor()` is 0 throughout.
 
 Agent (`pkg/storageincentives`):
 
-7. **Decrease during the sample: the round is played.** The sample hook lowers the radius by one; the agent commits, the played-after-decrease counter is 1, the skip counter is 0.
-8. **Increase during the sample: skipped** (the existing `TestAgentSkipsRoundWhenDepthChangesInSample`), now also asserting `skipped_depth_changed_total{direction="increase"}` is 1.
-9. **Increase then decrease during the sample: skipped,** although the committed depth is back to the depth read.
-10. **Series exported at 0** before any skip or decrease.
+8. **Decrease during the sample: the round is played.** A one-shot sample hook lowers the radius by one on the first sample only (the mock contract's `Reveal` fails from the second round, `agent_test.go:360-361`, so the test stops after the first commit). The agent commits; the played-after-decrease counter is 1; the skip counter is 0.
+9. **Increase during the sample: skipped** (the existing `TestAgentSkipsRoundWhenDepthChangesInSample`), now also asserting `skipped_radius_increase_total` is 1.
+10. **Increase then decrease during the sample: skipped,** although the radius is back where it was at the read.
+11. **Series exported at 0** before any skip or decrease.
 
 **Mutation checks** (each must make a test fail):
 
-- expiry runs counted toward the episode (test 2);
-- expiry runs adding active time inside an open episode (test 3);
-- expiry run closing an open episode (test 3);
-- episode "work left" still counting pending expired batches (test 4);
+- kinds swapped at the two call sites in `reserve.go` (tests 7 and the #649 worker test);
+- expiry runs opening the episode (test 2);
+- a hold adding active time (test 3);
+- `expiredLocked` ignoring a hold (test 3, the call at 80 s);
+- a hold closing an open episode (test 3);
+- `episodeWorkLeft` still counting pending expired batches (test 4);
 - pause skipped for expiry runs (test 5);
-- skip on any depth change, decreases included (test 7);
-- comparison on the committed depth instead of the increase counter (test 9);
-- `SetRadius` counting every call (test 6);
-- counters not incremented, or not created at start (tests 8 and 10).
-
-Test 1 is a verification, not a mutation target: if it fails, the reasoning behind #663 is wrong and the change must not ship.
+- skip on any depth change, decreases included (test 8);
+- comparison on the radius instead of the increase count (test 10);
+- `SetRadius` counting every call, or storing radius and count in two words (test 6);
+- counters not incremented, or not created at start (tests 9 and 11).
 
 ## Measurement
 
-On the ten-node bench host, with the build that carries this change, during the planned eviction-and-refill cycle (A3/B3):
+Rule 7 asks for three runs per condition; where a condition happens once per cycle, the cycle is the run and three cycles are needed before the default is judged.
 
-- **Expiry:** count expiry runs and their size (`evict expired batches start` log line, `bee_localstore_expired_count` deltas) and `expiry_eviction_seconds_total`. Pass: `EvictingFor()` and `bee_localstore_eviction_running_seconds` stay 0 during expiry runs that are not inside an unreserve episode.
-- **Increase:** during A3 (all nodes evict at the default 500), the gate still fires: `bee_storageincentives_skipped_while_evicting` counts any selection that falls inside the unreserve episode (the bench nodes are unstaked and normally not selected, so the gate is checked through `EvictingFor()` and the episode gauge rather than through skips).
-- **Decrease:** during B3 (refill), any sample that overlaps a decrease is counted in the played-after-decrease counter. The bench observers take `/rchash` samples, which do not go through the agent, so on the bench this counter is expected to stay 0; it is a production-node metric.
-- Rule 7: report each series per node with the window it covers.
+- **Expiry, on the bench:** the planned A3/B3 cycle does not by itself expire a batch. Plan one: buy a short-lived batch on the bench's chain backend (a TTL of a few hours), upload enough chunks that its share on a node exceeds 31,000, and let it expire during a quiet period. Three such expiries. Record the `evict expired batches start` line, `bee_localstore_expired_count` deltas, `eviction_expiry_seconds_total`, and `EvictingFor()` / `bee_localstore_eviction_running_seconds`. Pass: the two episode series stay 0 during every expiry run outside an unreserve episode.
+- **Increase, on the bench:** during A3 (all nodes evict at the default 500) the episode opens as before (`EvictingFor()` and the episode gauge). The bench nodes are unstaked and not selected, so skips are not observed there.
+- **Hypothesis 2 is not observable on unstaked nodes:** the agent only samples when selected. It is covered by tests 8 to 10; in production, by the two counters.
+- **Mainnet canary (from #663):** on a staked production node, count expiry evictions over a week and how many pass the one-minute mark at 500/s, before and after this change, together with `skipped_while_evicting`. Pass: after the change, no `skipped_while_evicting` increment coincides with an expiry run outside an unreserve episode.
 
 ## Upstream
 
@@ -115,9 +128,9 @@ Neither issue applies to upstream as such: the episode and the post-sample check
 - `pkg/storer/reserve.go` (the two `evictionRun` call sites only)
 - `pkg/storer/internal/reserve/reserve.go` (`SetRadius` increase counter)
 - `pkg/storer/storer.go`, `pkg/storer/metrics.go` (interface method, metrics)
-- `pkg/storer/mock/mockreserve.go` (`RadiusIncreases`)
+- `pkg/storer/mock/mockreserve.go` (`RadiusState`)
 - `pkg/storageincentives/agent.go`, `pkg/storageincentives/metrics.go`
 - tests in `pkg/storer` and `pkg/storageincentives`
-- `docs/DIFFERENCES.md` (the #649 row updated)
+- `docs/DIFFERENCES.md`: the #649 behaviour row and the metrics row (`:226`, which names `skipping round because the committed depth changed during the sample`), and the `reserve-eviction-rate` settings row (`:153`, whose expiry-threshold note changes)
 
 Generated with help of AI.
