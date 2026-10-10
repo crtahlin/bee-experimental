@@ -84,7 +84,7 @@ var empty = reply{}
 // grow, and that a call with progress resets them.
 func TestNoProgressPauseGrowsAndResets(t *testing.T) {
 	t.Parallel()
-	const base = 40 * time.Millisecond
+	const base = 100 * time.Millisecond
 	_, ps := newScripted(t, base, time.Second, empty, empty, empty, reply{top: 1, n: 1}, empty, empty)
 
 	waitFor(t, 10*time.Second, func() bool { return len(ps.calls()) == 6 }, "script not consumed")
@@ -101,6 +101,66 @@ func TestNoProgressPauseGrowsAndResets(t *testing.T) {
 	}
 	if gap(5) >= 2*base {
 		t.Fatalf("gap %v after the first empty offer following progress, want about %v", gap(5), base)
+	}
+}
+
+// liveSync answers bin 0 like a healthy peer: it waits, then delivers one
+// chunk at the start, again and again. It never answers with nothing.
+type liveSync struct {
+	idle  time.Duration
+	mu    sync.Mutex
+	times []time.Time
+}
+
+func (l *liveSync) Sync(ctx context.Context, _ swarm.Address, bin uint8, start uint64) (uint64, int, error) {
+	if bin != 0 {
+		<-ctx.Done()
+		return 0, 0, ctx.Err()
+	}
+	select {
+	case <-time.After(l.idle):
+	case <-ctx.Done():
+		return 0, 0, ctx.Err()
+	}
+	l.mu.Lock()
+	l.times = append(l.times, time.Now())
+	l.mu.Unlock()
+	return start, 1, nil
+}
+
+func (l *liveSync) GetCursors(context.Context, swarm.Address) ([]uint64, uint64, error) {
+	return []uint64{0}, 0, nil
+}
+
+func (l *liveSync) deliveries() []time.Time {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]time.Time(nil), l.times...)
+}
+
+// TestLiveSyncNotPaused is a regression test for #576: a healthy peer that
+// idles and then delivers a chunk is never paused, and no call counts as
+// having made no progress.
+func TestLiveSyncNotPaused(t *testing.T) {
+	t.Parallel()
+	const idle = 300 * time.Millisecond
+	ls := &liveSync{idle: idle}
+	kad := kadMock.NewMockKademlia(kadMock.WithEachPeerRevCalls(kadMock.AddrTuple{Addr: swarm.RandAddress(t), PO: 0}))
+	p := puller.New(swarm.RandAddress(t), mock.NewStateStore(), kad, resMock.NewReserve(resMock.WithRadius(0)), ls, nil, log.Noop, puller.Options{Bins: 1})
+	p.SetRetryBackoff(time.Second, time.Minute)
+	p.Start(context.Background())
+	t.Cleanup(func() { _ = p.Close() })
+
+	waitFor(t, 10*time.Second, func() bool { return len(ls.deliveries()) >= 5 }, "deliveries stopped")
+	d := ls.deliveries()
+	for i := 1; i < len(d); i++ {
+		// idle plus a margin, well below the 1 s pause a no-progress call gets
+		if g := d[i].Sub(d[i-1]); g > idle+400*time.Millisecond {
+			t.Fatalf("gap %v between deliveries %d and %d, want about %v with no pause", g, i-1, i, idle)
+		}
+	}
+	if n := p.NoProgress(); n != 0 {
+		t.Fatalf("no-progress count %v for a peer that always delivers, want 0", n)
 	}
 }
 
