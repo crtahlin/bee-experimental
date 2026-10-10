@@ -42,20 +42,25 @@ func (p *Puller) recordActed(radius uint8, now time.Time) {
 	p.metrics.ActedRadius.Set(float64(radius))
 }
 
-// actedOn reports whether, after a recalculation at radius, at least one
-// neighbour (a peer with proximity order at or above the radius) has its
-// cursors and every bin at or above the radius syncing, started in this run
-// or earlier. Must be called under syncPeersMtx, after recalcPeers.
+// actedOn reports whether, after a recalculation at radius, the puller has
+// acted on it: at least one neighbour (a peer with proximity order at or
+// above the radius) has its cursors and every bin at or above the radius
+// syncing, started in this run or earlier; or no neighbour is connected at
+// all, so there is nothing to wait for. Neighbours that are connected but of
+// which none syncs (every cursors request failed, #695) do not count. Must be
+// called under syncPeersMtx, after recalcPeers.
 func (p *Puller) actedOn(radius uint8) bool {
+	neighbours := false
 	for _, peer := range p.syncPeers {
 		if peer.po < radius {
 			continue
 		}
+		neighbours = true
 		if peer.syncingFrom(radius, p.bins) {
 			return true
 		}
 	}
-	return false
+	return !neighbours
 }
 
 // syncingFrom reports whether the peer has its cursors and every bin from

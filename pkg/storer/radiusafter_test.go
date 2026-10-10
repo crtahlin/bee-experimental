@@ -64,6 +64,21 @@ func TestRadiusDeferredWhileSettling(t *testing.T) {
 	}
 }
 
+// TestRadiusDeferredWithinSettle pins the settle boundary: an age between
+// half and the full window still defers.
+func TestRadiusDeferredWithinSettle(t *testing.T) {
+	t.Parallel()
+	s := &actedSyncer{}
+	s.set(true, 4, time.Now().Add(-40*time.Minute))
+	st := startActed(t, time.Hour, s, 4, nil)
+	if err := spinlock.Wait(5*time.Second, func() bool { return st.RadiusDecreaseDeferred(storer.DeferSettling) >= 2 }); err != nil {
+		t.Fatal("deferral at 40 of 60 minutes not counted")
+	}
+	if r := st.Reserve().Radius(); r != 4 {
+		t.Fatalf("radius %d at 40 of 60 minutes settled, want 4", r)
+	}
+}
+
 func TestRadiusDeferredNotAtRadius(t *testing.T) {
 	t.Parallel()
 	s := &actedSyncer{}
