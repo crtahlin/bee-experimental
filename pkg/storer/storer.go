@@ -217,7 +217,9 @@ func (d *dirFS) Open(path string) (fs.File, error) {
 
 var (
 	sharkyNoOfShards = 32
-	ErrDBQuit        = errors.New("db quit")
+	// ErrDBQuit is returned by work stopped by a shutdown, including store
+	// calls refused once the store stopped admitting work (wasp #634).
+	ErrDBQuit = transaction.ErrClosed
 )
 
 type closerFn func() error
@@ -608,7 +610,8 @@ func initDiskRepository(
 
 	recoveryCloser, pruned, err := sharkyRecovery(ctx, sharkyBasePath, store, opts)
 	if err != nil {
-		return nil, nil, nil, 0, fmt.Errorf("failed to recover sharky: %w", err)
+		// Close the index store opened above, or it stays open (wasp #634).
+		return nil, nil, nil, 0, errors.Join(fmt.Errorf("failed to recover sharky: %w", err), store.Close())
 	}
 
 	sharky, err := sharky.New(
@@ -617,7 +620,7 @@ func initDiskRepository(
 		swarm.SocMaxChunkSize,
 	)
 	if err != nil {
-		return nil, nil, nil, 0, fmt.Errorf("failed creating sharky instance: %w", err)
+		return nil, nil, nil, 0, errors.Join(fmt.Errorf("failed creating sharky instance: %w", err), store.Close())
 	}
 
 	pinIntegrity := &PinIntegrity{
@@ -1014,7 +1017,11 @@ func New(ctx context.Context, dirPath string, opts *Options) (*DB, error) {
 	}
 
 	if opts.ReserveCapacity > 0 {
-		rs, err := reserve.New(
+		// Assigned to the function's err, not a shadow, so the deferred
+		// close of the store runs on a failure (wasp #635).
+		var rs *reserve.Reserve
+		rs, err = reserve.NewContext(
+			ctx,
 			opts.Address,
 			st,
 			opts.ReserveCapacity,
@@ -1062,7 +1069,15 @@ func New(ctx context.Context, dirPath string, opts *Options) (*DB, error) {
 	// Held chunks survive a restart; their count is rebuilt here, after
 	// recovery, and they are validated once the listener is caught up
 	// (#583).
-	db.rebuildHeldCount()
+	db.rebuildHeldCount(ctx)
+
+	// A stop during startup cancels ctx. The counts above return early on
+	// it; returning the context's error here closes the store in the
+	// deferred close instead of leaving it open with its dirty marker
+	// (wasp #635).
+	if err = ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	db.inFlight.Add(1)
 	go db.cacheWorker(ctx)
@@ -1178,6 +1193,20 @@ func (db *DB) Close() error {
 	// racing it. A pathological store close blocks shutdown, which is visible,
 	// and cmd/bee still exits on a second interrupt. That is a better failure
 	// than reporting either success or failure while the store is open.
+	//
+	// wasp #634: a worker the drain gave up on may still be inside the
+	// store, for example an eviction round slowed by a busy disk. Closing
+	// the store under it panicked with "pebble: closed" and left the store
+	// dirty, costing a full recovery at the next start. So the store first
+	// stops admitting work (after the drains, so workers still had their
+	// chance to stop at a safe point): new calls get ErrDBQuit, iterations
+	// end at their next item, and Close waits only for the units already
+	// inside, each a transaction until done or a single read.
+	if g, ok := db.storage.(interface{ StopAdmitting(func(int64)) }); ok {
+		g.StopAdmitting(func(inside int64) {
+			db.logger.Warning("db shutdown waiting for store work in progress", "units", inside)
+		})
+	}
 	err := db.dbCloser.Close()
 
 	if !reserveOK || !cacheOK {

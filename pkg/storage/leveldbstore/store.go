@@ -5,6 +5,7 @@
 package leveldbstore
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -382,6 +383,29 @@ func (s *Store) Count(key storage.Key) (int, error) {
 
 	iter.Release()
 
+	return c, iter.Error()
+}
+
+// countCheckEvery is how many keys a context-aware count steps over between
+// checks of its context.
+const countCheckEvery = 4096
+
+// CountContext is Count that returns the context's error once the context
+// ends, checked every countCheckEvery keys (wasp #635).
+func (s *Store) CountContext(ctx context.Context, key storage.Key) (int, error) {
+	keys := util.BytesPrefix([]byte(key.Namespace() + separator))
+	iter := s.db.NewIterator(keys, nil)
+	defer iter.Release()
+
+	var c int
+	for iter.Next() {
+		c++
+		if c%countCheckEvery == 0 {
+			if err := ctx.Err(); err != nil {
+				return 0, err
+			}
+		}
+	}
 	return c, iter.Error()
 }
 

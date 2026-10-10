@@ -58,6 +58,20 @@ func New(
 	radiusSetter topology.SetStorageRadiuser,
 	logger log.Logger,
 ) (*Reserve, error) {
+	return NewContext(context.Background(), baseAddr, st, capacity, radiusSetter, logger)
+}
+
+// NewContext is New whose reserve count, the slowest step on a large
+// reserve, ends with the context's error once the context ends, so a stop
+// during startup does not wait for it (wasp #635).
+func NewContext(
+	ctx context.Context,
+	baseAddr swarm.Address,
+	st transaction.Storage,
+	capacity int,
+	radiusSetter topology.SetStorageRadiuser,
+	logger log.Logger,
+) (*Reserve, error) {
 	rs := &Reserve{
 		baseAddr:     baseAddr,
 		st:           st,
@@ -67,7 +81,7 @@ func New(
 		multx:        multex.New(),
 	}
 
-	err := st.Run(context.Background(), func(s transaction.Store) error {
+	err := st.Run(ctx, func(s transaction.Store) error {
 		rItem := &radiusItem{}
 		err := s.IndexStore().Get(rItem)
 		if err != nil && !errors.Is(err, storage.ErrNotFound) {
@@ -88,7 +102,7 @@ func New(
 			}
 		}
 
-		size, err := s.IndexStore().Count(&BatchRadiusItem{})
+		size, err := storage.CountContext(ctx, s.IndexStore(), &BatchRadiusItem{})
 		if err != nil {
 			return err
 		}
@@ -349,6 +363,11 @@ const EvictionRound = 1000
 // evictionRound is EvictionRound, a variable so tests can use small rounds.
 var evictionRound = EvictionRound
 
+// RoundStall, when set, is called at the first item of every eviction
+// round, inside the round. Tests set it to model a round slowed by a busy
+// disk (wasp #634); it is nil in production.
+var RoundStall func()
+
 // EvictionYield is how long EvictBatchBin waits, with the batch lock
 // released, before the next round of the same batch. The lock (a
 // condition variable woken by Broadcast) gives no turn to waiters: an
@@ -487,6 +506,9 @@ func (r *Reserve) evictRound(
 		}
 		read++
 		last = batchRadius.ID()
+		if read == 1 && RoundStall != nil {
+			RoundStall()
+		}
 
 		// Check if the chunk is pinned in any collection
 		pinned := false

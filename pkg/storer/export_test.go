@@ -244,3 +244,6 @@ const (
 	DeferNotAtRadius = deferNotAtRadius
 	DeferSettling    = deferSettling
 )
+
+// SetDrainWindow shortens the shutdown drain of a real DB for a test.
+func SetDrainWindow(db *DB, d time.Duration) { db.drainWindow = d }

@@ -50,7 +50,9 @@ type Cache struct {
 // here only to read the initial state of the cache before shutdown if there was
 // any.
 func New(ctx context.Context, store storage.Reader, capacity uint64) (*Cache, error) {
-	count, err := store.Count(&cacheEntry{})
+	// Context-aware, so a stop during startup does not wait for a full
+	// count of a large cache (wasp #635).
+	count, err := storage.CountContext(ctx, store, &cacheEntry{})
 	if err != nil {
 		return nil, fmt.Errorf("failed counting cache entries: %w", err)
 	}

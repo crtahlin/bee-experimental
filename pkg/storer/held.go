@@ -288,7 +288,7 @@ func (db *DB) heldEntries(addr swarm.Address, limit int) (int, error) {
 }
 
 // rebuildHeldCount counts the distinct held addresses at startup.
-func (db *DB) rebuildHeldCount() {
+func (db *DB) rebuildHeldCount(ctx context.Context) {
 	var (
 		n    uint64
 		last string
@@ -297,6 +297,11 @@ func (db *DB) rebuildHeldCount() {
 		Factory:      func() storage.Item { return new(heldItem) },
 		ItemProperty: storage.QueryItemID,
 	}, func(r storage.Result) (bool, error) {
+		// A stop during startup ends the count (wasp #635); New then
+		// returns the context's error.
+		if err := ctx.Err(); err != nil {
+			return true, err
+		}
 		if len(r.ID) < swarm.HashSize {
 			return false, nil
 		}
