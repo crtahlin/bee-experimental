@@ -41,6 +41,9 @@ type fakeChain struct {
 	headLag   uint64        // how many blocks the latest header lags block()
 	failBlock bool          // BlockNumber fails
 	baseFee   *big.Int
+	// nonceAt answers NonceAt for the block asked; nil means nonce 0
+	nonceAt     func(block uint64) (uint64, error)
+	nonceBlocks []uint64 // blocks NonceAt was asked for
 }
 
 func newFakeChain(block uint64) *fakeChain {
@@ -74,6 +77,25 @@ func (c *fakeChain) HeaderByNumber(context.Context, *big.Int) (*types.Header, er
 	}, nil
 }
 
+func (c *fakeChain) NonceAt(_ context.Context, _ common.Address, block *big.Int) (uint64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if block == nil {
+		return 0, errors.New("fake chain: NonceAt needs a block")
+	}
+	c.nonceBlocks = append(c.nonceBlocks, block.Uint64())
+	if c.nonceAt == nil {
+		return 0, nil
+	}
+	return c.nonceAt(block.Uint64())
+}
+
+func (c *fakeChain) setNonceAt(fn func(block uint64) (uint64, error)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.nonceAt = fn
+}
+
 func (c *fakeChain) setHeadLag(n uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -97,6 +119,8 @@ type fakeTxs struct {
 	mu          sync.Mutex
 	states      map[common.Hash]transaction.TxState
 	feeCaps     map[common.Hash]*big.Int
+	nonces      map[common.Hash]uint64 // stored nonce per hash; default 0
+	storedErr   error                  // StoredTransaction fails
 	lookupErr   error
 	rebroadcast []common.Hash
 	replaced    []common.Hash
@@ -105,7 +129,7 @@ type fakeTxs struct {
 }
 
 func newFakeTxs() *fakeTxs {
-	return &fakeTxs{states: make(map[common.Hash]transaction.TxState), feeCaps: make(map[common.Hash]*big.Int)}
+	return &fakeTxs{states: make(map[common.Hash]transaction.TxState), feeCaps: make(map[common.Hash]*big.Int), nonces: make(map[common.Hash]uint64)}
 }
 
 func (f *fakeTxs) newHash() common.Hash {
@@ -158,11 +182,14 @@ func (f *fakeTxs) service() transaction.Service {
 		transactionmock.WithStoredTransactionFunc(func(h common.Hash) (*transaction.StoredTransaction, error) {
 			f.mu.Lock()
 			defer f.mu.Unlock()
+			if f.storedErr != nil {
+				return nil, f.storedErr
+			}
 			fc, ok := f.feeCaps[h]
 			if !ok {
 				fc = big.NewInt(100)
 			}
-			return &transaction.StoredTransaction{GasFeeCap: fc}, nil
+			return &transaction.StoredTransaction{GasFeeCap: fc, Nonce: f.nonces[h]}, nil
 		}),
 	)
 }
@@ -1395,5 +1422,139 @@ func TestClaimRechecksListedReveals(t *testing.T) {
 	}
 	if !f.state().HasRevealed(1) {
 		t.Fatal("HasRevealed not set from the mined listed reveal")
+	}
+}
+
+// A commit reported missing is removed only when the node's nonce at the
+// last block of the commit phase shows the commit's nonce unused. The
+// answer is pinned to that block, so a chain node that lags behind cannot
+// give it, even when the status and head reads reach different chain
+// nodes (#745).
+func TestCommitMissingPinnedToNonce(t *testing.T) {
+	t.Parallel()
+
+	revealStart := uint64(testBlocksPerRound + testBlocksPerPhase)
+	commitEnd := revealStart - 1
+	const commitNonce = 5
+	errNonce := errors.New("block not available")
+
+	for _, tc := range []struct {
+		name  string
+		state transaction.TxState
+		// nonce at the end of the commit phase, per step
+		nonce     func(step int) (uint64, error)
+		storedErr error
+		steps     int
+		gone      bool // key removed, no reveal
+		reveal    bool // reveal sent
+	}{
+		{
+			name:   "not found, nonce used by the end of the commit phase",
+			state:  transaction.TxNotFound,
+			nonce:  func(int) (uint64, error) { return commitNonce + 1, nil },
+			steps:  1,
+			reveal: true,
+		},
+		{
+			name:  "not found, nonce unused",
+			state: transaction.TxNotFound,
+			nonce: func(int) (uint64, error) { return commitNonce, nil },
+			steps: 2,
+			gone:  true,
+		},
+		{
+			// the nonce went to another transaction after the commit
+			// phase: the commit never landed
+			name:  "cancelled, nonce used only after the commit phase",
+			state: transaction.TxCancelled,
+			nonce: func(int) (uint64, error) { return commitNonce, nil },
+			steps: 2,
+			gone:  true,
+		},
+		{
+			// used by the end of the commit phase, by our commit or by
+			// another transaction: reveal, the contract decides
+			name:   "cancelled, nonce used by the end of the commit phase",
+			state:  transaction.TxCancelled,
+			nonce:  func(int) (uint64, error) { return commitNonce + 1, nil },
+			steps:  1,
+			reveal: true,
+		},
+		{
+			name:  "nonce read fails, then shows the nonce unused",
+			state: transaction.TxNotFound,
+			nonce: func(step int) (uint64, error) {
+				if step < 2 {
+					return 0, errNonce
+				}
+				return commitNonce, nil
+			},
+			steps: 4,
+			gone:  true,
+		},
+		{
+			name:      "stored commit unreadable",
+			state:     transaction.TxNotFound,
+			nonce:     func(int) (uint64, error) { return commitNonce, nil },
+			storedErr: errors.New("not stored"),
+			steps:     1,
+			reveal:    true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				f := newRevealFixture(t, mock.NewStateStore(), newFakeChain(revealStart+commitSettleBlocks), newFakeTxs())
+				const round = 1
+				f.setSample(round)
+				if err := f.state().SetCommitKey(round, []byte("key")); err != nil {
+					t.Fatal(err)
+				}
+				commitTx := f.txs.newHash()
+				if err := f.state().SetCommitTx(round, commitTx); err != nil {
+					t.Fatal(err)
+				}
+				f.txs.set(commitTx, tc.state)
+				f.txs.nonces[commitTx] = commitNonce
+				f.txs.storedErr = tc.storedErr
+				step := 0
+				f.chain.setNonceAt(func(block uint64) (uint64, error) {
+					if block != commitEnd {
+						return 0, fmt.Errorf("nonce asked at block %d, want %d", block, commitEnd)
+					}
+					return tc.nonce(step)
+				})
+
+				var done bool
+				for step = range tc.steps {
+					if step > 0 {
+						time.Sleep(testBlockTime)
+					}
+					var err error
+					done, err = f.revealer.Reveal(context.Background(), round)
+					if err != nil {
+						t.Fatalf("step %d: %v", step, err)
+					}
+					if step < tc.steps-1 {
+						if _, hasKey := f.state().CommitKey(round); done || !hasKey {
+							t.Fatalf("step %d: done %v, key kept %v; want the key kept and a later check", step, done, hasKey)
+						}
+					}
+				}
+
+				_, hasKey := f.state().CommitKey(round)
+				_, reveals := f.contract.counts()
+				switch {
+				case tc.gone:
+					if !done || hasKey || reveals != 0 {
+						t.Fatalf("done %v, key kept %v, reveals %d; want the key removed and no reveal", done, hasKey, reveals)
+					}
+				case tc.reveal:
+					if !done || reveals != 1 || !f.state().HasRevealed(round) {
+						t.Fatalf("done %v, reveals %d, revealed %v; want the reveal sent", done, reveals, f.state().HasRevealed(round))
+					}
+				}
+			})
+		})
 	}
 }

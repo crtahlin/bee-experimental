@@ -209,7 +209,7 @@ func createServiceWithBlockTime(
 	}, reserveOpts...)
 	reserve := resMock.NewReserve(reserveOpts...)
 
-	revealer, err := newRevealer(statestore.NewStateStore(), contract, transactionmock.New(), backend, blockTime, blocksPerRound, blocksPerPhase)
+	revealer, err := newRevealer(statestore.NewStateStore(), contract, transactionmock.New(), revealBackend{backend}, blockTime, blocksPerRound, blocksPerPhase)
 	if err != nil {
 		return nil, err
 	}
@@ -240,6 +240,16 @@ func newRevealer(store storage.StateStorer, contract redistribution.Contract, tx
 		return nil, err
 	}
 	return storageincentives.NewRevealer(state, contract, txService, backend, blockTime, blocksPerRound, blocksPerPhase, log.Noop), nil
+}
+
+// revealBackend gives an agent test's chain backend the nonce read the
+// Revealer needs; no test here reaches the missing-commit check.
+type revealBackend struct {
+	storageincentives.ChainBackend
+}
+
+func (revealBackend) NonceAt(context.Context, common.Address, *big.Int) (uint64, error) {
+	return 0, nil
 }
 
 type mockchainBackend struct {
@@ -273,6 +283,10 @@ func (m *mockchainBackend) HeaderByNumber(context.Context, *big.Int) (*types.Hea
 	return &types.Header{
 		Time: uint64(time.Now().Unix()),
 	}, nil
+}
+
+func (m *mockchainBackend) NonceAt(context.Context, common.Address, *big.Int) (uint64, error) {
+	return 0, nil
 }
 
 func (m *mockchainBackend) BalanceAt(ctx context.Context, address common.Address, block *big.Int) (*big.Int, error) {

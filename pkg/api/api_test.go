@@ -713,7 +713,7 @@ func createRedistributionAgentService(
 		return nil, err
 	}
 	blockTime := func() time.Duration { return time.Millisecond * 10 }
-	revealer := storageincentives.NewRevealer(state, contract, tranService, backend, blockTime, blocksPerRound, blocksPerPhase, log.Noop)
+	revealer := storageincentives.NewRevealer(state, contract, tranService, revealBackend{backend}, blockTime, blocksPerRound, blocksPerPhase, log.Noop)
 
 	return storageincentives.New(
 		addr,
@@ -823,4 +823,14 @@ func newTestPostService() postage.Service {
 			true,
 		)),
 	)
+}
+
+// revealBackend gives the test's chain backend the nonce read the Revealer
+// needs; no API test reaches the missing-commit check.
+type revealBackend struct {
+	storageincentives.ChainBackend
+}
+
+func (revealBackend) NonceAt(context.Context, common.Address, *big.Int) (uint64, error) {
+	return 0, nil
 }

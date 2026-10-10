@@ -49,6 +49,11 @@ func (c *unsyncedChain) HeaderByNumber(context.Context, *big.Int) (*types.Header
 	return &types.Header{Number: new(big.Int).SetUint64(c.block()), Time: uint64(time.Now().Add(-time.Hour).Unix())}, nil
 }
 
+func (c *unsyncedChain) NonceAt(context.Context, common.Address, *big.Int) (uint64, error) {
+	c.reads.Add(1)
+	return 0, nil
+}
+
 // A build error after the Revealer is started: the early reveal is
 // registered in the node, so the build's error shutdown closes it, and it
 // reads the chain no more afterwards (#737).
