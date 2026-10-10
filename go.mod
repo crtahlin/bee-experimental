@@ -61,7 +61,7 @@ require (
 	gopkg.in/yaml.v2 v2.4.0
 	resenje.org/feed v0.1.2
 	resenje.org/multex v0.1.0
-	resenje.org/singleflight v0.4.0
+	resenje.org/singleflight v0.4.1
 	resenje.org/web v0.4.3
 )
 
