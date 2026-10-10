@@ -2,6 +2,11 @@
 
 Issue: #725. Related: #634/#635 (clean stop, `cmd/bee/cmd/lifecycle.go` and the storer gate), #649 (lottery gates), #540 (2-second blocks).
 
+## Decided (operator, 2026-10-10)
+
+1. **`stop-wait-for-reveal` defaults to true.** A stop waits for a pending reveal, bounded by the end of the reveal phase.
+2. **`TimeoutStopSec=300` in the packaged systemd unit** (`packaging/bee.service`, the only packaged unit file in the repository), so systemd does not kill the process during the longest wait at 5-second blocks. This changes every packaged install's stop timeout; it is recorded in `docs/DIFFERENCES.md`.
+
 ## Terms
 
 - **Round:** 152 blocks. **Phases** (`pkg/storageincentives/agent.go:209-216`): commit = blocks 0-37 of the round, reveal = 38-75, claim = 76-151 (`blocksPerPhase` = 38).
@@ -50,10 +55,10 @@ Right after the chain client, transaction service and state store exist in the b
 - Metrics: `bee_storageincentives_stop_waited_for_reveal_total`, `bee_storageincentives_reveal_missed_on_stop_total`, `bee_storageincentives_reveal_after_restart_total`.
 - Log: the Warning in section 2; an Info line when the early reveal of section 3 is sent.
 
-### Settings and decisions for the operator
+### Settings
 
-- **Wait on stop (section 2):** proposed on by default, as a setting `stop-wait-for-reveal` (true; false = today). Cost: a stop can take up to about 3.5 minutes at 5 s blocks (about 1.5 minutes after #540), only when a reveal is pending, which a node at depth 9 has in about 1 of 512 rounds per neighbourhood it holds (at doubling 3, about 8 in 512).
-- **systemd `TimeoutStopSec` in `packaging/bee.service`:** 90 s today. With the wait on, the worst case at 5 s blocks exceeds it and systemd would SIGKILL during the wait (the store is already closed cleanly by then, so only the reveal is lost, as today). Options: raise it to 300 s in the packaged unit (operator decision; affects every packaged install), or leave 90 s and accept that the wait completes only when the reveal phase opens within about 80 s of the stop. After #540 the worst case fits in 90 s.
+- **Wait on stop (section 2):** on by default (decided), as a setting `stop-wait-for-reveal` (true; false = today). Cost: a stop can take up to about 3.5 minutes at 5 s blocks (about 1.5 minutes after #540), only when a reveal is pending, which a node at depth 9 has in about 1 of 512 rounds per neighbourhood it holds (at doubling 3, about 8 in 512).
+- **systemd `TimeoutStopSec` in `packaging/bee.service`:** 90 s today. With the wait on, the worst case at 5 s blocks exceeds it and systemd would SIGKILL during the wait (the store is already closed cleanly by then, so only the reveal is lost, as today). Decided: raise it to 300 s in the packaged unit (affects every packaged install). After #540 the worst case would also fit in 90 s.
 - **Sections 1, 3 and 4** are fixes without a setting.
 
 No wire change: the contract calls are the same; only their timing and persistence change.
