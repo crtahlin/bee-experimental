@@ -582,19 +582,7 @@ func NewBee(
 
 	defer func(b *Bee) {
 		if err != nil {
-			logger.Error(err, "got error, shutting down...")
-			// a pending reveal (an early reveal after a restart) is
-			// waited for, bounded by its reveal phase
-			ctx, cancel := context.Background(), context.CancelFunc(func() {})
-			if b.revealGuard != nil {
-				if budget := b.revealGuard.WaitBudget(); budget > 0 {
-					ctx, cancel = context.WithTimeout(ctx, budget)
-				}
-			}
-			defer cancel()
-			if err2 := b.Shutdown(ctx); err2 != nil {
-				logger.Error(err2, "got error while shutting down")
-			}
+			b.shutdownAfterBuildError(err)
 		}
 	}(b)
 
@@ -819,9 +807,7 @@ func NewBee(
 			return nil, fmt.Errorf("storage incentives state: %w", err)
 		}
 		revealer = storageincentives.NewRevealer(redistributionState, redistributionContract, transactionService, chainBackend, blockTime, storageincentives.DefaultBlocksPerRound, storageincentives.DefaultBlocksPerPhase, logger)
-		b.revealGuard = revealer
-		b.stopWaitForReveal = o.StopWaitForReveal
-		revealer.StartEarlyReveal()
+		b.startRevealer(revealer, o.StopWaitForReveal)
 	}
 
 	beeNodeMode := api.LightMode
@@ -1993,6 +1979,32 @@ func runShutdown(ctx context.Context, s shutdownSteps) {
 	s.chain()
 	s.rest()
 	s.stateStore()
+}
+
+// startRevealer registers the storage-lottery Revealer, so that any later
+// build error and every stop wait for it, and only then starts its early
+// reveal (#725).
+func (b *Bee) startRevealer(r *storageincentives.Revealer, stopWaitForReveal bool) {
+	b.revealGuard = r
+	b.stopWaitForReveal = stopWaitForReveal
+	r.StartEarlyReveal()
+}
+
+// shutdownAfterBuildError closes what a failed build opened. A pending
+// reveal (an early reveal after a restart) is waited for, bounded by its
+// reveal phase.
+func (b *Bee) shutdownAfterBuildError(err error) {
+	b.logger.Error(err, "got error, shutting down...")
+	ctx, cancel := context.Background(), context.CancelFunc(func() {})
+	if b.revealGuard != nil {
+		if budget := b.revealGuard.WaitBudget(); budget > 0 {
+			ctx, cancel = context.WithTimeout(ctx, budget)
+		}
+	}
+	defer cancel()
+	if err2 := b.Shutdown(ctx); err2 != nil {
+		b.logger.Error(err2, "got error while shutting down")
+	}
 }
 
 // Shutdown stops the node. A pending storage-lottery reveal is waited for

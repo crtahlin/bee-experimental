@@ -36,7 +36,9 @@ const (
 	// "cancelled" commit counts as not on chain. The contract accepts
 	// commits only in the commit phase, so a commit that a head this far
 	// into the reveal phase does not know never landed; a lagging head
-	// is checked again at the next block.
+	// is checked again at the next block. The answer must also hold at
+	// two consecutive heads, because the commit's status and the head come
+	// from separate calls, which can reach different chain nodes.
 	commitSettleBlocks = 2
 
 	// stopWaitMargin is added to WaitBudget to bound the stop wait, so a
@@ -96,6 +98,11 @@ type Revealer struct {
 	// one of them counts as a reveal after a restart
 	startupRounds map[uint64]struct{}
 
+	// commitGoneAt is the head at which a round's commit was last seen
+	// missing from a settled head; a second such answer at a later head
+	// removes the key. Guarded by stepMu.
+	commitGoneAt map[uint64]uint64
+
 	earlyCancel context.CancelFunc
 	wg          sync.WaitGroup
 }
@@ -123,6 +130,7 @@ func NewRevealer(
 		logger:         logger.WithName(loggerName).Register(),
 		inProgress:     make(map[uint64]struct{}),
 		startupRounds:  make(map[uint64]struct{}),
+		commitGoneAt:   make(map[uint64]uint64),
 		earlyCancel:    func() {},
 	}
 
@@ -235,9 +243,15 @@ func (r *Revealer) Wait(ctx context.Context) error {
 	waitCtx, cancel := context.WithTimeout(ctx, limit)
 	defer cancel()
 
-	if block, err := r.backend.BlockNumber(waitCtx); err == nil && block >= deadline {
-		// the last block seen is stale: the phase is over already
-		return nil
+	// A wait counts only when a block read confirms that the reveal
+	// phase has not ended; a failed read still waits, uncounted.
+	var waited uint64
+	if block, err := r.backend.BlockNumber(waitCtx); err == nil {
+		if block >= deadline {
+			// the last block seen is stale: the phase is over already
+			return nil
+		}
+		waited = 1
 	}
 
 	r.logger.Warning("stop waits for the storage-lottery reveal", "round", round, "up_to_block", deadline, "at_most", limit)
@@ -246,20 +260,41 @@ func (r *Revealer) Wait(ctx context.Context) error {
 	if !revealed && ctx.Err() == nil && errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
 		r.logger.Warning("stop: the storage-lottery reveal wait reached its time limit", "round", round, "limit", limit)
 	}
-	if revealed {
+	switch {
+	case revealed:
 		r.logger.Info("stop: storage-lottery reveal mined, stopping", "round", round)
-		r.state.countStop(1, 0, 0)
-	} else {
+		r.state.countStop(waited, 0, 0)
+	case !r.hasCommit(round):
+		// the commit was not broadcast, reverted or never landed: no
+		// reveal is owed, so none is missed
+		r.logger.Info("stop: no storage-lottery commit to reveal, stopping", "round", round)
+		r.state.countStop(waited, 0, 0)
+	default:
 		r.logger.Info("stop: storage-lottery reveal missed, stopping", "round", round)
-		r.state.countStop(1, 1, 0)
+		r.state.countStop(waited, 1, 0)
 	}
 	return ctx.Err()
 }
 
-// Close stops the early reveal and waits for it.
+// hasCommit reports whether the round has a stored commit key or a commit
+// in progress.
+func (r *Revealer) hasCommit(round uint64) bool {
+	r.commitGate.Lock()
+	defer r.commitGate.Unlock()
+	_, inProgress := r.inProgress[round]
+	_, hasKey := r.state.CommitKey(round)
+	return hasKey || inProgress
+}
+
+// Close stops the early reveal and waits for it, and for a reveal step
+// that singleflight gave up on: its context is cancelled once its last
+// caller leaves, so it ends soon, and the transaction service and the
+// state store, which close after the Revealer, are not used after Close.
 func (r *Revealer) Close() error {
 	r.earlyCancel()
 	r.wg.Wait()
+	r.stepMu.Lock()
+	defer r.stepMu.Unlock()
 	return nil
 }
 
@@ -270,6 +305,11 @@ func (r *Revealer) revealUntil(ctx context.Context, round uint64) bool {
 	for {
 		if r.state.HasRevealed(round) {
 			return true
+		}
+		if !r.hasCommit(round) {
+			// the commit's key is gone (not broadcast, reverted, never
+			// landed) and no commit is in progress: nothing to reveal
+			return false
 		}
 
 		block, err := r.backend.BlockNumber(ctx)
@@ -333,11 +373,8 @@ func (r *Revealer) revealStep(ctx context.Context, round uint64) (bool, error) {
 	txs, sentBlock := r.state.RevealTxs(round)
 
 	// any listed reveal mined: done, whichever it is
-	for _, txHash := range txs {
-		if st, err := r.txService.TransactionStatus(ctx, txHash); err == nil && st == transaction.TxMined {
-			r.revealed(ctx, round, txHash)
-			return true, nil
-		}
+	if r.listedRevealMined(ctx, round) {
+		return true, nil
 	}
 
 	listRevealTx := func(txHash common.Hash) error {
@@ -356,6 +393,11 @@ func (r *Revealer) revealStep(ctx context.Context, round uint64) (bool, error) {
 			r.revealed(ctx, round, newest)
 			return true, nil
 		case transaction.TxReverted:
+			// an older listed reveal can have been mined after the check
+			// above; the newest then reverts because the round is revealed
+			if r.listedRevealMined(ctx, round) {
+				return true, nil
+			}
 			return true, fmt.Errorf("%w: %s", errRevealReverted, newest)
 		case transaction.TxPending:
 			if !aged && !r.feeTooLow(ctx, newest) {
@@ -398,12 +440,31 @@ func (r *Revealer) revealStep(ctx context.Context, round uint64) (bool, error) {
 	txHash, err := r.contract.Reveal(ctx, sample.StorageRadius, sample.ReserveSampleHash.Bytes(), key, listRevealTx)
 	if err != nil {
 		if errors.Is(err, transaction.ErrTransactionReverted) {
+			// An earlier listed reveal can have been mined after its
+			// status was read; the fresh reveal then reverts because the
+			// round is revealed already.
+			if r.listedRevealMined(ctx, round) {
+				return true, nil
+			}
 			return true, err
 		}
 		return false, err
 	}
 	r.revealed(ctx, round, txHash)
 	return true, nil
+}
+
+// listedRevealMined marks the round revealed when any of its listed reveal
+// hashes is mined, and reports whether one is.
+func (r *Revealer) listedRevealMined(ctx context.Context, round uint64) bool {
+	txs, _ := r.state.RevealTxs(round)
+	for _, txHash := range txs {
+		if st, err := r.txService.TransactionStatus(ctx, txHash); err == nil && st == transaction.TxMined {
+			r.revealed(ctx, round, txHash)
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Revealer) revealed(ctx context.Context, round uint64, txHash common.Hash) {
@@ -425,10 +486,11 @@ const (
 // commitOnChain checks the round's commit before its first reveal. It is
 // gone when its receipt reverted, or when a synced backend whose head is
 // commitSettleBlocks into the reveal phase does not know it (or reports
-// its nonce used by another transaction). The same answer from a head
-// closer to the phase start is checked again at the next block. A lookup
-// error, an unsynced backend or an unknown commit hash all mean
-// "possibly committed".
+// its nonce used by another transaction) at two consecutive heads. The
+// same answer from a head closer to the phase start, or the first such
+// answer, is checked again at the next block. A lookup error, an unsynced
+// backend or an unknown commit hash all mean "possibly committed", and
+// clear an earlier "missing" answer.
 func (r *Revealer) commitOnChain(ctx context.Context, round uint64) commitCheck {
 	commitTx := r.state.CommitTx(round)
 	if commitTx == (common.Hash{}) {
@@ -436,21 +498,33 @@ func (r *Revealer) commitOnChain(ctx context.Context, round uint64) commitCheck 
 	}
 	st, err := r.txService.TransactionStatus(ctx, commitTx)
 	if err != nil {
+		delete(r.commitGoneAt, round)
 		return commitPossible
 	}
 	switch st {
 	case transaction.TxReverted:
+		delete(r.commitGoneAt, round)
 		return commitGone
 	case transaction.TxNotFound, transaction.TxCancelled:
 		header, err := r.backend.HeaderByNumber(ctx, nil)
 		if err != nil || !headerFresh(header) {
+			delete(r.commitGoneAt, round)
 			return commitPossible
 		}
 		if header.Number == nil || header.Number.Uint64() < r.revealStart(round)+commitSettleBlocks {
 			return commitRecheck
 		}
-		return commitGone
+		head := header.Number.Uint64()
+		if first, ok := r.commitGoneAt[round]; ok && head > first {
+			delete(r.commitGoneAt, round)
+			return commitGone
+		}
+		if _, ok := r.commitGoneAt[round]; !ok {
+			r.commitGoneAt[round] = head
+		}
+		return commitRecheck
 	}
+	delete(r.commitGoneAt, round)
 	return commitPossible
 }
 

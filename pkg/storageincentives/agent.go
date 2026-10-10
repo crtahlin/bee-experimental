@@ -346,7 +346,9 @@ func (a *Agent) handleReveal(ctx context.Context, round uint64) error {
 }
 
 func (a *Agent) handleClaim(ctx context.Context, round uint64) error {
-	hasRevealed := a.state.HasRevealed(round)
+	// A listed reveal mined after the reveal phase's last status read
+	// still counts, so a won claim is not skipped (#730).
+	hasRevealed := a.state.HasRevealed(round) || a.revealer.listedRevealMined(ctx, round)
 	if !hasRevealed {
 		// When there was no reveal in same round, phase is skipped
 		return nil

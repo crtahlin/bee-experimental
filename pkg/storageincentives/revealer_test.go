@@ -433,7 +433,13 @@ func TestNoSecondCommit(t *testing.T) {
 // the chain into its reveal phase.
 func revealFixtureInRevealPhase(t *testing.T) *revealFixture {
 	t.Helper()
-	f := newRevealFixture(t, mock.NewStateStore(), newFakeChain(17), newFakeTxs())
+	return revealFixtureAt(t, 17)
+}
+
+// revealFixtureAt is revealFixtureInRevealPhase with the chain at block.
+func revealFixtureAt(t *testing.T, block uint64) *revealFixture {
+	t.Helper()
+	f := newRevealFixture(t, mock.NewStateStore(), newFakeChain(block), newFakeTxs())
 	f.setSample(1)
 	if err := f.state().SetCommitKey(1, []byte("key")); err != nil {
 		t.Fatal(err)
@@ -501,45 +507,61 @@ func TestRevealNotResentWhilePending(t *testing.T) {
 }
 
 // The reveal is skipped only on a definite answer about the commit
-// (test 16).
+// (test 16). A skip removes the commit key and ends the round's steps;
+// the head is commitSettleBlocks into the reveal phase, so a missing
+// commit is gone once a second head agrees (#739).
 func TestRevealSkipOnlyWhenDefinite(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
-		name   string
-		state  transaction.TxState
-		err    error
-		lag    time.Duration
-		reveal bool
+		name    string
+		state   transaction.TxState
+		err     error
+		lag     time.Duration
+		reveal  bool
+		answers int // steps until a skip
 	}{
-		{"reverted", transaction.TxReverted, nil, 0, false},
-		{"not found, synced", transaction.TxNotFound, nil, 0, false},
-		{"not found, not synced", transaction.TxNotFound, nil, time.Hour, true},
-		{"lookup error", 0, errors.New("rpc down"), 0, true},
-		{"pending", transaction.TxPending, nil, 0, true},
-		{"mined", transaction.TxMined, nil, 0, true},
+		{"reverted", transaction.TxReverted, nil, 0, false, 1},
+		{"not found, synced", transaction.TxNotFound, nil, 0, false, 2},
+		{"not found, not synced", transaction.TxNotFound, nil, time.Hour, true, 1},
+		{"lookup error", 0, errors.New("rpc down"), 0, true, 1},
+		{"pending", transaction.TxPending, nil, 0, true, 1},
+		{"mined", transaction.TxMined, nil, 0, true, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			f := revealFixtureInRevealPhase(t)
-			f.txs.set(f.state().CommitTx(1), tc.state)
-			f.chain.setLag(tc.lag)
-			if tc.err != nil {
-				// the lookup fails for the commit only
-				commitTx := f.state().CommitTx(1)
-				f.revealer.txService = transactionmock.New(transactionmock.WithTransactionStatusFunc(func(ctx context.Context, h common.Hash) (transaction.TxState, error) {
-					if h == commitTx {
-						return 0, tc.err
+			synctest.Test(t, func(t *testing.T) {
+				f := revealFixtureAt(t, testBlocksPerRound+testBlocksPerPhase+commitSettleBlocks)
+				f.txs.set(f.state().CommitTx(1), tc.state)
+				f.chain.setLag(tc.lag)
+				if tc.err != nil {
+					// the lookup fails for the commit only
+					commitTx := f.state().CommitTx(1)
+					f.revealer.txService = transactionmock.New(transactionmock.WithTransactionStatusFunc(func(ctx context.Context, h common.Hash) (transaction.TxState, error) {
+						if h == commitTx {
+							return 0, tc.err
+						}
+						return transaction.TxNotFound, nil
+					}))
+				}
+
+				var done bool
+				for i := range tc.answers {
+					if i > 0 {
+						time.Sleep(testBlockTime)
 					}
-					return transaction.TxNotFound, nil
-				}))
-			}
+					done, _ = f.revealer.Reveal(context.Background(), 1)
+				}
 
-			_, _ = f.revealer.Reveal(context.Background(), 1)
-
-			if _, reveals := f.contract.counts(); (reveals == 1) != tc.reveal {
-				t.Fatalf("reveals %d, want reveal %v", reveals, tc.reveal)
-			}
+				if _, reveals := f.contract.counts(); (reveals == 1) != tc.reveal {
+					t.Fatalf("reveals %d, want reveal %v", reveals, tc.reveal)
+				}
+				if !tc.reveal {
+					if _, hasKey := f.state().CommitKey(1); !done || hasKey {
+						t.Fatalf("done %v, key kept %v; want a skip that removes the key", done, hasKey)
+					}
+				}
+			})
 		})
 	}
 }
@@ -1013,8 +1035,9 @@ func TestPendingConcurrentWithCommits(t *testing.T) {
 
 // A commit that is not found, or whose nonce reads as used by another
 // transaction, counts as never landed only from a head commitSettleBlocks
-// into the reveal phase. A head closer to the phase start keeps the key
-// and checks again at the next block.
+// into the reveal phase, and only when a later head gives the same answer
+// (#738). A head closer to the phase start, or the first such answer,
+// keeps the key and checks again at the next block.
 func TestCommitMissingNeedsSettledHead(t *testing.T) {
 	t.Parallel()
 
@@ -1024,7 +1047,7 @@ func TestCommitMissingNeedsSettledHead(t *testing.T) {
 		block   uint64
 		headLag uint64
 		state   transaction.TxState
-		gone    bool
+		gone    bool // gone at the second head
 	}{
 		{"not found, head settled", revealStart + commitSettleBlocks, 0, transaction.TxNotFound, true},
 		{"cancelled, head settled", revealStart + commitSettleBlocks, 0, transaction.TxCancelled, true},
@@ -1048,22 +1071,29 @@ func TestCommitMissingNeedsSettledHead(t *testing.T) {
 				f.txs.set(commitTx, tc.state)
 				f.chain.setHeadLag(tc.headLag)
 
+				// the first answer never removes the key
 				done, err := f.revealer.Reveal(context.Background(), round)
 				if err != nil {
 					t.Fatal(err)
 				}
-				_, hasKey := f.state().CommitKey(round)
-				if _, reveals := f.contract.counts(); reveals != 0 {
-					t.Fatalf("revealed %d times", reveals)
+				if _, hasKey := f.state().CommitKey(round); done || !hasKey {
+					t.Fatalf("first answer: done %v, key kept %v; want the key kept and a later check", done, hasKey)
 				}
+
 				if tc.gone {
-					if !done || hasKey {
-						t.Fatalf("done %v, key kept %v; want the key removed", done, hasKey)
+					// the same answer at the next head removes it
+					time.Sleep(testBlockTime)
+					done, err := f.revealer.Reveal(context.Background(), round)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, hasKey := f.state().CommitKey(round); !done || hasKey {
+						t.Fatalf("second answer: done %v, key kept %v; want the key removed", done, hasKey)
+					}
+					if _, reveals := f.contract.counts(); reveals != 0 {
+						t.Fatalf("revealed %d times", reveals)
 					}
 					return
-				}
-				if done || !hasKey {
-					t.Fatalf("done %v, key kept %v; want the key kept and a later check", done, hasKey)
 				}
 
 				// the lagging endpoint catches up: the commit is mined, and
@@ -1082,9 +1112,70 @@ func TestCommitMissingNeedsSettledHead(t *testing.T) {
 	}
 }
 
+// A commit missing at one settled head and found at the next keeps its
+// key and is revealed; two answers at the same head are not two heads
+// (#738).
+func TestCommitMissingOnceIsNotGone(t *testing.T) {
+	t.Parallel()
+
+	revealStart := uint64(testBlocksPerRound + testBlocksPerPhase)
+
+	t.Run("found at the next head", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			f := newRevealFixture(t, mock.NewStateStore(), newFakeChain(revealStart+commitSettleBlocks), newFakeTxs())
+			const round = 1
+			f.setSample(round)
+			if err := f.state().SetCommitKey(round, []byte("key")); err != nil {
+				t.Fatal(err)
+			}
+			commitTx := f.txs.newHash()
+			if err := f.state().SetCommitTx(round, commitTx); err != nil {
+				t.Fatal(err)
+			}
+			// a lagging chain node answers first
+			if done, err := f.revealer.Reveal(context.Background(), round); err != nil || done {
+				t.Fatalf("first answer: done %v err %v", done, err)
+			}
+			f.txs.set(commitTx, transaction.TxMined)
+			time.Sleep(testBlockTime)
+			if done, err := f.revealer.Reveal(context.Background(), round); err != nil || !done {
+				t.Fatalf("second answer: done %v err %v", done, err)
+			}
+			if _, reveals := f.contract.counts(); reveals != 1 || !f.state().HasRevealed(round) {
+				t.Fatalf("reveals %d, revealed %v; want the reveal sent", reveals, f.state().HasRevealed(round))
+			}
+		})
+	})
+
+	t.Run("same head twice", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			f := newRevealFixture(t, mock.NewStateStore(), newFakeChain(revealStart+commitSettleBlocks), newFakeTxs())
+			const round = 1
+			f.setSample(round)
+			if err := f.state().SetCommitKey(round, []byte("key")); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.state().SetCommitTx(round, f.txs.newHash()); err != nil {
+				t.Fatal(err)
+			}
+			for i := range 2 {
+				if done, err := f.revealer.Reveal(context.Background(), round); err != nil || done {
+					t.Fatalf("answer %d: done %v err %v", i+1, done, err)
+				}
+			}
+			if _, hasKey := f.state().CommitKey(round); !hasKey {
+				t.Fatal("key removed on two answers at one head")
+			}
+		})
+	})
+}
+
 // One signal never cancels the stop's context. When block number reads
 // keep failing, the wait still ends within WaitBudget plus the margin,
-// and the stop goes on (the miss is counted).
+// and the stop goes on. The miss is counted; the wait is not, because no
+// block read confirmed that the reveal phase was still open (#729).
 func TestWaitBoundedWhenBlockReadsFail(t *testing.T) {
 	t.Parallel()
 
@@ -1116,8 +1207,193 @@ func TestWaitBoundedWhenBlockReadsFail(t *testing.T) {
 			t.Fatalf("wait took %v, limit %v", took, limit)
 		}
 		st, _ := f.state().Status()
-		if st.StopWaitedForReveal != 1 || st.RevealMissedOnStop != 1 {
-			t.Fatalf("counts waited %d missed %d, want 1 and 1", st.StopWaitedForReveal, st.RevealMissedOnStop)
+		if st.StopWaitedForReveal != 0 || st.RevealMissedOnStop != 1 {
+			t.Fatalf("counts waited %d missed %d, want 0 and 1", st.StopWaitedForReveal, st.RevealMissedOnStop)
 		}
 	})
+}
+
+// The newest listed reveal reads as cancelled because an older listed one
+// was mined between the status reads; the fresh reveal then reverts. The
+// listed hashes are checked again, so the round counts as revealed and its
+// claim is not skipped (#730).
+func TestRevealRevertedRechecksListed(t *testing.T) {
+	t.Parallel()
+
+	f := revealFixtureInRevealPhase(t)
+	older, newer := f.txs.newHash(), f.txs.newHash()
+	f.txs.set(older, transaction.TxPending)
+	f.txs.set(newer, transaction.TxCancelled)
+	if err := f.state().AddRevealTx(1, older, 17); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.state().AddRevealTx(1, newer, 17); err != nil {
+		t.Fatal(err)
+	}
+	f.contract.revealResult = func(context.Context, common.Hash) error {
+		f.txs.set(older, transaction.TxMined)
+		return fmt.Errorf("reveal: %w", transaction.ErrTransactionReverted)
+	}
+
+	done, err := f.revealer.Reveal(context.Background(), 1)
+	if !done || err != nil {
+		t.Fatalf("done %v err %v; want done with no error", done, err)
+	}
+	if !f.state().HasRevealed(1) {
+		t.Fatal("round not revealed although an older listed reveal was mined")
+	}
+}
+
+// A commit in progress when the stop starts ends without a key (it was
+// not broadcast): the wait returns within a block instead of waiting for
+// the reveal phase, and no missed reveal is counted (#728).
+func TestWaitEndsWhenTheCommitIsGone(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		f := newRevealFixture(t, mock.NewStateStore(), newFakeChain(testBlocksPerRound+1), newFakeTxs())
+		const round = 1
+		f.setSample(round)
+		f.state().SetCurrentBlock(f.chain.block())
+		if err := f.revealer.beginCommit(round, []byte("key")); err != nil {
+			t.Fatal(err)
+		}
+
+		go func() {
+			time.Sleep(testBlockTime / 2)
+			f.revealer.endCommit(round, transaction.ErrNotBroadcast)
+		}()
+		start := time.Now()
+		if err := f.revealer.Wait(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if took := time.Since(start); took > 2*testBlockTime {
+			t.Fatalf("wait took %v after the commit was gone, want at most two blocks", took)
+		}
+		st, _ := f.state().Status()
+		if st.StopWaitedForReveal != 1 || st.RevealMissedOnStop != 0 {
+			t.Fatalf("counts waited %d missed %d, want 1 and 0", st.StopWaitedForReveal, st.RevealMissedOnStop)
+		}
+	})
+}
+
+// A reveal step whose caller left (a second signal ended the wait) keeps
+// running in the background; Close waits for it, so the transaction
+// service and the state store do not close under it (#731). Real time:
+// a goroutine blocked on a mutex is not durably blocked for synctest.
+func TestCloseWaitsForAbandonedStep(t *testing.T) {
+	t.Parallel()
+
+	f := revealFixtureInRevealPhase(t)
+	sending := make(chan struct{})
+	release := make(chan struct{})
+	f.contract.revealResult = func(context.Context, common.Hash) error {
+		close(sending)
+		<-release
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stepped := make(chan struct{})
+	go func() {
+		defer close(stepped)
+		_, _ = f.revealer.Reveal(ctx, 1)
+	}()
+	<-sending
+	cancel()
+	<-stepped // the caller left; the step still runs
+
+	closed := make(chan struct{})
+	go func() {
+		_ = f.revealer.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+		t.Fatal("Close returned while a reveal step was still running")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close did not return after the step ended")
+	}
+}
+
+// The newest listed reveal reads as reverted because an older listed one
+// was mined after the step's first check; the listed hashes are checked
+// again, so the round counts as revealed (#730).
+func TestRevealListedRevertedRechecksListed(t *testing.T) {
+	t.Parallel()
+
+	f := revealFixtureInRevealPhase(t)
+	older, newer := f.txs.newHash(), f.txs.newHash()
+	f.txs.set(older, transaction.TxPending)
+	f.txs.set(newer, transaction.TxReverted)
+	if err := f.state().AddRevealTx(1, older, 17); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.state().AddRevealTx(1, newer, 17); err != nil {
+		t.Fatal(err)
+	}
+	// the older reveal is mined between the step's first check and the
+	// newest hash's status read
+	base := f.revealer.txService
+	reads := 0
+	f.revealer.txService = transactionmock.New(transactionmock.WithTransactionStatusFunc(func(ctx context.Context, h common.Hash) (transaction.TxState, error) {
+		if h == older {
+			reads++
+			if reads > 1 {
+				return transaction.TxMined, nil
+			}
+		}
+		return base.TransactionStatus(ctx, h)
+	}))
+
+	done, err := f.revealer.Reveal(context.Background(), 1)
+	if !done || err != nil {
+		t.Fatalf("done %v err %v; want done with no error", done, err)
+	}
+	if !f.state().HasRevealed(1) {
+		t.Fatal("round not revealed although an older listed reveal was mined")
+	}
+}
+
+// winnerCheckContract records whether the claim phase asked if the node
+// won, which it does only for a revealed round.
+type winnerCheckContract struct {
+	*fakeContract
+	asked bool
+}
+
+func (c *winnerCheckContract) IsWinner(context.Context) (bool, error) {
+	c.asked = true
+	return false, nil
+}
+
+// The claim phase rechecks the listed reveal hashes when HasRevealed is
+// false: a reveal mined after the reveal phase's last status read is not
+// a reason to skip the claim (#730).
+func TestClaimRechecksListedReveals(t *testing.T) {
+	t.Parallel()
+
+	f := revealFixtureInRevealPhase(t)
+	h := f.txs.newHash()
+	f.txs.set(h, transaction.TxMined)
+	if err := f.state().AddRevealTx(1, h, 17); err != nil {
+		t.Fatal(err)
+	}
+	c := &winnerCheckContract{fakeContract: f.contract}
+	f.agent.contract = c
+
+	if err := f.agent.handleClaim(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if !c.asked {
+		t.Fatal("claim skipped although a listed reveal was mined")
+	}
+	if !f.state().HasRevealed(1) {
+		t.Fatal("HasRevealed not set from the mined listed reveal")
+	}
 }

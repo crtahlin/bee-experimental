@@ -145,6 +145,17 @@ No wire change: the contract calls are the same; only their timing and persisten
 
 Mutation checks (each must fail a test): key stored after the receipt again; key removed on a possibly-broadcast error; key-write error ignored; `exists` ignored after a restart; wait removed; monitor or chain client closed before the wait; localstore closed after the wait; early reveal cancelled instead of awaited on stop; a reveal sent while an earlier hash may still be mined; a not-found reveal re-signed instead of rebroadcast (hash changes); a replacement hash listed after the send; a rebroadcast send error swallowed; `HasRevealed` only from the newest hash; skip on a lookup error; `ErrNotBroadcast` on a `SendTransaction` error; the ambiguous send's nonce reused; a failed pre-broadcast send leaving the in-progress mark; `Pending()` not taking `commitGate`; reveal not retried; second signal not reaching `Shutdown`; third signal not exiting; commits not refused after shutdown starts; `Revealer.Reveal` not re-checking `HasRevealed`; two state instances; early reveal without the sync check; `revealPending` always false.
 
+## Changes after the code review
+
+Follow-ups from the review of #727, implemented together:
+
+- **A missing commit needs two settled heads** (#738). Rule 5's "not found from a synced backend" now also requires a head at least 2 blocks into the reveal phase, and the same answer at a later head: the commit's status and the head come from separate calls, which can reach different chain nodes.
+- **A reverted fresh reveal rechecks the listed hashes** (#730): an older listed reveal mined between the status reads marks the round revealed.
+- **The stop wait ends when no commit is left** (#728): a commit in progress that ends without a key ends the wait within a block, and no missed reveal is counted.
+- **`stopWaitedForReveal` counts only after a successful block read** at the stop (#729).
+- **`Revealer.Close` waits for a reveal step that single-flight gave up on** (#731).
+- **The replacement fee raise rounds up** (#734).
+
 ## Measurement
 
 - **No staked bench node exists.** Plan: a Sepolia testnet node (funded test wallet, recorded privately), staked at the testnet minimum, with scripted restarts in the commit phase after a commit, at the start of the reveal phase, and in the claim phase.
