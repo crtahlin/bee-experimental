@@ -15,7 +15,9 @@ Issues: #645, #646, #648. All three come from the review of #644, the code for #
 
 ## Change
 
-1. **#648, the only behaviour change.** Right before `makeOffer`, if `reqCtx.Err() != nil`, skip `makeOffer` and take the same path as a `makeOffer` that returned that error: `afterMakeOffer`, `watch.stop()`, `unregister`, and the existing handling of the cancel cause (#641 abandonment counting, #640 replacement wording). The metrics and the error returned are the same as today for an ended request; only the extra collection and subscription are gone.
+1. **#648, the only behaviour change.** Right before `makeOffer`, a one-line guard: `if err = reqCtx.Err(); err == nil { offer, err = s.makeOffer(reqCtx, rn) }`. Every later step stays as it is: `afterMakeOffer`, `watch.stop()`, `unregister`, and the existing handling of the cancel cause (#641 abandonment counting, #640 replacement wording). There is no second, copied exit block. The replaced, unwatched and abandoned metrics are unaffected.
+
+   This is not exactly "the same as today". Today a cancelled caller can still receive a result from a finished call that is still shared, and then go on to write its offer. With the guard, a request ended before `makeOffer` always ends with an error, which is the intended outcome for an ended request. The guard reduces the wasted collection but does not remove it: a request can still be ended after it has entered `makeOffer`.
 2. **#646:** a test-only accessor in `export_test.go`, `WaitingKeys() int`, returning `len(s.waiting.m)` under the mutex.
 3. No change to the wire, to settings, or to metrics.
 
@@ -23,7 +25,7 @@ Issues: #645, #646, #648. All three come from the review of #644, the code for #
 
 1. **Unregistered after the offer (#645).** A requester on a recorder stream sends a `Get` for a bin with chunks prepared, reads the `Offer`, and does not send its `Want`. While the server waits for the `Want`, `WaitingTracked()` is 0 and the gauge reads 0. The requester then sends its `Want` and the handler completes normally.
 2. **Empty keys deleted (#646).** Extend `TestWaitingRequestsGauge`: after all requests have ended, `WaitingKeys()` is 0, as well as `WaitingTracked()`.
-3. **No collection for a request ended in its wait loop (#648).** Request A (peer P, bin b, start s) waits. The `afterMakeOffer` hook is set to block A's handler, so A does not unregister after it is ended. Request B (P, b, s) ends A and enters its wait loop. Request C (P, b, s) ends B. Then A is released. The storer mock's `SubscribeBinCalls()` must show no call for B: A's call and C's call only. On today's code B adds one.
+3. **No collection for a request ended in its wait loop (#648).** Request A (peer P, bin b, start s) waits. The `afterMakeOffer` hook blocks only its first call (`calls.Add(1) == 1`, as in `duplicate_test.go`), so A does not unregister after it is ended; later calls pass straight through, so the skip path cannot block in the hook. Request B (P, b, s) ends A and enters its wait loop. Request C (P, b, s) ends B. Then A is released. The storer mock's `SubscribeBinCalls()` must show no call for B: A's call and C's call only (2). On today's code B adds one (3). The test also asserts `RequestsReplaced("same_start") == 2` and `RequestsAbandonedTotal() == 0`.
 
 **Mutation checks** (each must make a test fail):
 - unregister moved to a deferred call at the end of the handler (test 1);
@@ -38,4 +40,4 @@ None of the three is an upstream defect: the code they touch was added by #640 (
 
 ## Measurement
 
-None needed on a node: #645 and #646 add tests only, and #648 removes a collection that ends at once. The production check of #640 (waiting requests per peer stay at most 2 per bin) covers this code.
+None needed on a node: #645 and #646 add tests only, and #648 removes most of a collection that ends at once. The production check of #640 (waiting requests per peer stay at most 2 per bin) covers this code.
