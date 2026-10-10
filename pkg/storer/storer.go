@@ -1074,6 +1074,15 @@ func (db *DB) Metrics() []prometheus.Collector {
 		},
 		func() float64 { return db.EvictingFor().Seconds() },
 	))
+	collectors = append(collectors, prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Namespace: m.Namespace,
+			Subsystem: "localstore",
+			Name:      "eviction_expiry_running_seconds",
+			Help:      "Active time of the expired-batch eviction run in progress, not counting time paused for a sample; 0 when none (wasp #663).",
+		},
+		func() float64 { return db.episode.expiryActiveFor(time.Now()).Seconds() },
+	))
 	if v, ok := db.storage.(m.Collector); ok {
 		collectors = append(collectors, v.Metrics()...)
 	}

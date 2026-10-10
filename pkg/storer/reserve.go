@@ -261,7 +261,7 @@ func (db *DB) reserveWorker(ctx context.Context, ready chan<- struct{}) {
 			return
 		case <-batchExpiryTrigger:
 
-			err := db.evictionRun(func() error { return db.evictExpiredBatches(ctx) })
+			err := db.evictionRun(evictionKindExpiry, func() error { return db.evictExpiredBatches(ctx) })
 			if err != nil {
 				// A shutdown is not a fault, and the worker is stopping
 				// anyway, so it returns rather than warning (#407).
@@ -280,7 +280,7 @@ func (db *DB) reserveWorker(ctx context.Context, ready chan<- struct{}) {
 		case <-overCapTrigger:
 
 			db.metrics.OverCapTriggerCount.Inc()
-			if err := db.evictionRun(func() error { return db.unreserve(ctx) }); err != nil {
+			if err := db.evictionRun(evictionKindUnreserve, func() error { return db.unreserve(ctx) }); err != nil {
 				if errors.Is(err, ErrDBQuit) {
 					return
 				}

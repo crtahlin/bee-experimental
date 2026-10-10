@@ -106,3 +106,17 @@ func (db *DB) EvictionPauseCappedForTest() float64 {
 
 // EvictionPacedForTest reports whether eviction is paced (#651).
 func (db *DB) EvictionPacedForTest() bool { return db.evictionPacer != nil }
+
+// ExpiryRunningSecondsForTest returns the active time of the expiry run in
+// progress, as the eviction_expiry_running_seconds gauge does (#663).
+func (db *DB) ExpiryRunningSecondsForTest() float64 {
+	return db.episode.expiryActiveFor(time.Now()).Seconds()
+}
+
+// EvictionExpirySecondsForTest reads eviction_expiry_seconds_total (#663).
+func (db *DB) EvictionExpirySecondsForTest() float64 {
+	return metricValue(db.metrics.EvictionExpirySeconds)
+}
+
+// EpisodeWorkLeftForTest reports what keeps an eviction episode open (#663).
+func (db *DB) EpisodeWorkLeftForTest() bool { return db.episodeWorkLeft() }

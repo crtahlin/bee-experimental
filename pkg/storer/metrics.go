@@ -47,6 +47,7 @@ type metrics struct {
 	ReserveEvictionWorkers        prometheus.Gauge
 	ReserveArrivalRate            prometheus.Gauge
 	EvictionPausedSeconds         prometheus.Counter
+	EvictionExpirySeconds         prometheus.Counter
 	EvictionPauseCapped           prometheus.Counter
 }
 
@@ -312,6 +313,14 @@ func newMetrics() metrics {
 				Subsystem: subsystem,
 				Name:      "reserve_arrival_rate",
 				Help:      "Chunks per second added to the reserve over the last minute, as seen by a paced eviction (wasp #623). Updated only while a paced eviction runs; between evictions it keeps its last value.",
+			},
+		),
+		EvictionExpirySeconds: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Namespace: m.Namespace,
+				Subsystem: subsystem,
+				Name:      "eviction_expiry_seconds_total",
+				Help:      "Active time of expired-batch eviction runs, not counting time paused for a sample; these runs do not count toward the eviction episode (wasp #663).",
 			},
 		),
 		EvictionPausedSeconds: prometheus.NewCounter(
